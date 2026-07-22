@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cmath>
 #include <map>
 #include <unordered_map>
@@ -30,6 +31,7 @@
 #include "griddb.h"
 #include "forwarder.h"
 #include "SwitchStorage.h"
+#include "CheatManager.h"
 #include "ui_audio.h"
 
 // SDL uses Xbox button names.
@@ -43,6 +45,8 @@ static const char *EMU_INI     = "sdmc:/switch/nethersx2/nethersx2.ini";
 static const char *COVERS_DIR = "sdmc:/switch/nethersx2/covers";
 static const char *CORES_DIR  = "sdmc:/switch/nethersx2/cores";
 static const char *GAMECFG_DIR= "sdmc:/switch/nethersx2/gamecfg";
+static const char *GAMECRC_DIR= "sdmc:/switch/nethersx2/gamecrc";
+static const char *CHEATS_DIR = "sdmc:/switch/nethersx2/cheats";
 static const char *DEF_GAMEDIR= "sdmc:/switch/nethersx2/games";
 static const char *BIOS_DIR   = "sdmc:/switch/nethersx2/bios";
 static const char *RESOURCES_DIR = "sdmc:/switch/nethersx2/resources";
@@ -183,7 +187,7 @@ static const char *iniGet(const char *key, const char *def) {
 }
 static void iniSet(const char *key, const char *val) { storeSet(*g_active, key, val); }
 
-enum OType { OT_CHOICE, OT_RANGE, OT_SCALED_RANGE, OT_SUBMENU, OT_TEXT };
+enum OType { OT_CHOICE, OT_RANGE, OT_SCALED_RANGE, OT_SUBMENU, OT_TEXT, OT_HOTKEY };
 struct Choice { const char *label, *val; };
 struct Opt {
   const char *label;
@@ -207,12 +211,14 @@ struct Opt {
 #define O_RANGEG(l,k,lo,hi,s,d,gk,go) { l, k, OT_RANGE, nullptr,0, lo,hi,s, d, 0, gk, go, 1, nullptr }
 #define O_TEXT(l,k,d)          { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 #define O_TEXTG(l,k,d,gk,go)   { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
+#define O_HOTKEY(l,k,d)        { l, k, OT_HOTKEY, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 
 static const Choice C_backend[]  = { {"Vulkan (NVK)","14"}, {"OpenGL","12"} };
 static const Choice C_build[]    = { {"Patched (4248)","4248"}, {"Classic (3668)","3668"} };
 static const Choice C_fastmem[]  = { {"Off","off"}, {"On","hybrid"} };
-// The bundled cores support integer scaling only.
-static const Choice C_upscale[]  = { {"1x (native ~480p)","1"},{"2x (~720p)","2"},{"3x (~1080p)","3"},
+static const Choice C_upscale[]  = { {"0.25x","0.25"},{"0.5x","0.5"},{"0.75x","0.75"},
+                                     {"1x (native ~480p)","1"},{"1.25x","1.25"},{"1.5x","1.5"},{"1.75x","1.75"},
+                                     {"2x (~720p)","2"},{"2.25x","2.25"},{"2.5x","2.5"},{"2.75x","2.75"},{"3x (~1080p)","3"},
                                      {"4x (~1440p)","4"},{"5x (~1800p)","5"},{"6x (4K ~2160p)","6"} };
 static const Choice C_bool[]     = { {"Off","false"}, {"On","true"} };
 static const Choice C_aspect[]   = { {"4:3","4:3"}, {"16:9","16:9"}, {"Stretch","Stretch"}, {"Auto","Auto 4:3/3:2"} };
@@ -241,7 +247,7 @@ static const Choice C_btn[]      = { {"A","A"},{"B","B"},{"X","X"},{"Y","Y"},{"L
                                      {"D-Up","Up"},{"D-Down","Down"},{"D-Left","Left"},{"D-Right","Right"},{"None","None"} };
 static const Choice C_stick[]    = { {"Left Stick","LStick"}, {"Right Stick","RStick"}, {"None","None"} };
 static const Choice C_players[]  = { {"1","1"}, {"2","2"} };
-static const Choice C_launcherTheme[] = { {"Glow","animated"}, {"Bubbles","homebrew"},
+static const Choice C_launcherTheme[] = { {"XMB (PS3)","xmb"}, {"Glow","animated"}, {"Bubbles","homebrew"},
                                           {"Classic","classic"}, {"OLED black","oled"} };
 static const Choice C_gridColumns[] = { {"3","3"}, {"4","4"}, {"5","5"}, {"6","6"}, {"7","7"}, {"8","8"} };
 static const Choice C_gridRows[] = { {"1","1"}, {"2","2"}, {"3","3"} };
@@ -311,8 +317,9 @@ static const Opt S_network[] = {
   O_TEXTG ("Custom DNS server", "Wrapper/NetDNS", "", "Wrapper/Network", "false"),
 };
 static const Opt S_controller[] = {
-  O_CHOICE("Controller ports", "Wrapper/ControllerCount", C_players, "1"),
+  O_CHOICE("Controller ports", "Wrapper/ControllerCount", C_players, "2"),
   O_CHOICE("Vibration",   "Wrapper/Vibration",     C_bool, "true"),
+  O_HOTKEY("Turbo hotkey", "Wrapper/TurboCombo", "None"),
   O_CHOICE("Cross  (X)",  "Wrapper/Pad1/Cross",    C_btn, "B"),
   O_CHOICE("Circle (O)",  "Wrapper/Pad1/Circle",   C_btn, "A"),
   O_CHOICE("Square",      "Wrapper/Pad1/Square",   C_btn, "Y"),
@@ -368,7 +375,8 @@ static void commitAll() {
   for (int s = 0; s < SCR_COUNT; s++)
     for (int i = 0; i < g_screens[s].n; i++) {
       const Opt &o = g_screens[s].opts[i];
-      if (o.key && (o.type == OT_CHOICE || o.type == OT_RANGE || o.type == OT_SCALED_RANGE || o.type == OT_TEXT)) {
+      if (o.key && (o.type == OT_CHOICE || o.type == OT_RANGE || o.type == OT_SCALED_RANGE ||
+                    o.type == OT_TEXT || o.type == OT_HOTKEY)) {
         std::string v = iniGet(o.key, o.def);
         iniSet(o.key, v.c_str());
       }
@@ -388,7 +396,7 @@ static bool g_plReady = false;
 static bool g_griddbReady = false;
 static bool g_storageSocketReady = false;
 
-enum class LauncherTheme { Glow, Bubbles, Classic, Oled };
+enum class LauncherTheme { Xmb, Glow, Bubbles, Classic, Oled };
 static LauncherTheme g_launcherTheme = LauncherTheme::Glow;
 static bool g_uiAnimations = true;
 static bool g_showGameTitles = true;
@@ -527,13 +535,18 @@ static void applyLauncherAppearance() {
   const char *theme = storeGet(g_global, "Wrapper/Theme", "animated");
   g_launcherTheme = !strcmp(theme, "classic") ? LauncherTheme::Classic :
                     !strcmp(theme, "oled") ? LauncherTheme::Oled :
-                    !strcmp(theme, "homebrew") ? LauncherTheme::Bubbles : LauncherTheme::Glow;
+                    !strcmp(theme, "homebrew") ? LauncherTheme::Bubbles :
+                    !strcmp(theme, "xmb") ? LauncherTheme::Xmb : LauncherTheme::Glow;
   g_uiAnimations = strcmp(storeGet(g_global, "Wrapper/UiAnimations", "true"), "false") != 0;
   g_showGameTitles = strcmp(storeGet(g_global, "Wrapper/ShowGameTitles", "true"), "false") != 0;
   g_gridColumns = std::max(3, std::min(8, atoi(storeGet(g_global, "Wrapper/GridColumns", "6"))));
   g_gridRows = std::max(1, std::min(3, atoi(storeGet(g_global, "Wrapper/GridRows", "2"))));
 
-  if (g_launcherTheme == LauncherTheme::Classic) {
+  if (g_launcherTheme == LauncherTheme::Xmb) {
+    COL_BG={2,35,92,255}; COL_TXT={246,250,255,255}; COL_DIM={176,207,233,255};
+    COL_HI={151,229,255,255}; COL_VAL={255,255,255,255}; COL_SEL={116,218,255,255};
+    COL_PANEL={4,28,73,164}; COL_CARD={5,36,86,196}; COL_FOCUS={20,91,148,214};
+  } else if (g_launcherTheme == LauncherTheme::Classic) {
     COL_BG={22,24,30,255}; COL_TXT={228,230,235,255}; COL_DIM={150,155,165,255};
     COL_HI={96,200,255,255}; COL_VAL={255,210,100,255}; COL_SEL={255,170,0,255};
     COL_PANEL={28,31,40,255}; COL_CARD={24,26,34,255}; COL_FOCUS={66,56,30,235};
@@ -578,7 +591,7 @@ static void ensureGlowTexture() {
 }
 
 static bool hasAnimatedBackground() {
-  return g_launcherTheme==LauncherTheme::Bubbles||g_launcherTheme==LauncherTheme::Glow;
+  return g_launcherTheme==LauncherTheme::Xmb||g_launcherTheme==LauncherTheme::Bubbles||g_launcherTheme==LauncherTheme::Glow;
 }
 
 static void drawGlow(float x,float y,float radius,Uint8 red,Uint8 green,Uint8 blue,Uint8 alpha) {
@@ -602,6 +615,90 @@ static void drawBackgroundParticles(float time,SDL_Color color,int count,float s
 
 static Uint8 blendChannel(Uint8 first,Uint8 second,float amount) {
   return (Uint8)(first+(second-first)*std::clamp(amount,0.f,1.f));
+}
+
+static float xmbWaveY(float x,float time,float center,float amplitude,float frequency,float slope,float phase) {
+  const float primary=sinf(x*6.2831853f*frequency+phase+time*0.115f);
+  const float detail=sinf(x*6.2831853f*(frequency*2.07f)+phase*0.61f-time*0.072f);
+  return center+slope*(x-0.5f)+amplitude*(primary+detail*0.24f);
+}
+
+static void drawXmbRibbon(float time,float center,float amplitude,float frequency,float slope,float phase,
+                          int halfWidth,SDL_Color color) {
+  constexpr int pointCount=121;
+  std::array<SDL_Point,pointCount> points{};
+  for(int offset=-halfWidth;offset<=halfWidth;offset++){
+    float distance=halfWidth?fabsf((float)offset/halfWidth):0.f;
+    Uint8 alpha=(Uint8)(color.a*powf(std::max(0.f,1.f-distance),1.45f));
+    if(alpha<2) continue;
+    for(int point=0;point<pointCount;point++){
+      float x=(float)point/(pointCount-1);
+      points[point]={(int)(x*SW),(int)(xmbWaveY(x,time,center,amplitude,frequency,slope,phase)*SH)+offset};
+    }
+    SDL_SetRenderDrawColor(g_ren,color.r,color.g,color.b,alpha);
+    SDL_RenderDrawLines(g_ren,points.data(),pointCount);
+  }
+}
+
+static void drawXmbFilament(float time,float center,float amplitude,float frequency,float slope,float phase,
+                            SDL_Color color) {
+  constexpr int pointCount=161;
+  std::array<SDL_Point,pointCount> points{};
+  for(int point=0;point<pointCount;point++){
+    float x=(float)point/(pointCount-1);
+    points[point]={(int)(x*SW),(int)(xmbWaveY(x,time,center,amplitude,frequency,slope,phase)*SH)};
+  }
+  SDL_SetRenderDrawColor(g_ren,color.r,color.g,color.b,color.a);
+  SDL_RenderDrawLines(g_ren,points.data(),pointCount);
+}
+
+static void drawXmbSparkles(float time) {
+  for(int index=0;index<42;index++){
+    float x=fmodf(index*0.618034f+time*(0.0022f+(index%5)*0.00045f),1.08f)-0.04f;
+    float y=xmbWaveY(x,time,0.585f,0.095f,0.91f,0.075f,0.4f)+
+            (fmodf(index*0.413f,1.f)-0.5f)*0.31f;
+    float pulse=0.5f+0.5f*sinf(time*(0.55f+(index%7)*0.08f)+index*1.731f);
+    Uint8 alpha=(Uint8)(28.f+pulse*(index%9==0?142.f:82.f));
+    int px=(int)(x*SW),py=(int)(y*SH);
+    fillRect(px,py,index%9==0?3:2,index%9==0?3:2,(SDL_Color){220,246,255,alpha});
+    if(index%9==0&&pulse>0.55f){
+      SDL_SetRenderDrawColor(g_ren,235,251,255,(Uint8)(alpha*0.62f));
+      SDL_RenderDrawLine(g_ren,px-5,py+1,px+7,py+1);
+      SDL_RenderDrawLine(g_ren,px+1,py-5,px+1,py+7);
+    }
+  }
+}
+
+static void drawXmbBackground(float time) {
+  const SDL_Color top={3,37,102,255},middle={8,93,184,255},bottom={0,20,68,255};
+  constexpr int bands=72;
+  for(int band=0;band<bands;band++){
+    float y=(band+0.5f)/bands;
+    SDL_Color color{};
+    if(y<0.52f){
+      float amount=y/0.52f;
+      color={blendChannel(top.r,middle.r,amount),blendChannel(top.g,middle.g,amount),blendChannel(top.b,middle.b,amount),255};
+    } else {
+      float amount=(y-0.52f)/0.48f;
+      color={blendChannel(middle.r,bottom.r,amount),blendChannel(middle.g,bottom.g,amount),blendChannel(middle.b,bottom.b,amount),255};
+    }
+    int y0=band*SH/bands,y1=(band+1)*SH/bands;
+    fillRect(0,y0,SW,y1-y0,color);
+  }
+  if(g_glowTexture){
+    drawGlow(0.10f,0.43f,1.18f,55,157,255,54);
+    drawGlow(0.84f,0.38f,0.92f,41,112,228,42);
+  }
+  drawXmbRibbon(time,0.655f,0.082f,0.78f,-0.105f,2.15f,std::max(12,SH/18),(SDL_Color){63,166,255,31});
+  drawXmbRibbon(time,0.575f,0.074f,0.96f,0.080f,0.35f,std::max(10,SH/25),(SDL_Color){189,235,255,48});
+  drawXmbRibbon(time,0.605f,0.049f,1.28f,-0.025f,3.82f,std::max(5,SH/54),(SDL_Color){230,250,255,72});
+  for(int trace=0;trace<9;trace++){
+    float offset=(trace-4)*0.009f;
+    drawXmbFilament(time,0.588f+offset,0.083f+trace*0.0017f,0.91f,0.052f,
+                    0.62f+trace*0.19f,(SDL_Color){202,241,255,(Uint8)(18+trace%3*8)});
+  }
+  drawXmbFilament(time,0.578f,0.073f,0.96f,0.080f,0.35f,(SDL_Color){243,253,255,136});
+  drawXmbSparkles(time);
 }
 
 static void drawBubble(int centerX,int centerY,int radius,Uint8 alpha) {
@@ -683,6 +780,11 @@ static void clearUiBackground() {
   if(!hasAnimatedBackground()) return;
   ensureGlowTexture();
   float time=g_uiAnimations?SDL_GetTicks()/1000.f:0.f;
+  if(g_launcherTheme==LauncherTheme::Xmb){
+    drawXmbBackground(time);
+    if(g_glowTexture){ SDL_SetTextureColorMod(g_glowTexture,255,255,255); SDL_SetTextureAlphaMod(g_glowTexture,255); }
+    return;
+  }
   if(g_launcherTheme==LauncherTheme::Bubbles){
     drawBubblesBackground(time);
     if(g_glowTexture){ SDL_SetTextureColorMod(g_glowTexture,255,255,255); SDL_SetTextureAlphaMod(g_glowTexture,255); }
@@ -1061,6 +1163,34 @@ struct Game {
   long long added = 0;
   long long played = 0;
 };
+
+static std::string gameCRCFile(const Game &game) {
+  return std::string(GAMECRC_DIR) + "/" + game.key + ".ini";
+}
+
+static uint32_t loadGameCRC(const Game &game) {
+  std::string path = gameCRCFile(game);
+  if (!regularFileExists(path) && game.legacyUnique && !game.legacyKey.empty()) {
+    const std::string legacy = std::string(GAMECRC_DIR) + "/" + game.legacyKey + ".ini";
+    if (regularFileExists(legacy)) path = legacy;
+  }
+  Store values;
+  storeLoad(values, path.c_str());
+  const char *text = storeGet(values, "CRC", "");
+  if (!text || !*text || strlen(text) > 8) return 0;
+  char *end = nullptr;
+  errno = 0;
+  const unsigned long value = strtoul(text, &end, 16);
+  return !errno && end && !*end && value && value <= UINT32_MAX ?
+             static_cast<uint32_t>(value) : 0;
+}
+
+static std::string cheatFileForCRC(uint32_t crc) {
+  char name[32];
+  snprintf(name, sizeof(name), "%08X.pnach", crc);
+  return std::string(CHEATS_DIR) + "/" + name;
+}
+
 static std::vector<Game> g_games;
 static Uint64 g_coverUseSerial = 0;
 static constexpr size_t COVER_CACHE_LIMIT = 28;
@@ -2303,6 +2433,7 @@ static void optValue(const Opt &o, char *out, int n) {
     snprintf(out,n,"%d%s",value,o.suffix?o.suffix:"");
   }
   else if (o.type==OT_TEXT){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"(auto)"); }
+  else if (o.type==OT_HOTKEY){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"None"); }
   else if (o.type==OT_SUBMENU) snprintf(out,n,">");
 }
 static void optAdjust(const Opt &o, int dir) {
@@ -2315,6 +2446,7 @@ static void optAdjust(const Opt &o, int dir) {
     if(v>o.hi)v=o.hi;
     char b[24]; snprintf(b,sizeof(b),"%g",(double)v/o.multiplier); iniSet(o.key,b);
   }
+  else if (o.type==OT_HOTKEY) iniSet(o.key,"None");
 }
 
 static const char *captureButton(SDL_GameController *pad) {
@@ -2351,6 +2483,71 @@ static const char *captureButton(SDL_GameController *pad) {
     drawTextC(g_font_big,SW/2,py+50,"Press a button to bind", COL_HI);
     char sub[64]; snprintf(sub,sizeof(sub),"wait %ds to cancel", remain);
     drawTextC(g_font,SW/2,py+126,sub, COL_DIM);
+    SDL_RenderPresent(g_ren);
+    SDL_Delay(8);
+  }
+}
+
+static std::string captureButtonCombo(SDL_GameController *pad) {
+  struct M { SDL_GameControllerButton button; const char *token; };
+  static const M buttons[] = {
+    {SDL_CONTROLLER_BUTTON_B,"A"},{SDL_CONTROLLER_BUTTON_A,"B"},
+    {SDL_CONTROLLER_BUTTON_Y,"X"},{SDL_CONTROLLER_BUTTON_X,"Y"},
+    {SDL_CONTROLLER_BUTTON_LEFTSHOULDER,"L"},{SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,"R"},
+    {SDL_CONTROLLER_BUTTON_LEFTSTICK,"StickL"},{SDL_CONTROLLER_BUTTON_RIGHTSTICK,"StickR"},
+    {SDL_CONTROLLER_BUTTON_START,"Plus"},{SDL_CONTROLLER_BUTTON_BACK,"Minus"},
+    {SDL_CONTROLLER_BUTTON_DPAD_UP,"Up"},{SDL_CONTROLLER_BUTTON_DPAD_DOWN,"Down"},
+    {SDL_CONTROLLER_BUTTON_DPAD_LEFT,"Left"},{SDL_CONTROLLER_BUTTON_DPAD_RIGHT,"Right"},
+  };
+  if(!pad) return {};
+  constexpr unsigned triggerLeftBit=(unsigned)(sizeof(buttons)/sizeof(*buttons));
+  constexpr unsigned triggerRightBit=triggerLeftBit+1;
+  auto heldMask=[&](){
+    Uint32 mask=0;
+    SDL_GameControllerUpdate();
+    for(unsigned i=0;i<sizeof(buttons)/sizeof(*buttons);i++)
+      if(SDL_GameControllerGetButton(pad,buttons[i].button)) mask|=(Uint32)1u<<i;
+    if(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_TRIGGERLEFT)>16000) mask|=(Uint32)1u<<triggerLeftBit;
+    if(SDL_GameControllerGetAxis(pad,SDL_CONTROLLER_AXIS_TRIGGERRIGHT)>16000) mask|=(Uint32)1u<<triggerRightBit;
+    return mask;
+  };
+  auto maskText=[&](Uint32 mask){
+    std::string value;
+    auto append=[&](const char *token){ if(!value.empty()) value+='+'; value+=token; };
+    for(unsigned i=0;i<sizeof(buttons)/sizeof(*buttons);i++) if(mask&((Uint32)1u<<i)) append(buttons[i].token);
+    if(mask&((Uint32)1u<<triggerLeftBit)) append("ZL");
+    if(mask&((Uint32)1u<<triggerRightBit)) append("ZR");
+    return value;
+  };
+
+  const Uint32 start=SDL_GetTicks();
+  bool armed=false,started=false;
+  Uint32 captured=0;
+  SDL_Event event;
+  for(;;){
+    while(SDL_PollEvent(&event)) if(event.type==SDL_QUIT) return {};
+    const Uint32 held=heldMask();
+    if(!armed){
+      if(!held) armed=true;
+    } else if(held){
+      started=true;
+      captured|=held;
+    } else if(started){
+      return maskText(captured);
+    }
+
+    int remain=10-(int)((SDL_GetTicks()-start)/1000);
+    if(remain<=0) return {};
+    clearUiBackground();
+    int pw=840,ph=250,px=(SW-pw)/2,py=(SH-ph)/2;
+    glassPanel(px,py,pw,ph);
+    border(px,py,pw,ph,3,COL_SEL);
+    drawTextC(g_font_big,SW/2,py+42,"Hold the Turbo button combo",COL_HI);
+    drawTextC(g_font,SW/2,py+104,armed?"Hold every button, then release them":"Release the button used to open this screen",COL_TXT);
+    std::string current=maskText(captured|held);
+    drawTextC(g_font,SW/2,py+148,current.empty()?"Waiting...":current.c_str(),current.empty()?COL_DIM:COL_VAL);
+    char sub[64]; snprintf(sub,sizeof(sub),"%ds to cancel",remain);
+    drawTextC(g_font_sm,SW/2,py+204,sub,COL_DIM);
     SDL_RenderPresent(g_ren);
     SDL_Delay(8);
   }
@@ -2511,6 +2708,13 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
             if(optEnabled(o)){
               char buf[128];
               if(promptText(o.label, iniGet(o.key,o.def), buf, sizeof(buf))) iniSet(o.key,buf);
+            }
+            beginScreenFx();
+          }
+          else if(o.type==OT_HOTKEY){
+            if(optEnabled(o)){
+              std::string combo=captureButtonCombo(pad);
+              if(!combo.empty()) iniSet(o.key,combo.c_str());
             }
             beginScreenFx();
           }
@@ -2730,12 +2934,109 @@ static void libraryStorageScreen() {
   }
 }
 
-static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
+static void runCheatSettings(Game &game,uint32_t crc) {
+  const std::string path=crc?cheatFileForCRC(crc):std::string();
+  NxCheatList cheats{};
+  bool loaded=crc&&nx_cheat_load(path.c_str(),&cheats);
+  int sel=0,top=0;
+  const int rowH=58,y0=118,vis=std::max(1,(SH-y0-66)/rowH);
+  std::string notice;
+  beginScreenFx();
+  for(;;){
+    const int codeCount=loaded?(int)cheats.count:0;
+    const int n=codeCount+1;
+    if(sel>=n) sel=n-1;
+    if(top>sel) top=sel;
+    if(sel>=top+vis) top=sel-vis+1;
+    if(!beginUiFrame()) return;
+    SDL_Event event; navRepeat();
+    while(pollUiEvent(event)){
+      pumpStick(event); int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
+      if(touchScrollList(touch,sel,top,n,vis)) continue;
+      if(touch==TOUCH_TAP){
+        if(ty<topBarH()||ty>=SH-40) return;
+        for(int row=0;row<vis&&top+row<n;row++){
+          int index=top+row,y=y0+row*rowH;
+          if(ty>=y&&ty<y+rowH){ sel=index; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; }
+        }
+        continue;
+      }
+      if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
+      if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) sel=(sel+n-1)%n;
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%n;
+      else if(event.cbutton.button==BTN_CANCEL) return;
+      else if(event.cbutton.button==BTN_CONFIRM&&sel==codeCount) return;
+      else if(sel<codeCount&&(event.cbutton.button==BTN_CONFIRM||
+              event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT||
+              event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)){
+        const NxCheatEntry &entry=cheats.entries[sel];
+        bool enable=entry.enabled_count!=entry.patch_count;
+        if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT) enable=false;
+        if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT) enable=true;
+        if(nx_cheat_set_enabled(path.c_str(),(size_t)sel,enable)){
+          // The core still has one master gate for cheats/<CRC>.pnach. Enabling
+          // an individual code also enables that gate in this game's profile.
+          if(enable) storeSet(g_game,"EmuCore/EnableCheats","true");
+          loaded=nx_cheat_load(path.c_str(),&cheats);
+          notice=enable?"Cheat code enabled":"Cheat code disabled";
+        } else notice="Could not update the PNACH file";
+      }
+    }
+
+    clearUiBackground();
+    char subtitle[256];
+    if(crc) snprintf(subtitle,sizeof(subtitle),"%s  -  CRC %08X",game.title.c_str(),crc);
+    else snprintf(subtitle,sizeof(subtitle),"%s",game.title.c_str());
+    drawHeader("Cheat codes",subtitle);
+    int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
+    const int shown=std::min(vis,n);
+    glassPanel(colX-12,y0-10,colW+24,shown*rowH+18);
+    float target=(float)(y0+(sel-top)*rowH+2);
+    g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
+    fillRect(colX,(int)g_hy,colW,rowH-4,COL_FOCUS);
+    fillRect(colX,(int)g_hy,5,rowH-4,COL_SEL);
+    const int fontHeight=TTF_FontHeight(g_font);
+    for(int row=0;row<vis&&top+row<n;row++){
+      const int index=top+row,slot=y0+row*rowH,y=slot+(rowH-fontHeight)/2;
+      const bool current=index==sel;
+      if(index==codeCount){
+        drawText(g_font,labelX,y,"Back",current?COL_VAL:COL_TXT);
+        drawTextR(g_font,valX,y,"<",current?COL_VAL:COL_DIM);
+      } else {
+        const NxCheatEntry &entry=cheats.entries[index];
+        const char *state=!entry.enabled_count?"Off":(entry.enabled_count==entry.patch_count?"On":"Mixed");
+        drawScrollTextL(g_font,labelX,y,valX-labelX-130,entry.name,current?COL_VAL:COL_TXT);
+        drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,state,current?COL_VAL:COL_DIM);
+      }
+    }
+    if(!crc){
+      drawTextC(g_font,SW/2,SH-150,"Launch this game once so NetherSX2 can identify its CRC.",COL_HI);
+    } else if(!loaded){
+      drawTextC(g_font,SW/2,SH-176,"The PNACH file could not be read.",COL_HI);
+    } else if(!cheats.file_exists){
+      drawTextC(g_font,SW/2,SH-184,"No cheat file found. Add this file to the cheats folder:",COL_HI);
+      char filename[32]; snprintf(filename,sizeof(filename),"%08X.pnach",crc);
+      drawTextC(g_font,SW/2,SH-144,filename,COL_VAL);
+    } else if(!cheats.count){
+      drawTextC(g_font,SW/2,SH-150,"No PNACH sections or named code blocks were found.",COL_HI);
+    } else if(!notice.empty()){
+      drawTextC(g_font_sm,SW/2,SH-86,notice.c_str(),notice.find("Could not")==0?(SDL_Color){235,120,120,255}:COL_HI);
+    }
+    drawTextC(g_font_sm,SW/2,SH-42,"A  Toggle     Left  Off     Right  On     B  Back",COL_DIM);
+    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+  }
+}
+
+static void runSettingsRoot(SDL_GameController *pad, const char *ctx, Game *game) {
   static const int order[] = { SCR_EMU, SCR_GRAPHICS, SCR_AUDIO, SCR_NETWORK, SCR_CONTROLLER };
   const int nscr=(int)(sizeof(order)/sizeof(*order));
-  bool global=!(ctx&&*ctx);
-  int launcherRow=0,libraryRow=1,screenStart=2;
-  int n=nscr+(global?2:0),sel=0,top=0;
+  const bool global=!(ctx&&*ctx);
+  const bool hasCheatRow=!global&&game;
+  const int launcherRow=0,libraryRow=1,cheatRow=0;
+  const int screenStart=global?2:(hasCheatRow?1:0);
+  const int n=nscr+(global?2:(hasCheatRow?1:0));
+  const uint32_t gameCRC=hasCheatRow?loadGameCRC(*game):0;
+  int sel=0,top=0;
   const int rowH=58,y0=92,sectionGap=34,vis=std::max(1,(SH-y0-42-sectionGap)/rowH);
   auto rowY=[&](int index){ return y0+(index-top)*rowH+(global&&index>=screenStart?sectionGap:0); };
   beginScreenFx();
@@ -2756,7 +3057,8 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
       else if(event.cbutton.button==BTN_CONFIRM){
         if(global&&sel==launcherRow) launcherSettingsScreen();
         else if(global&&sel==libraryRow) libraryStorageScreen();
-        else runSettings(order[global?sel-screenStart:sel],pad,ctx);
+        else if(hasCheatRow&&sel==cheatRow) runCheatSettings(*game,gameCRC);
+        else runSettings(order[sel-screenStart],pad,ctx);
         beginScreenFx();
       } else if(event.cbutton.button==BTN_CANCEL) return;
       if(sel<top) top=sel;
@@ -2780,14 +3082,18 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
       int index=top+row,slot=rowY(index),y=slot+(rowH-fontHeight)/2; bool current=index==sel;
       if(global&&index==launcherRow){
         const char *theme=storeGet(g_global,"Wrapper/Theme","animated");
-        const char *value=!strcmp(theme,"animated")?"Glow":(!strcmp(theme,"classic")?"Classic":(!strcmp(theme,"oled")?"OLED black":"Bubbles"));
+        const char *value=!strcmp(theme,"xmb")?"XMB (PS3)":(!strcmp(theme,"animated")?"Glow":(!strcmp(theme,"classic")?"Classic":(!strcmp(theme,"oled")?"OLED black":"Bubbles")));
         drawText(g_font,labelX,y,"Launcher",current?COL_VAL:COL_TXT);
         drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,value,current?COL_VAL:COL_DIM);
       } else if(global&&index==libraryRow){
         drawText(g_font,labelX,y,"Library & storage",current?COL_VAL:COL_TXT);
         drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"games / files / network",current?COL_VAL:COL_DIM);
+      } else if(hasCheatRow&&index==cheatRow){
+        drawText(g_font,labelX,y,"Cheat codes",current?COL_VAL:COL_TXT);
+        if(gameCRC){ char value[24]; snprintf(value,sizeof(value),"CRC %08X",gameCRC); drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,value,current?COL_VAL:COL_DIM); }
+        else drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"launch once",current?COL_VAL:COL_DIM);
       } else {
-        drawText(g_font,labelX,y,g_screens[order[global?index-screenStart:index]].title,current?COL_VAL:COL_TXT);
+        drawText(g_font,labelX,y,g_screens[order[index-screenStart]].title,current?COL_VAL:COL_TXT);
         drawTextR(g_font,valX,y,">",current?COL_VAL:COL_DIM);
       }
     }
@@ -3244,7 +3550,7 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
           if(sel==0) return 1;
           else if(sel==1){
             g_active=&g_game;
-            runSettingsRoot(pad,g.title.c_str());
+            runSettingsRoot(pad,g.title.c_str(),&g);
             g_active=&g_global;
             mkdir(GAMECFG_DIR,0777);
             bool saved=true;
@@ -3282,9 +3588,11 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
               }
               remove(coverPath(g).c_str());
               remove(gp.c_str());
+              remove(gameCRCFile(g).c_str());
               if(g.legacyUnique&&!g.legacyKey.empty()){
                 remove((std::string(COVERS_DIR)+"/"+g.legacyKey+".png").c_str());
                 remove(legacyGp.c_str());
+                remove((std::string(GAMECRC_DIR)+"/"+g.legacyKey+".ini").c_str());
                 storeRemove(g_titles,g.legacyKey.c_str());
                 storeRemove(g_recent,g.legacyKey.c_str());
               }
@@ -3678,7 +3986,7 @@ int main(int argc, char **argv){
 
   g_griddbReady=griddb_global_init();
   if(!g_griddbReady&&R_SUCCEEDED(socketInitializeDefault())) g_storageSocketReady=true;
-  const char *directories[]={"sdmc:/switch",DATA_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,DEF_GAMEDIR,BIOS_DIR,RESOURCES_DIR};
+  const char *directories[]={"sdmc:/switch",DATA_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,GAMECRC_DIR,CHEATS_DIR,DEF_GAMEDIR,BIOS_DIR,RESOURCES_DIR};
   for(const char *directory:directories) if(!ensureDirectory(directory)) return startupFailure("Could not create the NetherSX2 data directories.");
 
   struct stat configStat{};
@@ -3696,7 +4004,7 @@ int main(int argc, char **argv){
     storeSet(g_global,"Wrapper/Theme","animated");
     storeSet(g_global,"Wrapper/GridColumns","6");
     storeSet(g_global,"Wrapper/GridRows","2");
-    storeSet(g_global,"Wrapper/ControllerCount","1");
+    storeSet(g_global,"Wrapper/ControllerCount","2");
     storeSet(g_global,"Wrapper/Pad1/Deadzone","10");
     storeSet(g_global,"Wrapper/ShowGameTitles","true");
     storeSet(g_global,"Wrapper/UiAnimations","true");
@@ -3843,7 +4151,7 @@ int main(int argc, char **argv){
           break;
         case BTN_SETTINGS: {
           std::vector<std::string> oldPaths=gamePaths;
-          g_active=&g_global; runSettingsRoot(g_pad,nullptr); storeSave(g_global,LAUNCHER_INI);
+          g_active=&g_global; runSettingsRoot(g_pad,nullptr,nullptr); storeSave(g_global,LAUNCHER_INI);
           layout=gridLayout(); cols=layout.cols; rows=layout.rows;
           gamePaths=loadGameSources();
           if(gamePaths!=oldPaths||g_rescanAfterSettings){
@@ -3890,16 +4198,23 @@ int main(int argc, char **argv){
     appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
     if(haveCore){ std::string corePath="/switch/nethersx2/cores/libemucore_"+build+".so"; storeSet(g_global,"Wrapper/CoreSo",corePath.c_str()); }
     Store effective=g_global;
+    std::string gameConfigPath,gameCRCPath;
     if(!launchKey.empty()){
       std::string profile=std::string(GAMECFG_DIR)+"/"+launchKey+".ini";
       if(!regularFileExists(profile)&&launchLegacyUnique&&!launchLegacyKey.empty()) profile=std::string(GAMECFG_DIR)+"/"+launchLegacyKey+".ini";
       Store overrides; storeLoad(overrides,profile.c_str());
       for(const auto &entry:overrides.kv) storeSet(effective,entry.k.c_str(),entry.v.c_str());
+      gameConfigPath=toEmu(profile);
+      gameCRCPath=toEmu(std::string(GAMECRC_DIR)+"/"+launchKey+".ini");
     }
     storeSet(effective,"EmuCore/DiscPath",toEmu(launchPath).c_str());
     storeRemove(effective,"Wrapper/LauncherPath");
+    storeRemove(effective,"Wrapper/GameConfigPath");
+    storeRemove(effective,"Wrapper/GameCRCPath");
     const std::string launcherPath=launcherNroPath();
     if(!launcherPath.empty()) storeSet(effective,"Wrapper/LauncherPath",launcherPath.c_str());
+    if(!gameConfigPath.empty()) storeSet(effective,"Wrapper/GameConfigPath",gameConfigPath.c_str());
+    if(!gameCRCPath.empty()) storeSet(effective,"Wrapper/GameCRCPath",gameCRCPath.c_str());
     bool configSaved=storeSave(effective,EMU_INI);
     willChain=haveCore&&haveEmulator&&haveResources&&configSaved;
     if(!willChain){

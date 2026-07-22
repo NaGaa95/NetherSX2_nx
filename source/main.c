@@ -28,6 +28,7 @@
 #include "keycodes.h"
 #include "syslang.h"
 #include "SwitchStorageBridge.h"
+#include "CheatManager.h"
 
 // Android MotionEvent axis codes (handleControllerAxisEvent expects these)
 #define AAXIS_X         0
@@ -197,6 +198,7 @@ static struct {
   void (*saveStateSlot)(void *env, void *cls, int slot);
   void (*loadStateSlot)(void *env, void *cls, int slot);
   void (*toggleLimiterMode)(void *env, void *cls, int mode);
+  void (*reloadPatches)(void *env, void *cls);
   void (*setPadValue)(void *env, void *cls, int controller, int bind, float value);
   void (*handleControllerButtonEvent)(void *env, void *cls, int dev, int code, jbool down);
   void (*handleControllerAxisEvent)(void *env, void *cls, int dev, int axis, float value);
@@ -224,6 +226,7 @@ static void resolve_entry_points(void) {
   RESOLVE(saveStateSlot,               NLSYM("saveStateSlot"));
   RESOLVE(loadStateSlot,               NLSYM("loadStateSlot"));
   RESOLVE(toggleLimiterMode,           NLSYM("toggleLimiterMode"));
+  nl.reloadPatches = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("reloadPatches"));
   // setPadValue drives the emulated DualShock2 DIRECTLY (this is what AetherSX2's
   // on-screen touch controls use), bypassing InputManager's binding layer -- which
   // is empty for us: setDefaultPadSettings only writes Pad1 knobs (Type/Deadzone/
@@ -244,6 +247,20 @@ static void resolve_entry_points(void) {
 static char g_disc_path[1024];
 static char g_core_so[256];   // core .so to load (Wrapper/CoreSo, default SO_NAME)
 static volatile int g_vm_running = 0;
+static uint32_t g_game_crc;
+static int g_game_crc_changed;
+
+// The Android frontend receives this same callback and uses the CRC to resolve
+// cheats/<CRC>.pnach. Keep the callback data instead of discarding it so the
+// native overlay can operate on the exact file selected by the core.
+void wrapper_game_changed(const char *path, const char *serial,
+                          const char *title, uint32_t crc) {
+  (void)path;
+  (void)serial;
+  (void)title;
+  __atomic_store_n(&g_game_crc, crc, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_game_crc_changed, 1, __ATOMIC_RELEASE);
+}
 
 static void *emu_thread_main(void *arg) {
   (void)arg;
@@ -267,7 +284,7 @@ static pthread_t emu_thread;
 static HidVibrationDeviceHandle g_vib_players[MAX_CONTROLLERS][2], g_vib_hh[2];
 static int g_vib_ready[MAX_CONTROLLERS], g_vib_hh_ready;
 static int g_vibration = 1;   // Wrapper/Vibration user toggle
-static int g_controller_count = 1;
+static int g_controller_count = 2;
 
 static void rumble_init(void) {
   static const HidNpadIdType ids[MAX_CONTROLLERS] = {
@@ -519,12 +536,33 @@ typedef struct {
   float deadzone;
 } PadConfig;
 static PadConfig g_pad_config[MAX_CONTROLLERS];
+static u64 g_turbo_combo;
+static int g_turbo_active;
+static int g_turbo_blocked;
 
 static u64 tok_to_hid(const char *tok) {
   if (!tok || !*tok || !strcasecmp(tok, "None")) return 0;
   for (unsigned i = 0; i < sizeof(hid_tokens) / sizeof(*hid_tokens); i++)
     if (!strcasecmp(tok, hid_tokens[i].tok)) return hid_tokens[i].hid;
   return 0; // unknown token -> unbound
+}
+
+static u64 combo_to_hid(const char *combo) {
+  if (!combo || !*combo || !strcasecmp(combo, "None")) return 0;
+  char buffer[192];
+  if (strlen(combo) >= sizeof(buffer)) return 0;
+  strcpy(buffer, combo);
+  u64 mask = 0;
+  char *save = NULL;
+  for (char *part = strtok_r(buffer, "+", &save); part; part = strtok_r(NULL, "+", &save)) {
+    while (*part && isspace((unsigned char)*part)) part++;
+    char *end = part + strlen(part);
+    while (end > part && isspace((unsigned char)end[-1])) *--end = '\0';
+    const u64 button = tok_to_hid(part);
+    if (!button) return 0;
+    mask |= button;
+  }
+  return mask;
 }
 
 static int stick_src_from_tok(const char *tok) {
@@ -561,7 +599,7 @@ static int pad_pref_int(int player, const char *name, int def) {
 }
 
 static void pad_load_bindings(void) {
-  g_controller_count = prefs_get_int("Wrapper/ControllerCount", 1);
+  g_controller_count = prefs_get_int("Wrapper/ControllerCount", 2);
   if (g_controller_count < 1) g_controller_count = 1;
   if (g_controller_count > MAX_CONTROLLERS) g_controller_count = MAX_CONTROLLERS;
   memset(g_pad_config, 0, sizeof(g_pad_config));
@@ -588,6 +626,7 @@ static void pad_load_bindings(void) {
     config->deadzone = (float)deadzone / 100.0f;
   }
   g_vibration = prefs_get_bool("Wrapper/Vibration", true);
+  g_turbo_combo = combo_to_hid(prefs_get_string("Wrapper/TurboCombo", "None"));
 }
 
 static void pad_axis(int controller, int neg_bind, int pos_bind, float v) {
@@ -620,6 +659,7 @@ static void apply_ps2_stick(int controller, const PadConfig *config, const PadSt
 typedef enum {
   QUICK_MENU_CLOSED,
   QUICK_MENU_MAIN,
+  QUICK_MENU_CHEATS,
   QUICK_MENU_MAPPING,
   QUICK_MENU_CAPTURE
 } QuickMenuMode;
@@ -627,6 +667,7 @@ typedef enum {
 static QuickMenuMode g_quick_menu_mode;
 static int g_quick_menu_selection;
 static int g_quick_menu_slot;
+static int g_quick_menu_cheat_selection;
 static int g_quick_menu_map_player;
 static int g_quick_menu_map_selection;
 static int g_quick_menu_capture_armed;
@@ -644,6 +685,10 @@ static const char *const g_ee_cycle_rate_labels[] = {
 static const char *const g_ee_cycle_skip_labels[] = {
   "Off", "Mild", "Moderate", "Maximum"
 };
+
+static NxCheatList g_quick_cheats;
+static char g_quick_cheat_path[256];
+static int g_quick_cheat_load_ok;
 
 static void text_append(char *buffer, size_t size, const char *format, ...) {
   size_t used = strlen(buffer);
@@ -679,27 +724,82 @@ static void quick_menu_release_inputs(void) {
 static void quick_menu_draw_main(void) {
   static const char *labels[] = {
     "Resume game", "State slot", "Load state", "Save state",
-    "Controller mapping", "Frame limiter", "EE cycle rate", "EE cycle skip",
-    "Reset console", "Exit game"
+    "Controller mapping", "Cheat codes", "Frame limiter", "EE cycle rate",
+    "EE cycle skip", "Reset console", "Exit game"
   };
   char text[1024] = "NETHERSX2 QUICK MENU\n\n";
   for (int i = 0; i < (int)(sizeof(labels) / sizeof(*labels)); i++) {
     const char *marker = i == g_quick_menu_selection ? "> " : "  ";
     if (i == 1)
       text_append(text, sizeof(text), "%s%s: %d\n", marker, labels[i], g_quick_menu_slot);
-    else if (i == 5)
-      text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
-                  g_quick_menu_limiter_unlimited ? "Unlimited" : "Limited");
     else if (i == 6)
       text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
-                  g_ee_cycle_rate_labels[g_quick_menu_ee_cycle_rate + 3]);
+                  g_quick_menu_limiter_unlimited ? "Unlimited" : "Limited");
     else if (i == 7)
+      text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
+                  g_ee_cycle_rate_labels[g_quick_menu_ee_cycle_rate + 3]);
+    else if (i == 8)
       text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
                   g_ee_cycle_skip_labels[g_quick_menu_ee_cycle_skip]);
     else
       text_append(text, sizeof(text), "%s%s\n", marker, labels[i]);
   }
   text_append(text, sizeof(text), "\nA  Select     B  Close     Left/Right  Change");
+  quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+}
+
+static void quick_menu_refresh_cheats(void) {
+  memset(&g_quick_cheats, 0, sizeof(g_quick_cheats));
+  g_quick_cheat_path[0] = '\0';
+  const uint32_t crc = __atomic_load_n(&g_game_crc, __ATOMIC_ACQUIRE);
+  if (!crc) {
+    g_quick_cheat_load_ok = 1;
+    return;
+  }
+  snprintf(g_quick_cheat_path, sizeof(g_quick_cheat_path),
+           DATA_ROOT "/cheats/%08X.pnach", crc);
+  g_quick_cheat_load_ok = nx_cheat_load(g_quick_cheat_path, &g_quick_cheats);
+  if (g_quick_menu_cheat_selection > (int)g_quick_cheats.count)
+    g_quick_menu_cheat_selection = (int)g_quick_cheats.count;
+}
+
+static void quick_menu_draw_cheats(void) {
+  quick_menu_refresh_cheats();
+  const uint32_t crc = __atomic_load_n(&g_game_crc, __ATOMIC_ACQUIRE);
+  char text[1024];
+  if (crc)
+    snprintf(text, sizeof(text), "CHEAT CODES - CRC %08X\n\n", crc);
+  else
+    snprintf(text, sizeof(text), "CHEAT CODES\n\n");
+  if (!crc) {
+    text_append(text, sizeof(text), "Waiting for the running game's CRC.\n\n> Back\n");
+  } else if (!g_quick_cheat_load_ok) {
+    text_append(text, sizeof(text), "Could not read %08X.pnach.\n\n> Back\n", crc);
+  } else if (!g_quick_cheats.file_exists) {
+    text_append(text, sizeof(text), "No cheat file found.\n\nPlace %08X.pnach in:\n/switch/nethersx2/cheats/\n\n> Back\n", crc);
+  } else if (!g_quick_cheats.count) {
+    text_append(text, sizeof(text), "No named PNACH code blocks were found.\n\n> Back\n");
+  } else {
+    const int count = (int)g_quick_cheats.count;
+    int first = g_quick_menu_cheat_selection > 3 ? g_quick_menu_cheat_selection - 3 : 0;
+    if (first > count - 6) first = count > 6 ? count - 6 : 0;
+    int last = first + 7;
+    if (last > count + 1) last = count + 1;
+    for (int item = first; item < last; item++) {
+      const char *marker = item == g_quick_menu_cheat_selection ? "> " : "  ";
+      if (item == count) {
+        text_append(text, sizeof(text), "%sBack\n", marker);
+      } else {
+        const NxCheatEntry *entry = &g_quick_cheats.entries[item];
+        const char *state = !entry->enabled_count ? "[ ]" :
+                            entry->enabled_count == entry->patch_count ? "[x]" : "[-]";
+        text_append(text, sizeof(text), "%s%s %.74s\n", marker, state, entry->name);
+      }
+    }
+    if (g_quick_cheats.truncated)
+      text_append(text, sizeof(text), "\nOnly the first %d codes are shown.", NX_CHEAT_MAX_ENTRIES);
+  }
+  text_append(text, sizeof(text), "\nA  Toggle     Left  Off     Right  On     B  Back");
   quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
 }
 
@@ -771,10 +871,11 @@ static const char *quick_menu_pressed_token(u64 pressed) {
   return NULL;
 }
 
-static bool quick_menu_persist_launcher_setting(const char *key, const char *value) {
-  const char *path = DATA_ROOT "/launcher.ini";
-  const char *tmp = DATA_ROOT "/launcher.ini.tmp";
-  const char *old = DATA_ROOT "/launcher.ini.old";
+static bool quick_menu_persist_setting(const char *path, const char *key, const char *value) {
+  char tmp[1024], old[1024];
+  if (!path || !*path || snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+      snprintf(old, sizeof(old), "%s.old", path) >= (int)sizeof(old))
+    return false;
   remove(tmp);
   struct stat st;
   if (stat(path, &st) != 0 && stat(old, &st) == 0)
@@ -826,17 +927,71 @@ static bool quick_menu_persist_launcher_setting(const char *key, const char *val
   return true;
 }
 
+static bool quick_menu_persist_launcher_setting(const char *key, const char *value) {
+  return quick_menu_persist_setting(DATA_ROOT "/launcher.ini", key, value);
+}
+
+static bool quick_menu_persist_game_setting(const char *key, const char *value) {
+  const char *path = prefs_get_string("Wrapper/GameConfigPath", "");
+  static const char prefix[] = DATA_ROOT "/gamecfg/";
+  if (strncmp(path, prefix, sizeof(prefix) - 1) || strstr(path, "/../"))
+    return false;
+  return quick_menu_persist_setting(path, key, value);
+}
+
+static void quick_menu_persist_game_crc(void) {
+  if (!__atomic_exchange_n(&g_game_crc_changed, 0, __ATOMIC_ACQ_REL)) return;
+  const uint32_t crc = __atomic_load_n(&g_game_crc, __ATOMIC_ACQUIRE);
+  const char *path = prefs_get_string("Wrapper/GameCRCPath", "");
+  static const char prefix[] = DATA_ROOT "/gamecrc/";
+  if (!crc || strncmp(path, prefix, sizeof(prefix) - 1) || strstr(path, "/../")) return;
+  char value[16];
+  snprintf(value, sizeof(value), "%08X", crc);
+  // One attempt per core callback. Retrying a failed SD write at the 120 Hz
+  // input rate would only make a storage fault worse.
+  quick_menu_persist_setting(path, "CRC", value);
+}
+
+static void quick_menu_save_prefs_preserving_messages(void) {
+  if (g_quick_menu_restore_messages)
+    prefs_set_bool("EmuCore/GS/OsdShowMessages", false);
+  prefs_save();
+  if (g_quick_menu_restore_messages)
+    prefs_set_bool("EmuCore/GS/OsdShowMessages", true);
+}
+
+typedef enum {
+  QUICK_CHEAT_UPDATE_FAILED,
+  QUICK_CHEAT_UPDATE_OK,
+  QUICK_CHEAT_UPDATE_PROFILE_UNSAVED
+} QuickCheatUpdateResult;
+
+static QuickCheatUpdateResult quick_menu_set_cheat_enabled(unsigned index, bool enabled) {
+  if (!g_quick_cheat_load_ok || index >= g_quick_cheats.count ||
+      !nx_cheat_set_enabled(g_quick_cheat_path, index, enabled))
+    return QUICK_CHEAT_UPDATE_FAILED;
+
+  bool profile_saved = true;
+  if (enabled) {
+    // This is the core's master gate for cheats/<CRC>.pnach. Enabling an
+    // individual code also enables that gate for this game; disabling a code
+    // leaves the user's existing master setting untouched.
+    prefs_set_bool("EmuCore/EnableCheats", true);
+    quick_menu_save_prefs_preserving_messages();
+    nl.applySettings(fake_env, NATIVE_CLASS);
+    profile_saved = quick_menu_persist_game_setting("EmuCore/EnableCheats", "true");
+  }
+  if (nl.reloadPatches) nl.reloadPatches(fake_env, NATIVE_CLASS);
+  return profile_saved ? QUICK_CHEAT_UPDATE_OK : QUICK_CHEAT_UPDATE_PROFILE_UNSAVED;
+}
+
 static bool quick_menu_store_binding(const char *token) {
   const unsigned bind = (unsigned)(g_quick_menu_map_selection - 1);
   char key[64];
   snprintf(key, sizeof(key), "Wrapper/Pad%d/%s", g_quick_menu_map_player + 1,
            ps2_buttons[bind].key);
   prefs_set_string(key, token);
-  if (g_quick_menu_restore_messages)
-    prefs_set_bool("EmuCore/GS/OsdShowMessages", false);
-  prefs_save();
-  if (g_quick_menu_restore_messages)
-    prefs_set_bool("EmuCore/GS/OsdShowMessages", true);
+  quick_menu_save_prefs_preserving_messages();
   pad_load_bindings();
   return quick_menu_persist_launcher_setting(key, token);
 }
@@ -872,7 +1027,7 @@ static bool quick_menu_update(u64 down, u64 pressed) {
   if (!pressed) return true;
 
   if (g_quick_menu_mode == QUICK_MENU_MAIN) {
-    const int item_count = 10;
+    const int item_count = 11;
     if (pressed & HidNpadButton_Up)
       g_quick_menu_selection = (g_quick_menu_selection + item_count - 1) % item_count;
     if (pressed & HidNpadButton_Down)
@@ -881,25 +1036,25 @@ static bool quick_menu_update(u64 down, u64 pressed) {
       g_quick_menu_slot = (g_quick_menu_slot + 9) % 10;
     if (g_quick_menu_selection == 1 && (pressed & HidNpadButton_Right))
       g_quick_menu_slot = (g_quick_menu_slot + 1) % 10;
-    if (g_quick_menu_selection == 6 && (pressed & HidNpadButton_Left) &&
+    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Left) &&
         g_quick_menu_ee_cycle_rate > -3) {
       g_quick_menu_ee_cycle_rate--;
       prefs_set_int("EmuCore/Speedhacks/EECycleRate", g_quick_menu_ee_cycle_rate);
       nl.applySettings(fake_env, NATIVE_CLASS);
     }
-    if (g_quick_menu_selection == 6 && (pressed & HidNpadButton_Right) &&
+    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Right) &&
         g_quick_menu_ee_cycle_rate < 3) {
       g_quick_menu_ee_cycle_rate++;
       prefs_set_int("EmuCore/Speedhacks/EECycleRate", g_quick_menu_ee_cycle_rate);
       nl.applySettings(fake_env, NATIVE_CLASS);
     }
-    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Left) &&
+    if (g_quick_menu_selection == 8 && (pressed & HidNpadButton_Left) &&
         g_quick_menu_ee_cycle_skip > 0) {
       g_quick_menu_ee_cycle_skip--;
       prefs_set_int("EmuCore/Speedhacks/EECycleSkip", g_quick_menu_ee_cycle_skip);
       nl.applySettings(fake_env, NATIVE_CLASS);
     }
-    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Right) &&
+    if (g_quick_menu_selection == 8 && (pressed & HidNpadButton_Right) &&
         g_quick_menu_ee_cycle_skip < 3) {
       g_quick_menu_ee_cycle_skip++;
       prefs_set_int("EmuCore/Speedhacks/EECycleSkip", g_quick_menu_ee_cycle_skip);
@@ -928,21 +1083,64 @@ static bool quick_menu_update(u64 down, u64 pressed) {
           quick_menu_draw_mapping();
           return true;
         case 5:
+          g_quick_menu_mode = QUICK_MENU_CHEATS;
+          g_quick_menu_cheat_selection = 0;
+          quick_menu_draw_cheats();
+          return true;
+        case 6:
           nl.toggleLimiterMode(fake_env, NATIVE_CLASS, 3);
           g_quick_menu_limiter_unlimited = !g_quick_menu_limiter_unlimited;
           break;
-        case 8:
+        case 9:
           nl.resetVM(fake_env, NATIVE_CLASS);
           quick_menu_close();
           quick_menu_status("Console reset");
           return true;
-        case 9:
+        case 10:
           g_quick_menu_exit_requested = 1;
           quick_menu_close();
           return true;
       }
     }
     quick_menu_draw_main();
+    return true;
+  }
+
+  if (g_quick_menu_mode == QUICK_MENU_CHEATS) {
+    const int code_count = (int)g_quick_cheats.count;
+    const int item_count = code_count + 1;
+    if (pressed & HidNpadButton_Up)
+      g_quick_menu_cheat_selection = (g_quick_menu_cheat_selection + item_count - 1) % item_count;
+    if (pressed & HidNpadButton_Down)
+      g_quick_menu_cheat_selection = (g_quick_menu_cheat_selection + 1) % item_count;
+    if (pressed & HidNpadButton_B) {
+      g_quick_menu_mode = QUICK_MENU_MAIN;
+      quick_menu_draw_main();
+      return true;
+    }
+    if ((pressed & HidNpadButton_A) && g_quick_menu_cheat_selection == code_count) {
+      g_quick_menu_mode = QUICK_MENU_MAIN;
+      quick_menu_draw_main();
+      return true;
+    }
+    if (g_quick_menu_cheat_selection < code_count &&
+        (pressed & (HidNpadButton_A | HidNpadButton_Left | HidNpadButton_Right))) {
+      const NxCheatEntry *entry = &g_quick_cheats.entries[g_quick_menu_cheat_selection];
+      bool enable = entry->enabled_count != entry->patch_count;
+      if (pressed & HidNpadButton_Left) enable = false;
+      if (pressed & HidNpadButton_Right) enable = true;
+      const QuickCheatUpdateResult result = quick_menu_set_cheat_enabled(
+          (unsigned)g_quick_menu_cheat_selection, enable);
+      if (result == QUICK_CHEAT_UPDATE_FAILED) {
+        quick_menu_status("Could not update the PNACH cheat file");
+      } else if (result == QUICK_CHEAT_UPDATE_PROFILE_UNSAVED) {
+        quick_menu_status("Code changed; per-game cheat gate could not be saved");
+      } else {
+        quick_menu_status(enable ? "Cheat code enabled" :
+                                   "Cheat code disabled (reset may be required)");
+      }
+    }
+    quick_menu_draw_cheats();
     return true;
   }
 
@@ -983,16 +1181,33 @@ static bool quick_menu_update(u64 down, u64 pressed) {
   return true;
 }
 
+static void turbo_set_active(int active) {
+  active = active != 0;
+  if (active == g_turbo_active) return;
+  // Limiter mode 1 is Turbo; requesting it again returns the core to Nominal.
+  nl.toggleLimiterMode(fake_env, NATIVE_CLASS, 1);
+  g_turbo_active = active;
+}
+
 static void update_gamepads(void) {
+  quick_menu_persist_game_crc();
   for (int player = 0; player < g_controller_count; player++)
     padUpdate(&g_pads[player]);
   const u64 menu_down = padGetButtons(&g_pads[0]);
   const u64 menu_pressed = menu_down & ~g_pad_previous[0];
   if (quick_menu_update(menu_down, menu_pressed)) {
+    turbo_set_active(0);
+    g_turbo_blocked = 1;
     for (int player = 0; player < g_controller_count; player++)
       g_pad_previous[player] = padGetButtons(&g_pads[player]);
     return;
   }
+  int turbo_down = g_turbo_combo && (menu_down & g_turbo_combo) == g_turbo_combo;
+  if (g_turbo_blocked) {
+    if (!turbo_down) g_turbo_blocked = 0;
+    turbo_down = 0;
+  }
+  turbo_set_active(turbo_down);
   for (int player = 0; player < g_controller_count; player++) {
     PadState *pad = &g_pads[player];
     PadConfig *config = &g_pad_config[player];
@@ -1135,12 +1350,14 @@ int main(void) {
   NATIVE_CLASS = jni_obj_new("xyz/aethersx2/android/NativeLibrary");
   FAKE_CONTEXT = jni_obj_new("android/content/Context");
   FAKE_SURFACE = jni_obj_new("android/view/Surface");
-  run_startup_sequence();
-
-  padConfigureInput(g_controller_count, HidNpadStyleSet_NpadStandard);
+  // Keep both Horizon player slots advertised even when only one PS2 port is
+  // enabled. Advertising g_controller_count here made HOS power off player 2
+  // as soon as the game runtime replaced the launcher's input configuration.
+  padConfigureInput(MAX_CONTROLLERS, HidNpadStyleSet_NpadStandard);
   padInitialize(&g_pads[0], HidNpadIdType_No1, HidNpadIdType_Handheld);
   padInitialize(&g_pads[1], HidNpadIdType_No2);
   hidInitializeTouchScreen();
+  run_startup_sequence();
   rumble_init();
 
 #if GS_RENDERER == GS_RENDERER_VK
@@ -1181,6 +1398,7 @@ int main(void) {
 
   if (g_quick_menu_mode != QUICK_MENU_CLOSED)
     quick_menu_close();
+  turbo_set_active(0);
 
   const int has_next_load = envHasNextLoad();
   const char *launcher_path = prefs_get_string("Wrapper/LauncherPath", "");

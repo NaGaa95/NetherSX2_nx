@@ -19,7 +19,9 @@ settings, then chainloads the emulator.
 The launcher supports multiple library folders across SD, USB mass storage, and SMB shares.
 
 **L + R + Plus** to open the quick menu for save states, controller rebinding,
-frame-limiter control, reset, and exit.
+selectable per-game PNACH cheat codes, frame-limiter control, reset, and exit.
+The cheat browser reads `/switch/nethersx2/cheats/<CRC>.pnach`, recognizes PNACH
+`[sections]` and legacy `// code name` blocks.
 
 No emulator core, BIOS, or game assets are included in this repository.
 

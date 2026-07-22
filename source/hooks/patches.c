@@ -40,6 +40,8 @@ static const Patch g_patches_4248[] = {
   { 0x61c964, 0x54000221, INSN_NOP, "center display Y" },
   // Horizon cannot write-protect the ashmem-backed EE RAM for SMC detection.
   { 0x711180, 0xb940054a, 0x5280004a, "SMC: force ProtMode_Manual" },
+  // Android exposes 0.25x, but this core revision clamps the GS multiplier to 0.5x.
+  { 0x4bab84, 0x1e2c1002, 0x1e2a1002, "GS upscale minimum 0.25x" },
 };
 
 static const Patch g_patches_3668[] = {
@@ -59,6 +61,7 @@ static const Patch g_patches_3668[] = {
   { 0x62a204, 0x54000141, INSN_NOP, "center display X" },
   { 0x62a244, 0x54000221, INSN_NOP, "center display Y" },
   { 0x6f6c10, 0xb940054a, 0x5280004a, "SMC: force ProtMode_Manual" },
+  { 0x4ab4a8, 0x1e2c1002, 0x1e2a1002, "GS upscale minimum 0.25x" },
 };
 
 // Ignore the core's boot-time RequestStop until application shutdown.

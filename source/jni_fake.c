@@ -633,6 +633,8 @@ static void *dispatch_object(void *recv, const char *name, const char *sig, va_l
 }
 
 extern void wrapper_rumble(int player, float large, float small);
+extern void wrapper_game_changed(const char *path, const char *serial,
+                                 const char *title, uint32_t crc);
 
 // -- void-returning calls -----------------------------------------------------
 static void dispatch_void(const char *name, va_list va) {
@@ -646,10 +648,11 @@ static void dispatch_void(const char *name, va_list va) {
 
   // NativeLibrary.onGameChanged(path, serial, title, crc)
   if (!strcmp(name, "onGameChanged")) {
-    void *jpath = va_arg(va, void *); (void)jpath;
-    (void)va_arg(va, void *);
-    (void)va_arg(va, void *);
-    (void)va_arg(va, int);
+    void *jpath = va_arg(va, void *);
+    void *jserial = va_arg(va, void *);
+    void *jtitle = va_arg(va, void *);
+    uint32_t crc = (uint32_t)va_arg(va, int);
+    wrapper_game_changed(obj_str(jpath), obj_str(jserial), obj_str(jtitle), crc);
     return;
   }
   // NativeLibrary.reportErrorAsync(title, msg)

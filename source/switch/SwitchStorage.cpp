@@ -27,12 +27,19 @@ namespace SwitchStorage
 {
 namespace
 {
+constexpr size_t kSmbReadAheadBytes = 256 * 1024;
+constexpr size_t kSmbReadAheadBudget = 8 * 1024 * 1024;
+
 struct SmbMount;
 
 struct SmbFile
 {
 	SmbMount* mount;
 	smb2fh* handle;
+	uint8_t* readAhead;
+	size_t readAheadOffset;
+	size_t readAheadSize;
+	uint64_t position;
 };
 
 struct SmbDir
@@ -50,6 +57,7 @@ struct SmbMount
 	bool connected = false;
 	devoptab_t devoptab{};
 	std::mutex ioMutex;
+	size_t readAheadBytes = 0;
 
 	~SmbMount()
 	{
@@ -61,6 +69,45 @@ struct SmbMount
 		}
 	}
 };
+
+bool EnsureReadAheadBuffer(SmbFile* file)
+{
+	if (file->readAhead)
+		return true;
+	if (file->mount->readAheadBytes > kSmbReadAheadBudget - kSmbReadAheadBytes)
+		return false;
+	file->readAhead = static_cast<uint8_t*>(std::malloc(kSmbReadAheadBytes));
+	if (!file->readAhead)
+		return false;
+	file->mount->readAheadBytes += kSmbReadAheadBytes;
+	return true;
+}
+
+void ReleaseReadAheadBuffer(SmbFile* file)
+{
+	if (!file->readAhead)
+		return;
+	std::free(file->readAhead);
+	file->readAhead = nullptr;
+	file->mount->readAheadBytes -= kSmbReadAheadBytes;
+	file->readAheadOffset = 0;
+	file->readAheadSize = 0;
+}
+
+int SynchronizeFilePosition(SmbFile* file)
+{
+	if (file->readAheadSize == 0)
+		return 0;
+	uint64_t resultPosition = 0;
+	const int result = smb2_lseek(file->mount->context, file->handle,
+		static_cast<int64_t>(file->position), SEEK_SET, &resultPosition);
+	if (result >= 0)
+	{
+		file->readAheadOffset = 0;
+		file->readAheadSize = 0;
+	}
+	return result;
+}
 
 std::mutex s_mountMutex;
 std::vector<std::unique_ptr<SmbMount>> s_smbMounts;
@@ -195,6 +242,18 @@ int smbOpen(_reent* reent, void* state, const char* source, int flags, int)
 	if (!file->handle)
 		return fail(reent, EIO);
 	file->mount = mount;
+	if (flags & O_APPEND)
+	{
+		uint64_t position = 0;
+		const int result = smb2_lseek(mount->context, file->handle, 0, SEEK_END, &position);
+		if (result < 0)
+		{
+			smb2_close(mount->context, file->handle);
+			std::memset(file, 0, sizeof(*file));
+			return fail(reent, -result);
+		}
+		file->position = position;
+	}
 	reent->_errno = 0;
 	return 0;
 }
@@ -205,6 +264,7 @@ int smbClose(_reent* reent, void* state)
 	if (!file || !file->mount || !file->handle)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	ReleaseReadAheadBuffer(file);
 	const int result = smb2_close(file->mount->context, file->handle);
 	std::memset(file, 0, sizeof(*file));
 	if (result < 0)
@@ -221,17 +281,51 @@ ssize_t smbRead(_reent* reent, void* state, char* output, size_t length)
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
 	const size_t maximum = std::max<size_t>(1, smb2_get_max_read_size(file->mount->context));
 	size_t total = 0;
+	if (file->readAheadOffset < file->readAheadSize)
+	{
+		const size_t cached = std::min(length,
+			file->readAheadSize - file->readAheadOffset);
+		std::memcpy(output, file->readAhead + file->readAheadOffset, cached);
+		file->readAheadOffset += cached;
+		file->position += cached;
+		total += cached;
+		if (file->readAheadOffset == file->readAheadSize)
+		{
+			file->readAheadOffset = 0;
+			file->readAheadSize = 0;
+		}
+	}
 	while (total < length)
 	{
-		const size_t amount = std::min(length - total, maximum);
-		const int result = smb2_read(file->mount->context, file->handle,
-		                             reinterpret_cast<uint8_t*>(output + total), amount);
+		const size_t remaining = length - total;
+		const bool useReadAhead = remaining < kSmbReadAheadBytes && EnsureReadAheadBuffer(file);
+		const size_t amount = std::min(useReadAhead ? kSmbReadAheadBytes : remaining, maximum);
+		uint8_t* destination = useReadAhead ? file->readAhead : reinterpret_cast<uint8_t*>(output + total);
+		const int result = smb2_read(file->mount->context, file->handle, destination, amount);
 		if (result < 0)
 			return total ? static_cast<ssize_t>(total) : fail(reent, -result);
 		if (result == 0)
 			break;
-		total += static_cast<size_t>(result);
-		if (static_cast<size_t>(result) < amount)
+		if (useReadAhead)
+		{
+			file->readAheadOffset = 0;
+			file->readAheadSize = static_cast<size_t>(result);
+			const size_t copied = std::min(remaining, file->readAheadSize);
+			std::memcpy(output + total, file->readAhead, copied);
+			file->readAheadOffset = copied;
+			file->position += copied;
+			total += copied;
+			if (file->readAheadOffset == file->readAheadSize)
+			{
+				file->readAheadOffset = 0;
+				file->readAheadSize = 0;
+			}
+			break;
+		}
+		const size_t bytesRead = static_cast<size_t>(result);
+		file->position += bytesRead;
+		total += bytesRead;
+		if (bytesRead < amount)
 			break;
 	}
 	reent->_errno = 0;
@@ -244,6 +338,9 @@ ssize_t smbWrite(_reent* reent, void* state, const char* input, size_t length)
 	if (!file || !file->mount || !file->handle)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	const int synchronized = SynchronizeFilePosition(file);
+	if (synchronized < 0)
+		return fail(reent, -synchronized);
 	const size_t maximum = std::max<size_t>(1, smb2_get_max_write_size(file->mount->context));
 	size_t total = 0;
 	while (total < length)
@@ -256,6 +353,7 @@ ssize_t smbWrite(_reent* reent, void* state, const char* input, size_t length)
 		if (result == 0)
 			return total ? static_cast<ssize_t>(total) : fail(reent, EIO);
 		total += static_cast<size_t>(result);
+		file->position += static_cast<size_t>(result);
 	}
 	reent->_errno = 0;
 	return static_cast<ssize_t>(total);
@@ -271,12 +369,61 @@ off_t smbSeek(_reent* reent, void* state, off_t position, int origin)
 	}
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
 	uint64_t resultPosition = 0;
-	const int result = smb2_lseek(file->mount->context, file->handle, position, origin, &resultPosition);
-	if (result < 0 || resultPosition > static_cast<uint64_t>(LLONG_MAX))
+	if (origin == SEEK_SET || origin == SEEK_CUR)
 	{
-		fail(reent, result < 0 ? -result : EOVERFLOW);
+		if (file->position > static_cast<uint64_t>(LLONG_MAX))
+		{
+			fail(reent, EOVERFLOW);
+			return static_cast<off_t>(-1);
+		}
+		const int64_t base = origin == SEEK_SET ? 0 : static_cast<int64_t>(file->position);
+		if (position > 0 && base > LLONG_MAX - position)
+		{
+			fail(reent, EOVERFLOW);
+			return static_cast<off_t>(-1);
+		}
+		const int64_t target = base + position;
+		if (target < 0)
+		{
+			fail(reent, EINVAL);
+			return static_cast<off_t>(-1);
+		}
+		if (file->readAheadSize > 0)
+		{
+			const uint64_t cacheStart = file->position - file->readAheadOffset;
+			const uint64_t cacheEnd = cacheStart + file->readAheadSize;
+			if (static_cast<uint64_t>(target) >= cacheStart && static_cast<uint64_t>(target) <= cacheEnd)
+			{
+				file->readAheadOffset = static_cast<size_t>(static_cast<uint64_t>(target) - cacheStart);
+				file->position = static_cast<uint64_t>(target);
+				reent->_errno = 0;
+				return static_cast<off_t>(target);
+			}
+		}
+		const int result = smb2_lseek(file->mount->context, file->handle, target, SEEK_SET, &resultPosition);
+		if (result < 0)
+		{
+			fail(reent, -result);
+			return static_cast<off_t>(-1);
+		}
+	}
+	else
+	{
+		const int result = smb2_lseek(file->mount->context, file->handle, position, origin, &resultPosition);
+		if (result < 0)
+		{
+			fail(reent, -result);
+			return static_cast<off_t>(-1);
+		}
+	}
+	if (resultPosition > static_cast<uint64_t>(LLONG_MAX))
+	{
+		fail(reent, EOVERFLOW);
 		return static_cast<off_t>(-1);
 	}
+	file->readAheadOffset = 0;
+	file->readAheadSize = 0;
+	file->position = resultPosition;
 	reent->_errno = 0;
 	return static_cast<off_t>(resultPosition);
 }
@@ -478,6 +625,9 @@ int smbTruncate(_reent* reent, void* state, off_t length)
 	if (!file || !file->mount || !file->handle)
 		return fail(reent, EBADF);
 	std::lock_guard<std::mutex> lock(file->mount->ioMutex);
+	const int synchronized = SynchronizeFilePosition(file);
+	if (synchronized < 0)
+		return fail(reent, -synchronized);
 	const int result = smb2_ftruncate(file->mount->context, file->handle, length);
 	if (result < 0)
 		return fail(reent, -result);
