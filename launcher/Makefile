@@ -24,14 +24,15 @@ ROMFS		:=	romfs		# bundles the emulator cores (cores/emucore_*.so)
 
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.1.2
+APP_VERSION	:=	1.1.3
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+LTOFLAGS := -flto=auto -fuse-linker-plugin
 
 PKGS	:=	sdl2 SDL2_ttf SDL2_image libcurl
 
-CFLAGS	:=	`$(PREFIX)pkg-config --cflags $(PKGS)` -Wall -Wextra -O3 -DNDEBUG \
+CFLAGS	:=	`$(PREFIX)pkg-config --cflags $(PKGS)` -Wall -Wextra -O3 -DNDEBUG $(LTOFLAGS) \
 			-ffunction-sections -fdata-sections -fno-ident \
 			-ffile-prefix-map=$(CURDIR)=. -fmacro-prefix-map=$(CURDIR)=. \
 			$(ARCH) $(DEFINES)
@@ -41,7 +42,7 @@ CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OF
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -std=gnu++17
 
 ASFLAGS	:=	$(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -Wl,-Map,$(notdir $*.map) \
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) $(LTOFLAGS) -Wl,-Map,$(notdir $*.map) \
 			-Wl,--gc-sections -Wl,--build-id=none
 
 # SDL2_image (covers) + libcurl (SteamGridDB; libnx TLS backend, no cacert needed) +

@@ -173,10 +173,10 @@ static void prefs_seed_defaults(void) {
   prefs_seed("EmuCore/GS/AspectRatio", "4:3");
   prefs_seed("EmuCore/GS/VsyncEnable", "0");
 #if GS_RENDERER == GS_RENDERER_VK
-  // NVK's WSI drives its own present thread; don't also run the core's threaded
-  // presentation. The two bundled cores use opposite names for the same state.
-  prefs_seed("EmuCore/GS/DisableThreadedPresentation", "1");
-  prefs_seed("EmuCore/GS/ThreadedPresentation", "0");
+  // Keep presentation work off the GS thread by default. The two bundled cores
+  // use opposite names for the same state.
+  prefs_seed("EmuCore/GS/DisableThreadedPresentation", "0");
+  prefs_seed("EmuCore/GS/ThreadedPresentation", "1");
 #endif
   prefs_seed("EmuCore/GS/SkipDuplicateFrames", "false");
 
@@ -185,6 +185,7 @@ static void prefs_seed_defaults(void) {
   prefs_seed("Wrapper/LSFGEnabled", "false");
   prefs_seed("Wrapper/LSFGFlowScale", "0.25");
   prefs_seed("Wrapper/LSFGPerformance", "true");
+  prefs_seed("Wrapper/FastmemMode", "hybrid");
 
   // core
   prefs_seed("EmuCore/EnableCheats", "0");

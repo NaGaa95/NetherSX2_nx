@@ -6,15 +6,16 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    := ../romfs/fwd
 
 # cfg dir is hardcoded in main.c; don't pass it via -D (MSYS2 mangles leading-slash args).
-VERSION := 1.1.2
+VERSION := 1.1.3
+LTOFLAGS := -flto=auto -fuse-linker-plugin
 
 CFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs \
           -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft \
-          -fPIE -O3 -DNDEBUG -Wall -Wextra -ffunction-sections -fdata-sections -fno-ident \
+          -fPIE -O3 -DNDEBUG -Wall -Wextra -ffunction-sections -fdata-sections -fno-ident $(LTOFLAGS) \
           -ffile-prefix-map=$(CURDIR)=. -fmacro-prefix-map=$(CURDIR)=. \
           -I$(DEVKITPRO)/libnx/include \
           -D__SWITCH__ -DVERSION='"$(VERSION)"'
-LDFLAGS := -L$(DEVKITPRO)/libnx/lib -lnx -Wl,--gc-sections -Wl,--build-id=none -Wl,--wrap,exit
+LDFLAGS := -L$(DEVKITPRO)/libnx/lib -lnx $(LTOFLAGS) -Wl,--gc-sections -Wl,--build-id=none -Wl,--wrap,exit
 
 all: $(OUT)/hbl.nso $(OUT)/hbl.npdm $(OUT)/default.nacp
 

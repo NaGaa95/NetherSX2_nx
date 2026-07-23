@@ -128,6 +128,7 @@ static bool lsfgDllInstalled() {
 
 static bool normalizeLsfgStore(Store &store) {
   bool changed = false;
+  const bool installed = lsfgDllInstalled();
   if (storeHas(store, "Wrapper/LSFGDllPath")) {
     storeRemove(store, "Wrapper/LSFGDllPath");
     changed = true;
@@ -141,10 +142,19 @@ static bool normalizeLsfgStore(Store &store) {
       changed = true;
     }
   }
-  if (!lsfgDllInstalled() &&
+  if (!installed &&
       storeHas(store, "Wrapper/LSFGEnabled") &&
       !strcmp(storeGet(store, "Wrapper/LSFGEnabled", "false"), "true")) {
     storeSet(store, "Wrapper/LSFGEnabled", "false");
+    changed = true;
+  }
+  if (installed &&
+      !strcmp(storeGet(store, "Wrapper/LSFGEnabled", "false"), "true") &&
+      strcmp(storeGet(store, "EmuCore/GS/SkipDuplicateFrames", "false"), "true")) {
+    // Frame generation must consume unique game frames. Feeding it the core's
+    // repeated 30 -> 60 FPS presents makes LSFG submit 120 FIFO frames to a
+    // 60 Hz display and stalls emulation at roughly half speed.
+    storeSet(store, "EmuCore/GS/SkipDuplicateFrames", "true");
     changed = true;
   }
   return changed;
@@ -293,7 +303,7 @@ static const Opt S_graphics[] = {
   O_CHOICE("FMV aspect",       "EmuCore/GS/FMVAspectRatioSwitch", C_fmvasp, "Off"),
   O_CHOICE("VSync",            "EmuCore/GS/VsyncEnable", C_vsync, "0"),
   O_CHOICE("Skip duplicate frames", "EmuCore/GS/SkipDuplicateFrames", C_bool, "false"),
-  O_CHOICE("Disable threaded presentation", "EmuCore/GS/DisableThreadedPresentation", C_bool, "true"),
+  O_CHOICE("Disable threaded presentation", "EmuCore/GS/DisableThreadedPresentation", C_bool, "false"),
   O_CHOICE("Texture filtering","EmuCore/GS/filter", C_filter, "2"),
   O_CHOICE("Anisotropic",      "EmuCore/GS/MaxAnisotropy", C_aniso, "0"),
   O_CHOICE("Show FPS",         "EmuCore/GS/OsdShowFPS", C_bool, "false"),
@@ -338,7 +348,7 @@ static const Opt S_audio[] = {
 };
 static const Opt S_emu[] = {
   O_CHOICE("Core version",     "Wrapper/CoreBuild", C_build, "4248"),
-  O_CHOICE("Fastmem",          "Wrapper/FastmemMode", C_fastmem, "off"),
+  O_CHOICE("Fastmem",          "Wrapper/FastmemMode", C_fastmem, "hybrid"),
   O_CHOICE("System language",  "Wrapper/SystemLanguage", C_syslang, "auto"),
   O_CHOICE("EE cycle rate",    "EmuCore/Speedhacks/EECycleRate", C_eecr, "0"),
   O_CHOICE("EE cycle skip",    "EmuCore/Speedhacks/EECycleSkip", C_eecs, "0"),
@@ -2470,6 +2480,9 @@ static bool optEnabled(const Opt &o) {
   if(o.type==OT_STATUS) return true;
   if(o.key && !strncmp(o.key,"Wrapper/LSFG",12) && !lsfgDllInstalled())
     return false;
+  if(o.key && !strcmp(o.key,"EmuCore/GS/SkipDuplicateFrames") &&
+     !strcmp(iniGet("Wrapper/LSFGEnabled","false"),"true"))
+    return false;
   return !o.gateKey || strcmp(iniGet(o.gateKey, ""), o.gateOff) != 0;
 }
 static void optValue(const Opt &o, char *out, int n) {
@@ -2485,9 +2498,14 @@ static void optValue(const Opt &o, char *out, int n) {
   else if (o.type==OT_STATUS) snprintf(out,n,"%s",lsfgDllInstalled()?"Installed":"Missing");
   else if (o.type==OT_SUBMENU) snprintf(out,n,">");
 }
+static void optSetChoice(const Opt &o,const char *value) {
+  iniSet(o.key,value);
+  if(o.key && !strcmp(o.key,"Wrapper/LSFGEnabled") && !strcmp(value,"true"))
+    iniSet("EmuCore/GS/SkipDuplicateFrames","true");
+}
 static void optAdjust(const Opt &o, int dir) {
   if (!optEnabled(o)) return;
-  if (o.type==OT_CHOICE){ int i=choiceIdx(o); if(i<0)i=0; i=(i+dir+o.nch)%o.nch; iniSet(o.key,o.ch[i].val); }
+  if (o.type==OT_CHOICE){ int i=choiceIdx(o); if(i<0)i=0; i=(i+dir+o.nch)%o.nch; optSetChoice(o,o.ch[i].val); }
   else if (o.type==OT_RANGE){ int v=atoi(iniGet(o.key,o.def))+dir*o.step; if(v<o.lo)v=o.lo; if(v>o.hi)v=o.hi; char b[24]; snprintf(b,sizeof(b),"%d",v); iniSet(o.key,b); }
   else if (o.type==OT_SCALED_RANGE){
     int v=(int)std::lround(std::strtod(iniGet(o.key,o.def),nullptr)*o.multiplier)+dir*o.step;
@@ -2711,7 +2729,7 @@ static void optChoosePopup(const Opt &o) {
   const char* labels[32]; int n = o.nch>32?32:o.nch;
   for(int i=0;i<n;i++) labels[i]=o.ch[i].label;
   int idx = dropdown(o.label, labels, n, choiceIdx(o));
-  if(idx>=0 && idx<o.nch) iniSet(o.key, o.ch[idx].val);
+  if(idx>=0 && idx<o.nch) optSetChoice(o,o.ch[idx].val);
 }
 
 static int s_setSel[SCR_COUNT]={0}, s_setTop[SCR_COUNT]={0};
@@ -4254,8 +4272,7 @@ int main(int argc, char **argv){
     if(build!="4248"&&build!="3668") build="4248";
     std::string renderer=strcmp(storeGet(effective,"EmuCore/GS/Renderer","14"),"12")==0?"gl":"vk";
     const bool disableThreadedPresentation=!strcmp(
-        storeGet(effective,"EmuCore/GS/DisableThreadedPresentation",
-                 renderer=="vk"?"true":"false"),"true");
+        storeGet(effective,"EmuCore/GS/DisableThreadedPresentation","false"),"true");
     if(build=="3668"){
       storeSet(effective,"EmuCore/GS/ThreadedPresentation",
                disableThreadedPresentation?"false":"true");
@@ -4296,6 +4313,10 @@ int main(int argc, char **argv){
     } else if(lsfgRequested&&!lsfgDllInstalled()){
       storeSet(effective,"Wrapper/LSFGEnabled","false");
       lsfgWarning="LSFG disabled: Lossless.dll is missing";
+    } else if(lsfgRequested){
+      // LSFG 2x must receive unique frames, not the duplicate presents used to
+      // refresh 30 FPS PS2 titles at 60 Hz.
+      storeSet(effective,"EmuCore/GS/SkipDuplicateFrames","true");
     }
     bool configSaved=storeSave(effective,EMU_INI);
     willChain=haveCore&&haveEmulator&&haveResources&&configSaved;

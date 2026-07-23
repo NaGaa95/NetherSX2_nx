@@ -1463,7 +1463,7 @@ int main(void) {
 
   // settings store: load nethersx2.ini + seed OpenGL/folder defaults
   prefs_init(PREFS_PATH);
-  fastmem_set_mode(!strcmp(prefs_get_string("Wrapper/FastmemMode", "off"), "hybrid") ?
+  fastmem_set_mode(!strcmp(prefs_get_string("Wrapper/FastmemMode", "hybrid"), "hybrid") ?
                        FASTMEM_MODE_ON : FASTMEM_MODE_OFF);
   pad_load_bindings();
   snprintf(g_disc_path, sizeof(g_disc_path), "%s",
@@ -1536,6 +1536,7 @@ int main(void) {
   u64 ticks = 0;
   int boosting = 1;
   int quick_menu_hint_shown = 0;
+  const int cpu_boost_present_limit = 60;
 
   pthr_pin_bg_core();
 
@@ -1549,7 +1550,9 @@ int main(void) {
     update_gamepads();
     update_touch();
     svcSleepThread(1000000000ull / 120); // ~120 Hz input polling
-    if (boosting && FRAME_COUNT >= 300) {   // boot done: drop the load-time CPU boost
+    if (boosting && FRAME_COUNT >= cpu_boost_present_limit) {
+      // One second at 60 FPS (two seconds for a duplicate-skipped 30 FPS game)
+      // is enough to cover core and renderer startup without holding FastLoad.
       cpu_boost(0);
       boosting = 0;
     }

@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.1.2
+APP_VERSION	:=	1.1.3
 BUILD		:=	build
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
@@ -25,6 +25,7 @@ INCLUDES	:=	source source/switch \
 # options for code generation
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+LTOFLAGS := -flto=auto -fuse-linker-plugin
 
 # __SWITCH__ for libnx; NETHERSX2 gates the port-specific shim branches.
 DEFINES	:=	-D__SWITCH__ -DNETHERSX2
@@ -52,7 +53,7 @@ else
 DEFINES	+=	-DGS_RENDERER=12
 endif
 
-CFLAGS	:=	-g -Wall -O3 -ffunction-sections -fno-omit-frame-pointer \
+CFLAGS	:=	-g -Wall -O3 -ffunction-sections -fno-omit-frame-pointer $(LTOFLAGS) \
 			$(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
 CXXFLAGS	:= $(CFLAGS)
@@ -61,7 +62,7 @@ CXXFLAGS	+= -std=gnu++20
 endif
 
 ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) $(LTOFLAGS) -Wl,-Map,$(notdir $*.map)
 
 STORAGE_LIBS := $(TOPDIR)/launcher/dependencies/build/_deps/libsmb2-build/lib/libsmb2.a \
 				$(TOPDIR)/launcher/dependencies/build/_deps/libusbhsfs-build/liblibusbhsfs.a
@@ -167,6 +168,13 @@ else
 .PHONY:	all
 
 DEPENDS	:=	$(OFILES:.o=.d)
+
+# libnx provides a weak 1 KiB __nx_exception_stack, while crash.c supplies the
+# strong 512 KiB stack used by the re-entrant fastmem/JIT fault handler. Keep
+# that defining object out of LTO so the linker sees the final strong size
+# before the LTO plugin materializes symbols (and does not retain/report the
+# weak libnx size).
+crash.o: CFLAGS += -fno-lto
 
 #---------------------------------------------------------------------------------
 all	:	$(OUTPUT).nro

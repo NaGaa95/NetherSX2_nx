@@ -58,7 +58,9 @@ LSFG 2x Frame Generation is available for the Vulkan renderer in
 You must provide your own `Lossless.dll` at `/switch/nethersx2/lsfg/Lossless.dll`.
 LSFG must be enabled before launching a game so the Vulkan session can be
 prepared. Frame Generation starts **Off** in every game and must be enabled
-manually from **L + R + Plus > Frame Generation**.
+manually from **L + R + Plus > Frame Generation**. Skip Duplicate Frames is
+automatically enabled for prepared LSFG sessions so only unique game frames
+are interpolated.
 
 ### How to build
 
