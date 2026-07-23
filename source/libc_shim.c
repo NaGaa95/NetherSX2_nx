@@ -767,6 +767,7 @@ int AndroidBitmap_unlockPixels_fake(void *env, void *bitmap) {
 #define FASTMEM_ENTRY_PAGE_MASK 0x000fffffu
 #define FASTMEM_ENTRY_FD_SHIFT  20
 #define FASTMEM_FAULT_BATCH_PAGES 16u
+#define FASTMEM_REVERSE_END     UINT32_MAX
 
 typedef struct {
   int used;
@@ -775,6 +776,8 @@ typedef struct {
   size_t size;
   VirtmemReservation *reservation;
   int alias_backed;
+  uint32_t *reverse_heads;
+  size_t reverse_page_count;
 } AshmemRegion;
 
 static AshmemRegion g_ashmem[MAX_ASHMEM];
@@ -783,7 +786,9 @@ static Mutex g_fastmem_lock;
 static FastmemMode g_fastmem_mode = FASTMEM_MODE_OFF;
 static uintptr_t g_fastmem_base;
 static uint32_t *g_fastmem_pages;
+static uint32_t *g_fastmem_reverse_next;
 static unsigned g_fastmem_live_pages;
+static char g_smc_reason[128] = "not configured";
 
 void fastmem_set_mode(FastmemMode mode) {
   if (mode < FASTMEM_MODE_OFF || mode > FASTMEM_MODE_ON)
@@ -793,6 +798,160 @@ void fastmem_set_mode(FastmemMode mode) {
 
 FastmemMode fastmem_get_mode(void) {
   return g_fastmem_mode;
+}
+
+static void smc_probe_reason(const char *stage, Result rc) {
+  snprintf(g_smc_reason, sizeof(g_smc_reason), "%s failed (0x%08x)", stage,
+           (unsigned)rc);
+}
+
+/*
+ * Exercise the permission sequence used by the wrapper's SMC path. The initial
+ * RW permission turns the canonical AliasCode mapping into AliasCodeData. That
+ * state is reprotected with svcSetMemoryPermission; the process-memory SVC is
+ * only valid for the initial code-to-data transition. A fastmem SharedCode
+ * alias must still be unmapped before its writable backing becomes read-only.
+ */
+static int memory_smc_probe(void) {
+  void *raw = memalign(MMAP_PAGE, MMAP_PAGE);
+  if (!raw) {
+    snprintf(g_smc_reason, sizeof(g_smc_reason), "probe allocation failed");
+    return 0;
+  }
+  memset(raw, 0, MMAP_PAGE);
+
+  VirtmemReservation *canonical_reservation = NULL;
+  VirtmemReservation *fastmem_reservation = NULL;
+  void *canonical = NULL;
+  void *fastmem_alias = NULL;
+  int canonical_mapped = 0;
+  int fastmem_mapped = 0;
+  int passed = 0;
+  const Handle self = envGetOwnProcessHandle();
+
+  virtmemLock();
+  canonical = virtmemFindCodeMemory(MMAP_PAGE, MMAP_PAGE);
+  canonical_reservation = canonical ? virtmemAddReservation(canonical, MMAP_PAGE) : NULL;
+  if (g_fastmem_mode != FASTMEM_MODE_OFF) {
+    fastmem_alias = virtmemFindAslr(MMAP_PAGE, 0);
+    fastmem_reservation = fastmem_alias ?
+        virtmemAddReservation(fastmem_alias, MMAP_PAGE) : NULL;
+  }
+  virtmemUnlock();
+
+  if (!canonical || !canonical_reservation ||
+      (g_fastmem_mode != FASTMEM_MODE_OFF &&
+       (!fastmem_alias || !fastmem_reservation))) {
+    snprintf(g_smc_reason, sizeof(g_smc_reason), "probe address reservation failed");
+    goto cleanup;
+  }
+
+  Result rc = svcMapProcessCodeMemory(self, (u64)canonical, (u64)raw, MMAP_PAGE);
+  if (R_FAILED(rc)) {
+    smc_probe_reason("MapProcessCodeMemory", rc);
+    goto cleanup;
+  }
+  canonical_mapped = 1;
+
+  rc = svcSetProcessMemoryPermission(self, (u64)canonical, MMAP_PAGE, Perm_Rw);
+  if (R_FAILED(rc)) {
+    smc_probe_reason("SetPermission(RW)", rc);
+    goto cleanup;
+  }
+
+  if (g_fastmem_mode != FASTMEM_MODE_OFF) {
+    rc = svcMapProcessMemory(fastmem_alias, self, (u64)canonical, MMAP_PAGE);
+    if (R_FAILED(rc)) {
+      smc_probe_reason("MapProcessMemory", rc);
+      goto cleanup;
+    }
+    fastmem_mapped = 1;
+  }
+
+  if (fastmem_mapped) {
+    rc = svcUnmapProcessMemory(fastmem_alias, self, (u64)canonical, MMAP_PAGE);
+    if (R_FAILED(rc)) {
+      smc_probe_reason("UnmapProcessMemory", rc);
+      goto cleanup;
+    }
+    fastmem_mapped = 0;
+  }
+
+  // The runtime reverse index performs this same alias-first ordering before
+  // forwarding PCSX2's canonical read-only request to Horizon. The mapping is
+  // AliasCodeData now, so normal current-process reprotection is required.
+  rc = svcSetMemoryPermission(canonical, MMAP_PAGE, Perm_R);
+  if (R_FAILED(rc)) {
+    smc_probe_reason("SetMemoryPermission(R) after alias unmap", rc);
+    goto cleanup;
+  }
+
+  rc = svcSetMemoryPermission(canonical, MMAP_PAGE, Perm_Rw);
+  if (R_FAILED(rc)) {
+    smc_probe_reason("SetMemoryPermission(RW restore)", rc);
+    goto cleanup;
+  }
+
+  if (g_fastmem_mode != FASTMEM_MODE_OFF) {
+    // Also verify that a page can be remapped after its code was invalidated.
+    rc = svcMapProcessMemory(fastmem_alias, self, (u64)canonical, MMAP_PAGE);
+    if (R_FAILED(rc)) {
+      smc_probe_reason("MapProcessMemory restore", rc);
+      goto cleanup;
+    }
+    fastmem_mapped = 1;
+    rc = svcUnmapProcessMemory(fastmem_alias, self, (u64)canonical, MMAP_PAGE);
+    if (R_FAILED(rc)) {
+      smc_probe_reason("UnmapProcessMemory restore", rc);
+      goto cleanup;
+    }
+    fastmem_mapped = 0;
+  }
+
+  snprintf(g_smc_reason, sizeof(g_smc_reason),
+           g_fastmem_mode == FASTMEM_MODE_OFF ?
+               "canonical R/RW probe passed" :
+               "canonical R/RW and fastmem alias-first probe passed");
+  passed = 1;
+
+cleanup:
+  if (fastmem_mapped) {
+    const Result rc = svcUnmapProcessMemory(fastmem_alias, self,
+                                            (u64)canonical, MMAP_PAGE);
+    if (R_FAILED(rc)) {
+      if (passed)
+        smc_probe_reason("probe alias cleanup", rc);
+      // Leave every related object reserved: the kernel mapping still owns it.
+      return 0;
+    }
+  }
+
+  if (canonical_mapped) {
+    const Result rc = svcUnmapProcessCodeMemory(self, (u64)canonical,
+                                                (u64)raw, MMAP_PAGE);
+    if (R_FAILED(rc)) {
+      if (passed)
+        smc_probe_reason("probe code cleanup", rc);
+      return 0;
+    }
+  }
+
+  virtmemLock();
+  if (fastmem_reservation)
+    virtmemRemoveReservation(fastmem_reservation);
+  if (canonical_reservation)
+    virtmemRemoveReservation(canonical_reservation);
+  virtmemUnlock();
+  free(raw);
+  return passed;
+}
+
+int memory_smc_initialize(void) {
+  return memory_smc_probe();
+}
+
+const char *memory_smc_reason(void) {
+  return g_smc_reason;
 }
 
 // returns the region for a fake ashmem fd, or NULL if fd isn't one of ours
@@ -810,26 +969,39 @@ static int ashmem_make_alias(AshmemRegion *region, void *raw, size_t size) {
   if (!canonical || !reservation)
     return -1;
 
+  const size_t reverse_page_count = size / MMAP_PAGE;
+  uint32_t *reverse_heads = NULL;
+  if (g_fastmem_mode != FASTMEM_MODE_OFF) {
+    reverse_heads = malloc(reverse_page_count * sizeof(*reverse_heads));
+    if (!reverse_heads) {
+      virtmemLock();
+      virtmemRemoveReservation(reservation);
+      virtmemUnlock();
+      return -1;
+    }
+    memset(reverse_heads, 0xff, reverse_page_count * sizeof(*reverse_heads));
+  }
+
   const Handle self = envGetOwnProcessHandle();
   Result rc = svcMapProcessCodeMemory(self, (u64)canonical, (u64)raw, size);
   if (R_FAILED(rc)) {
     virtmemLock();
     virtmemRemoveReservation(reservation);
     virtmemUnlock();
-
+    free(reverse_heads);
     return -1;
   }
   rc = svcSetProcessMemoryPermission(self, (u64)canonical, size, Perm_Rw);
   if (R_FAILED(rc)) {
     const Result undo = svcUnmapProcessCodeMemory(self, (u64)canonical, (u64)raw, size);
     if (R_FAILED(undo)) {
-
+      free(reverse_heads);
       return -2;
     }
     virtmemLock();
     virtmemRemoveReservation(reservation);
     virtmemUnlock();
-
+    free(reverse_heads);
     return -1;
   }
 
@@ -838,6 +1010,8 @@ static int ashmem_make_alias(AshmemRegion *region, void *raw, size_t size) {
   region->size = size;
   region->reservation = reservation;
   region->alias_backed = 1;
+  region->reverse_heads = reverse_heads;
+  region->reverse_page_count = reverse_page_count;
 
   return 0;
 }
@@ -866,7 +1040,9 @@ int ASharedMemory_create_fake(const char *name, size_t size) {
 
   AshmemRegion region = { .used = 1, .raw = p, .ptr = p, .size = sz };
   int alias_result = 0;
-  if (g_fastmem_mode != FASTMEM_MODE_OFF && sz >= FASTMEM_BACKING_MIN)
+  // Large ashmem regions contain the EE backing store and must always use the
+  // reprotectable AliasCodeData mapping required by page-based SMC detection.
+  if (sz >= FASTMEM_BACKING_MIN)
     alias_result = ashmem_make_alias(&region, p, sz);
   if (alias_result < 0) {
     mutexLock(&g_ashmem_lock);
@@ -1085,6 +1261,111 @@ static AshmemRegion *fastmem_entry_region(uint32_t entry, size_t *offset) {
   return region;
 }
 
+/* Reverse links let the canonical mprotect path find only the guest aliases
+ * which share a backing page. Scanning all 1,048,576 fastmem slots for every
+ * compiled EE page would erase the performance gain from page protection. */
+static int fastmem_reverse_insert_locked(size_t fastmem_page, uint32_t entry) {
+  if (!g_fastmem_reverse_next || fastmem_page >= FASTMEM_PAGE_COUNT ||
+      g_fastmem_reverse_next[fastmem_page] != FASTMEM_REVERSE_END)
+    return 0;
+
+  size_t source_offset;
+  AshmemRegion *region = fastmem_entry_region(entry, &source_offset);
+  const size_t source_page = source_offset / MMAP_PAGE;
+  if (!region || !region->reverse_heads || source_page >= region->reverse_page_count)
+    return 0;
+
+  g_fastmem_reverse_next[fastmem_page] = region->reverse_heads[source_page];
+  region->reverse_heads[source_page] = (uint32_t)fastmem_page;
+  return 1;
+}
+
+static int fastmem_reverse_remove_locked(size_t fastmem_page, uint32_t entry) {
+  if (!g_fastmem_reverse_next || fastmem_page >= FASTMEM_PAGE_COUNT)
+    return 0;
+
+  size_t source_offset;
+  AshmemRegion *region = fastmem_entry_region(entry, &source_offset);
+  const size_t source_page = source_offset / MMAP_PAGE;
+  if (!region || !region->reverse_heads || source_page >= region->reverse_page_count)
+    return 0;
+
+  uint32_t *link = &region->reverse_heads[source_page];
+  size_t guard = 0;
+  while (*link != FASTMEM_REVERSE_END) {
+    const uint32_t current = *link;
+    if (current >= FASTMEM_PAGE_COUNT || guard++ >= FASTMEM_PAGE_COUNT)
+      return 0;
+    if (current == fastmem_page) {
+      *link = g_fastmem_reverse_next[current];
+      g_fastmem_reverse_next[current] = FASTMEM_REVERSE_END;
+      return 1;
+    }
+    link = &g_fastmem_reverse_next[current];
+  }
+  return 0;
+}
+
+static Result fastmem_protect_backing_locked(AshmemRegion *region,
+                                              size_t source_offset,
+                                              size_t size) {
+  if (!g_fastmem_pages || !g_fastmem_reverse_next)
+    return 0;
+  if (!region || !region->reverse_heads ||
+      (source_offset & (MMAP_PAGE - 1)) || (size & (MMAP_PAGE - 1)) ||
+      source_offset > region->size || size > region->size - source_offset)
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+  const size_t first_source_page = source_offset / MMAP_PAGE;
+  const size_t source_page_count = size / MMAP_PAGE;
+  if (first_source_page > region->reverse_page_count ||
+      source_page_count > region->reverse_page_count - first_source_page)
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+  const Handle self = envGetOwnProcessHandle();
+  for (size_t page = 0; page < source_page_count; page++) {
+    const size_t expected_offset = (first_source_page + page) * MMAP_PAGE;
+    uint32_t alias = region->reverse_heads[first_source_page + page];
+    size_t guard = 0;
+    while (alias != FASTMEM_REVERSE_END) {
+      if (alias >= FASTMEM_PAGE_COUNT || guard++ >= FASTMEM_PAGE_COUNT)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+      const uint32_t next_alias = g_fastmem_reverse_next[alias];
+      const uint32_t entry = __atomic_load_n(&g_fastmem_pages[alias],
+                                             __ATOMIC_ACQUIRE);
+      size_t mapped_offset;
+      AshmemRegion *mapped_region = fastmem_entry_region(entry, &mapped_offset);
+      if (entry == FASTMEM_ENTRY_EMPTY || mapped_region != region ||
+          mapped_offset != expected_offset)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+      if (!(entry & FASTMEM_ENTRY_PROTECTED)) {
+        if (entry & FASTMEM_ENTRY_LAZY) {
+          __atomic_store_n(&g_fastmem_pages[alias],
+                           entry | FASTMEM_ENTRY_PROTECTED, __ATOMIC_RELEASE);
+        } else {
+          const uintptr_t destination = g_fastmem_base +
+                                        (size_t)alias * MMAP_PAGE;
+          const uintptr_t source = (uintptr_t)region->ptr + mapped_offset;
+          const Result rc = svcUnmapProcessMemory((void *)destination, self,
+                                                  source, MMAP_PAGE);
+          if (R_FAILED(rc))
+            return rc;
+          if (g_fastmem_live_pages)
+            g_fastmem_live_pages--;
+          __atomic_store_n(&g_fastmem_pages[alias],
+                           entry | FASTMEM_ENTRY_LAZY |
+                               FASTMEM_ENTRY_PROTECTED | FASTMEM_ENTRY_REMAP,
+                           __ATOMIC_RELEASE);
+        }
+      }
+      alias = next_alias;
+    }
+  }
+
+  return 0;
+}
+
 static Result fastmem_unmap_range_locked(uintptr_t addr, size_t size, int clear) {
   const uintptr_t base = g_fastmem_base;
   const size_t first = (size_t)((addr - base) / MMAP_PAGE);
@@ -1100,6 +1381,8 @@ static Result fastmem_unmap_range_locked(uintptr_t addr, size_t size, int clear)
 
     if (entry & (FASTMEM_ENTRY_LAZY | FASTMEM_ENTRY_PROTECTED)) {
       if (clear) {
+        if (!fastmem_reverse_remove_locked(first + i, entry))
+          return MAKERESULT(Module_Libnx, LibnxError_BadInput);
         __atomic_store_n(&g_fastmem_pages[first + i], FASTMEM_ENTRY_EMPTY,
                          __ATOMIC_RELEASE);
       } else if (!(entry & FASTMEM_ENTRY_LAZY)) {
@@ -1145,6 +1428,8 @@ static Result fastmem_unmap_range_locked(uintptr_t addr, size_t size, int clear)
     for (size_t j = 0; j < run; j++) {
       const uint32_t old = __atomic_load_n(&g_fastmem_pages[first + i + j],
                                            __ATOMIC_RELAXED);
+      if (clear && !fastmem_reverse_remove_locked(first + i + j, old))
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
       const uint32_t next = clear ? FASTMEM_ENTRY_EMPTY
                                   : (old | FASTMEM_ENTRY_LAZY |
                                      FASTMEM_ENTRY_PROTECTED | FASTMEM_ENTRY_REMAP);
@@ -1198,9 +1483,23 @@ static void *fastmem_map_alias(void *addr, size_t size, int prot,
   const uint32_t flags = FASTMEM_ENTRY_LAZY |
                          ((prot & PROT_WRITE) ? 0 : FASTMEM_ENTRY_PROTECTED);
   for (size_t i = 0; i < count; i++) {
+    const uint32_t entry =
+        fastmem_pack_entry(ash_index, offset + i * MMAP_PAGE, 0) | flags;
     __atomic_store_n(&g_fastmem_pages[first + i],
-                     fastmem_pack_entry(ash_index, offset + i * MMAP_PAGE, 0) | flags,
-                     __ATOMIC_RELEASE);
+                     entry, __ATOMIC_RELEASE);
+    if (!fastmem_reverse_insert_locked(first + i, entry)) {
+      __atomic_store_n(&g_fastmem_pages[first + i], FASTMEM_ENTRY_EMPTY,
+                       __ATOMIC_RELEASE);
+      for (size_t j = 0; j < i; j++) {
+        const uint32_t previous = __atomic_load_n(&g_fastmem_pages[first + j],
+                                                   __ATOMIC_RELAXED);
+        fastmem_reverse_remove_locked(first + j, previous);
+        __atomic_store_n(&g_fastmem_pages[first + j], FASTMEM_ENTRY_EMPTY,
+                         __ATOMIC_RELEASE);
+      }
+      mutexUnlock(&g_fastmem_lock);
+      return MAP_FAILED;
+    }
   }
   mutexUnlock(&g_fastmem_lock);
   return addr;
@@ -1307,12 +1606,11 @@ static int fastmem_select_signal_action(int *signal, BionicSigaction *action) {
 
 int fastmem_fault_can_dispatch(uintptr_t pc, uintptr_t fault_addr) {
   (void)pc;
-  if (g_fastmem_mode == FASTMEM_MODE_OFF)
-    return 0;
   if (!fastmem_managed_fault(fault_addr))
     return 0;
 
-  if (fastmem_lazy_fault_candidate(fault_addr))
+  if (g_fastmem_mode != FASTMEM_MODE_OFF &&
+      fastmem_lazy_fault_candidate(fault_addr))
     return 1;
 
   int sig;
@@ -1392,9 +1690,14 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t of
     }
 
     uint32_t *fastmem_pages = NULL;
+    uint32_t *fastmem_reverse_next = NULL;
     if (g_fastmem_mode != FASTMEM_MODE_OFF && len == FASTMEM_AREA_SIZE) {
       fastmem_pages = malloc(FASTMEM_PAGE_COUNT * sizeof(*fastmem_pages));
-      if (!fastmem_pages) {
+      fastmem_reverse_next =
+          malloc(FASTMEM_PAGE_COUNT * sizeof(*fastmem_reverse_next));
+      if (!fastmem_pages || !fastmem_reverse_next) {
+        free(fastmem_pages);
+        free(fastmem_reverse_next);
         virtmemLock();
         virtmemRemoveReservation(rv);
         virtmemUnlock();
@@ -1402,6 +1705,8 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t of
         return MAP_FAILED;
       }
       memset(fastmem_pages, 0xff, FASTMEM_PAGE_COUNT * sizeof(*fastmem_pages));
+      memset(fastmem_reverse_next, 0xff,
+             FASTMEM_PAGE_COUNT * sizeof(*fastmem_reverse_next));
     }
 
     int tracked = 0;
@@ -1422,6 +1727,7 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t of
     mutexUnlock(&g_mmap_lock);
     if (!tracked) {
       free(fastmem_pages);
+      free(fastmem_reverse_next);
       virtmemLock();
       virtmemRemoveReservation(rv);
       virtmemUnlock();
@@ -1431,6 +1737,8 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t of
 
     if (fastmem_pages) {
       __atomic_store_n(&g_fastmem_base, (uintptr_t)base, __ATOMIC_RELEASE);
+      __atomic_store_n(&g_fastmem_reverse_next, fastmem_reverse_next,
+                       __ATOMIC_RELEASE);
       __atomic_store_n(&g_fastmem_pages, fastmem_pages, __ATOMIC_RELEASE);
 
     }
@@ -1567,9 +1875,18 @@ int mprotect_fake(void *addr, size_t length, int prot) {
     const u32 permission = (prot & PROT_WRITE) ? Perm_Rw
                            : (prot & PROT_READ) ? Perm_R
                                                 : Perm_None;
-    Result rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), start, len, permission);
+    if (!(prot & PROT_WRITE) && g_fastmem_pages && region->reverse_heads) {
+      mutexLock(&g_fastmem_lock);
+      const Result alias_rc = fastmem_protect_backing_locked(
+          region, start - (uintptr_t)region->ptr, len);
+      mutexUnlock(&g_fastmem_lock);
+      if (R_FAILED(alias_rc)) {
+        errno = EACCES;
+        return -1;
+      }
+    }
+    Result rc = svcSetMemoryPermission((void *)start, len, permission);
     if (R_FAILED(rc)) {
-
       errno = EACCES;
       return -1;
     }
@@ -1628,7 +1945,6 @@ int mprotect_fake(void *addr, size_t length, int prot) {
                                               MMAP_PAGE);
       if (R_FAILED(rc)) {
         mutexUnlock(&g_fastmem_lock);
-
         errno = EACCES;
         return -1;
       }
@@ -1649,6 +1965,7 @@ int mprotect_fake(void *addr, size_t length, int prot) {
 int munmap_fake(void *addr, size_t length) {
   const size_t len = (length + MMAP_PAGE - 1) & ~(size_t)(MMAP_PAGE - 1);
   uint32_t *released_fastmem_pages = NULL;
+  uint32_t *released_fastmem_reverse_next = NULL;
   if (g_fastmem_pages && fastmem_contains((uintptr_t)addr, len)) {
     mutexLock(&g_fastmem_lock);
     if (R_FAILED(fastmem_unmap_range_locked((uintptr_t)addr, len, 1))) {
@@ -1658,7 +1975,9 @@ int munmap_fake(void *addr, size_t length) {
     }
     if ((uintptr_t)addr == g_fastmem_base && len == FASTMEM_AREA_SIZE) {
       released_fastmem_pages = g_fastmem_pages;
+      released_fastmem_reverse_next = g_fastmem_reverse_next;
       __atomic_store_n(&g_fastmem_pages, NULL, __ATOMIC_RELEASE);
+      __atomic_store_n(&g_fastmem_reverse_next, NULL, __ATOMIC_RELEASE);
       __atomic_store_n(&g_fastmem_base, 0, __ATOMIC_RELEASE);
       g_fastmem_live_pages = 0;
     }
@@ -1676,6 +1995,7 @@ int munmap_fake(void *addr, size_t length) {
         if (R_FAILED(rc)) {
           mutexUnlock(&g_mmap_lock);
           free(released_fastmem_pages);
+          free(released_fastmem_reverse_next);
           errno = EBUSY;
           return -1;
         }
@@ -1688,11 +2008,13 @@ int munmap_fake(void *addr, size_t length) {
       }
       mutexUnlock(&g_mmap_lock);
       free(released_fastmem_pages);
+      free(released_fastmem_reverse_next);
       return 0;
     }
   }
   mutexUnlock(&g_mmap_lock);
   free(released_fastmem_pages);
+  free(released_fastmem_reverse_next);
   return 0;
 }
 
@@ -1704,22 +2026,27 @@ void libc_memory_shutdown(void) {
 
   const uintptr_t fastmem_base = __atomic_load_n(&g_fastmem_base, __ATOMIC_ACQUIRE);
   uint32_t *fastmem_pages = __atomic_load_n(&g_fastmem_pages, __ATOMIC_ACQUIRE);
+  uint32_t *fastmem_reverse_next =
+      __atomic_load_n(&g_fastmem_reverse_next, __ATOMIC_ACQUIRE);
   int fastmem_released = 1;
-  if (fastmem_base || fastmem_pages) {
+  if (fastmem_base || fastmem_pages || fastmem_reverse_next) {
     fastmem_released = 0;
-    if (fastmem_base && fastmem_pages) {
+    if (fastmem_base && fastmem_pages && fastmem_reverse_next) {
       mutexLock(&g_fastmem_lock);
       const Result rc = fastmem_unmap_range_locked(fastmem_base,
                                                     FASTMEM_AREA_SIZE, 1);
       if (R_SUCCEEDED(rc)) {
         __atomic_store_n(&g_fastmem_pages, NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_fastmem_reverse_next, NULL, __ATOMIC_RELEASE);
         __atomic_store_n(&g_fastmem_base, 0, __ATOMIC_RELEASE);
         g_fastmem_live_pages = 0;
         fastmem_released = 1;
       }
       mutexUnlock(&g_fastmem_lock);
-      if (fastmem_released)
+      if (fastmem_released) {
         free(fastmem_pages);
+        free(fastmem_reverse_next);
+      }
     }
   }
 
@@ -1767,6 +2094,7 @@ void libc_memory_shutdown(void) {
       }
       remove_reservation(&region->reservation);
     }
+    free(region->reverse_heads);
     free(region->raw);
     memset(region, 0, sizeof(*region));
   }

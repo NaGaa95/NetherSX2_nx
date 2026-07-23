@@ -11,7 +11,6 @@
 #include "../util.h"
 #include "../hooks.h"
 #include "../so_util.h"
-#include "../prefs.h"
 
 extern so_module emu_mod; // libemucore.so (defined in main.c)
 
@@ -38,8 +37,6 @@ static const Patch g_patches_4248[] = {
   // Center aspect-fitted content.
   { 0x61c924, 0x54000141, INSN_NOP, "center display X" },
   { 0x61c964, 0x54000221, INSN_NOP, "center display Y" },
-  // Horizon cannot write-protect the ashmem-backed EE RAM for SMC detection.
-  { 0x711180, 0xb940054a, 0x5280004a, "SMC: force ProtMode_Manual" },
   // Android exposes 0.25x, but this core revision clamps the GS multiplier to 0.5x.
   { 0x4bab84, 0x1e2c1002, 0x1e2a1002, "GS upscale minimum 0.25x" },
 };
@@ -60,7 +57,6 @@ static const Patch g_patches_3668[] = {
   { 0x2e337c, 0x72a7068b, 0x72a52c6b, "gamedb cache ver hi" },
   { 0x62a204, 0x54000141, INSN_NOP, "center display X" },
   { 0x62a244, 0x54000221, INSN_NOP, "center display Y" },
-  { 0x6f6c10, 0xb940054a, 0x5280004a, "SMC: force ProtMode_Manual" },
   { 0x4ab4a8, 0x1e2c1002, 0x1e2a1002, "GS upscale minimum 0.25x" },
 };
 
@@ -181,14 +177,8 @@ void patch_game(void) {
     g_reqstop_slot = 0xb80558;
   }
 
-  const int smc = prefs_get_bool("Wrapper/EESmcCheck", true);
-
   for (int i = 0; i < total; i++) {
     const Patch *pt = &tbl[i];
-    if (!smc && !strncmp(pt->what, "SMC:", 4)) {
-
-      continue;
-    }
     if (!in_range(pt->vaddr, 4)) {
 
       continue;

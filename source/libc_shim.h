@@ -130,6 +130,8 @@ typedef enum {
 
 void fastmem_set_mode(FastmemMode mode);
 FastmemMode fastmem_get_mode(void);
+int memory_smc_initialize(void);
+const char *memory_smc_reason(void);
 int sigaction_fake(int sig, const void *act, void *old_act);
 int fastmem_fault_can_dispatch(uintptr_t pc, uintptr_t fault_addr);
 int fastmem_dispatch_fault(uintptr_t pc, uintptr_t fault_addr);

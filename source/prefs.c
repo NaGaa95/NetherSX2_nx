@@ -186,7 +186,6 @@ static void prefs_seed_defaults(void) {
   prefs_seed("Wrapper/LSFGFlowScale", "0.25");
   prefs_seed("Wrapper/LSFGPerformance", "true");
   prefs_seed("Wrapper/FastmemMode", "hybrid");
-
   // core
   prefs_seed("EmuCore/EnableCheats", "0");
   // Fast boot: read the disc's SYSTEM.CNF and boot the game's ELF directly,

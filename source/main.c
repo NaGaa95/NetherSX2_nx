@@ -112,6 +112,8 @@ void __libnx_initheap(void) {
 }
 
 static void check_syscalls(void) {
+  if (!envIsSyscallHinted(0x02))
+    fatal_error("svcSetMemoryPermission is unavailable.");
   if (!envIsSyscallHinted(0x77))
     fatal_error("svcMapProcessCodeMemory is unavailable.");
   if (!envIsSyscallHinted(0x78))
@@ -1481,6 +1483,9 @@ int main(void) {
 
   check_syscalls();
   check_data(g_core_so, g_disc_path);
+  if (!memory_smc_initialize())
+    fatal_error("Page-based SMC protection is unavailable.\n\n%s",
+                memory_smc_reason());
   set_screen_size(0, 0);
 
   extern char *fake_heap_start;

@@ -160,6 +160,19 @@ static bool normalizeLsfgStore(Store &store) {
   return changed;
 }
 
+static bool removeLegacySmcSettings(Store &store) {
+  bool changed = false;
+  if (storeHas(store, "Wrapper/EESmcCheck")) {
+    storeRemove(store, "Wrapper/EESmcCheck");
+    changed = true;
+  }
+  if (storeHas(store, "Wrapper/EESmcMode")) {
+    storeRemove(store, "Wrapper/EESmcMode");
+    changed = true;
+  }
+  return changed;
+}
+
 static bool recoverAtomicFile(const std::string &path) {
   const std::string tmp = path + ".tmp";
   const std::string old = path + ".old";
@@ -352,7 +365,6 @@ static const Opt S_emu[] = {
   O_CHOICE("System language",  "Wrapper/SystemLanguage", C_syslang, "auto"),
   O_CHOICE("EE cycle rate",    "EmuCore/Speedhacks/EECycleRate", C_eecr, "0"),
   O_CHOICE("EE cycle skip",    "EmuCore/Speedhacks/EECycleSkip", C_eecs, "0"),
-  O_CHOICE("SMC code checks",  "Wrapper/EESmcCheck", C_bool, "true"),
   O_CHOICE("Fast boot",        "Wrapper/FastBoot", C_bool, "true"),
   O_CHOICE("MTVU (multi-VU)",  "EmuCore/Speedhacks/vuThread", C_bool, "true"),
   O_CHOICE("Instant VU1",      "EmuCore/Speedhacks/vu1Instant", C_bool, "true"),
@@ -2738,6 +2750,10 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
     normalizeLsfgStore(g_global);
     if(g_active!=&g_global) normalizeLsfgStore(*g_active);
   }
+  if(scr==SCR_EMU){
+    removeLegacySmcSettings(g_global);
+    if(g_active!=&g_global) removeLegacySmcSettings(*g_active);
+  }
   const Screen &S=g_screens[scr];
   int sel=s_setSel[scr],top=s_setTop[scr];
   if(sel<0||sel>=S.n) sel=0;
@@ -4065,7 +4081,8 @@ int main(int argc, char **argv){
   struct stat configStat{};
   bool firstRun=stat(LAUNCHER_INI,&configStat)!=0;
   storeLoad(g_global,LAUNCHER_INI);
-  const bool lsfgSettingsNormalized=normalizeLsfgStore(g_global);
+  const bool settingsNormalized=normalizeLsfgStore(g_global) |
+                                removeLegacySmcSettings(g_global);
   storeLoad(g_titles,TITLES_INI);
   storeLoad(g_recent,RECENT_INI);
   int sortMode=atoi(storeGet(g_global,"Wrapper/SortMode","0"));
@@ -4085,7 +4102,7 @@ int main(int argc, char **argv){
     commitAll();
     if(!storeSave(g_global,LAUNCHER_INI)) return startupFailure("Could not create launcher.ini.");
   } else {
-    bool changed=lsfgSettingsNormalized;
+    bool changed=settingsNormalized;
     if(!storeHas(g_global,"Wrapper/GamePathCount")){ saveGameSources(loadGameSources()); changed=true; }
     int columns=atoi(storeGet(g_global,"Wrapper/GridColumns","6"));
     int rows=atoi(storeGet(g_global,"Wrapper/GridRows","2"));
@@ -4268,6 +4285,7 @@ int main(int argc, char **argv){
       gameCRCPath=toEmu(std::string(GAMECRC_DIR)+"/"+launchKey+".ini");
     }
     normalizeLsfgStore(effective);
+    removeLegacySmcSettings(effective);
     std::string build=storeGet(effective,"Wrapper/CoreBuild","4248");
     if(build!="4248"&&build!="3668") build="4248";
     std::string renderer=strcmp(storeGet(effective,"EmuCore/GS/Renderer","14"),"12")==0?"gl":"vk";
