@@ -50,6 +50,8 @@ static const char *CHEATS_DIR = "sdmc:/switch/nethersx2/cheats";
 static const char *DEF_GAMEDIR= "sdmc:/switch/nethersx2/games";
 static const char *BIOS_DIR   = "sdmc:/switch/nethersx2/bios";
 static const char *RESOURCES_DIR = "sdmc:/switch/nethersx2/resources";
+static const char *LSFG_DIR = "sdmc:/switch/nethersx2/lsfg";
+static const char *LSFG_DLL_FILE = "sdmc:/switch/nethersx2/lsfg/Lossless.dll";
 
 struct KV { std::string k, v; };
 struct Store { std::vector<KV> kv; };
@@ -120,6 +122,34 @@ static bool regularFileExists(const std::string &path) {
   return queryRegularFile(path, exists) && exists;
 }
 
+static bool lsfgDllInstalled() {
+  return regularFileExists(LSFG_DLL_FILE);
+}
+
+static bool normalizeLsfgStore(Store &store) {
+  bool changed = false;
+  if (storeHas(store, "Wrapper/LSFGDllPath")) {
+    storeRemove(store, "Wrapper/LSFGDllPath");
+    changed = true;
+  }
+  if (storeHas(store, "Wrapper/LSFGFlowScale")) {
+    const double flow = std::strtod(
+        storeGet(store, "Wrapper/LSFGFlowScale", "0.25"), nullptr);
+    const char *normalized = flow > 0.375 ? "0.5" : "0.25";
+    if (strcmp(storeGet(store, "Wrapper/LSFGFlowScale", "0.25"), normalized)) {
+      storeSet(store, "Wrapper/LSFGFlowScale", normalized);
+      changed = true;
+    }
+  }
+  if (!lsfgDllInstalled() &&
+      storeHas(store, "Wrapper/LSFGEnabled") &&
+      !strcmp(storeGet(store, "Wrapper/LSFGEnabled", "false"), "true")) {
+    storeSet(store, "Wrapper/LSFGEnabled", "false");
+    changed = true;
+  }
+  return changed;
+}
+
 static bool recoverAtomicFile(const std::string &path) {
   const std::string tmp = path + ".tmp";
   const std::string old = path + ".old";
@@ -187,7 +217,7 @@ static const char *iniGet(const char *key, const char *def) {
 }
 static void iniSet(const char *key, const char *val) { storeSet(*g_active, key, val); }
 
-enum OType { OT_CHOICE, OT_RANGE, OT_SCALED_RANGE, OT_SUBMENU, OT_TEXT, OT_HOTKEY };
+enum OType { OT_CHOICE, OT_RANGE, OT_SCALED_RANGE, OT_SUBMENU, OT_TEXT, OT_HOTKEY, OT_STATUS };
 struct Choice { const char *label, *val; };
 struct Opt {
   const char *label;
@@ -212,6 +242,7 @@ struct Opt {
 #define O_TEXT(l,k,d)          { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 #define O_TEXTG(l,k,d,gk,go)   { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
 #define O_HOTKEY(l,k,d)        { l, k, OT_HOTKEY, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
+#define O_STATUS(l)            { l, nullptr, OT_STATUS, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr, 1, nullptr }
 
 static const Choice C_backend[]  = { {"Vulkan (NVK)","14"}, {"OpenGL","12"} };
 static const Choice C_build[]    = { {"Patched (4248)","4248"}, {"Classic (3668)","3668"} };
@@ -221,6 +252,7 @@ static const Choice C_upscale[]  = { {"0.25x","0.25"},{"0.5x","0.5"},{"0.75x","0
                                      {"2x (~720p)","2"},{"2.25x","2.25"},{"2.5x","2.5"},{"2.75x","2.75"},{"3x (~1080p)","3"},
                                      {"4x (~1440p)","4"},{"5x (~1800p)","5"},{"6x (4K ~2160p)","6"} };
 static const Choice C_bool[]     = { {"Off","false"}, {"On","true"} };
+static const Choice C_lsfgFlow[] = { {"Quarter (recommended)","0.25"}, {"Half","0.5"} };
 static const Choice C_aspect[]   = { {"4:3","4:3"}, {"16:9","16:9"}, {"Stretch","Stretch"}, {"Auto","Auto 4:3/3:2"} };
 static const Choice C_fmvasp[]   = { {"Off","Off"}, {"4:3","4:3"}, {"16:9","16:9"} };
 static const Choice C_vsync[]    = { {"Off","0"}, {"On","1"}, {"Adaptive","2"} };
@@ -252,7 +284,7 @@ static const Choice C_launcherTheme[] = { {"XMB (PS3)","xmb"}, {"Glow","animated
 static const Choice C_gridColumns[] = { {"3","3"}, {"4","4"}, {"5","5"}, {"6","6"}, {"7","7"}, {"8","8"} };
 static const Choice C_gridRows[] = { {"1","1"}, {"2","2"}, {"3","3"} };
 
-enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_AUDIO, SCR_EMU, SCR_FRAMERATE, SCR_NETWORK, SCR_CONTROLLER, SCR_COUNT };
+enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_FRAMEGEN, SCR_AUDIO, SCR_EMU, SCR_FRAMERATE, SCR_NETWORK, SCR_CONTROLLER, SCR_COUNT };
 
 static const Opt S_graphics[] = {
   O_CHOICE("Renderer",         "EmuCore/GS/Renderer", C_backend, "14"),
@@ -260,6 +292,8 @@ static const Opt S_graphics[] = {
   O_CHOICE("Aspect ratio",     "EmuCore/GS/AspectRatio", C_aspect, "4:3"),
   O_CHOICE("FMV aspect",       "EmuCore/GS/FMVAspectRatioSwitch", C_fmvasp, "Off"),
   O_CHOICE("VSync",            "EmuCore/GS/VsyncEnable", C_vsync, "0"),
+  O_CHOICE("Skip duplicate frames", "EmuCore/GS/SkipDuplicateFrames", C_bool, "false"),
+  O_CHOICE("Disable threaded presentation", "EmuCore/GS/DisableThreadedPresentation", C_bool, "true"),
   O_CHOICE("Texture filtering","EmuCore/GS/filter", C_filter, "2"),
   O_CHOICE("Anisotropic",      "EmuCore/GS/MaxAnisotropy", C_aniso, "0"),
   O_CHOICE("Show FPS",         "EmuCore/GS/OsdShowFPS", C_bool, "false"),
@@ -289,6 +323,12 @@ static const Opt S_enhance[] = {
   O_CHOICE("SW renderer FMV",  "EmuCore/GS/SoftwareRendererFMV", C_bool, "false"),
   O_CHOICE("HW download mode", "EmuCore/GS/HWDownloadMode", C_hwdl, "0"),
 };
+static const Opt S_framegen[] = {
+  O_CHOICE("LSFG 2x (Vulkan only)", "Wrapper/LSFGEnabled", C_bool, "false"),
+  O_CHOICEG("Flow resolution", "Wrapper/LSFGFlowScale", C_lsfgFlow, "0.25", "Wrapper/LSFGEnabled", "false"),
+  O_CHOICEG("Performance mode", "Wrapper/LSFGPerformance", C_bool, "true", "Wrapper/LSFGEnabled", "false"),
+  O_STATUS("Lossless.dll"),
+};
 static const Opt S_audio[] = {
   O_RANGE ("Volume",           "SPU2/Mixing/FinalVolume", 0, 100, 5, "100"),
   O_CHOICE("Interpolation",    "SPU2/Mixing/Interpolation", C_interp, "4"),
@@ -310,7 +350,6 @@ static const Opt S_emu[] = {
   O_SUB   ("Frame rate control...", SCR_FRAMERATE),
   O_CHOICE("Sync to refresh",  "EmuCore/GS/SyncToHostRefreshRate", C_bool, "false"),
   O_CHOICE("Game patches",     "EmuCore/EnablePatches", C_bool, "true"),
-  O_CHOICE("Cheats",           "EmuCore/EnableCheats", C_bool, "false"),
 };
 static const Opt S_network[] = {
   O_CHOICE("Network adapter",  "Wrapper/Network", C_bool, "false"),
@@ -364,6 +403,7 @@ struct Screen { const char *title; const Opt *opts; int n; bool binds; };
 static const Screen g_screens[SCR_COUNT] = {
   { "Graphics",            S_graphics,   (int)(sizeof(S_graphics)/sizeof(Opt)),   false },
   { "Enhancements",        S_enhance,    (int)(sizeof(S_enhance)/sizeof(Opt)),    false },
+  { "Frame Generation",      S_framegen, (int)(sizeof(S_framegen)/sizeof(Opt)),   false },
   { "Audio",               S_audio,      (int)(sizeof(S_audio)/sizeof(Opt)),      false },
   { "Emulation / System",  S_emu,        (int)(sizeof(S_emu)/sizeof(Opt)),        false },
   { "Frame Rate Control",  S_framerate,  (int)(sizeof(S_framerate)/sizeof(Opt)),  false },
@@ -2416,17 +2456,25 @@ static void runFileManager() {
   runFileBrowser({},BrowserMode::Manage);
 }
 
+static const char *optDefault(const Opt &o) {
+  if(o.key && !strcmp(o.key,"EmuCore/GS/DisableThreadedPresentation"))
+    return !strcmp(iniGet("EmuCore/GS/Renderer","14"),"12") ? "false" : "true";
+  return o.def;
+}
 static int choiceIdx(const Opt &o) {
-  const char *cur = iniGet(o.key, o.def);
+  const char *cur = iniGet(o.key,optDefault(o));
   for (int i=0;i<o.nch;i++) if (!strcmp(o.ch[i].val, cur)) return i;
   return -1;
 }
 static bool optEnabled(const Opt &o) {
+  if(o.type==OT_STATUS) return true;
+  if(o.key && !strncmp(o.key,"Wrapper/LSFG",12) && !lsfgDllInstalled())
+    return false;
   return !o.gateKey || strcmp(iniGet(o.gateKey, ""), o.gateOff) != 0;
 }
 static void optValue(const Opt &o, char *out, int n) {
   out[0]=0;
-  if (o.type==OT_CHOICE){ int i=choiceIdx(o); snprintf(out,n,"%s", i>=0?o.ch[i].label:iniGet(o.key,o.def)); }
+  if (o.type==OT_CHOICE){ int i=choiceIdx(o); snprintf(out,n,"%s", i>=0?o.ch[i].label:iniGet(o.key,optDefault(o))); }
   else if (o.type==OT_RANGE) snprintf(out,n,"%s", iniGet(o.key,o.def));
   else if (o.type==OT_SCALED_RANGE) {
     int value=(int)std::lround(std::strtod(iniGet(o.key,o.def),nullptr)*o.multiplier);
@@ -2434,6 +2482,7 @@ static void optValue(const Opt &o, char *out, int n) {
   }
   else if (o.type==OT_TEXT){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"(auto)"); }
   else if (o.type==OT_HOTKEY){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"None"); }
+  else if (o.type==OT_STATUS) snprintf(out,n,"%s",lsfgDllInstalled()?"Installed":"Missing");
   else if (o.type==OT_SUBMENU) snprintf(out,n,">");
 }
 static void optAdjust(const Opt &o, int dir) {
@@ -2667,6 +2716,10 @@ static void optChoosePopup(const Opt &o) {
 
 static int s_setSel[SCR_COUNT]={0}, s_setTop[SCR_COUNT]={0};
 static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
+  if(scr==SCR_FRAMEGEN){
+    normalizeLsfgStore(g_global);
+    if(g_active!=&g_global) normalizeLsfgStore(*g_active);
+  }
   const Screen &S=g_screens[scr];
   int sel=s_setSel[scr],top=s_setTop[scr];
   if(sel<0||sel>=S.n) sel=0;
@@ -3028,17 +3081,18 @@ static void runCheatSettings(Game &game,uint32_t crc) {
 }
 
 static void runSettingsRoot(SDL_GameController *pad, const char *ctx, Game *game) {
-  static const int order[] = { SCR_EMU, SCR_GRAPHICS, SCR_AUDIO, SCR_NETWORK, SCR_CONTROLLER };
+  static const int order[] = { SCR_FRAMEGEN, SCR_EMU, SCR_GRAPHICS, SCR_AUDIO, SCR_NETWORK, SCR_CONTROLLER };
   const int nscr=(int)(sizeof(order)/sizeof(*order));
   const bool global=!(ctx&&*ctx);
   const bool hasCheatRow=!global&&game;
   const int launcherRow=0,libraryRow=1,cheatRow=0;
   const int screenStart=global?2:(hasCheatRow?1:0);
+  const int globalTopGroupRows=3;
   const int n=nscr+(global?2:(hasCheatRow?1:0));
   const uint32_t gameCRC=hasCheatRow?loadGameCRC(*game):0;
   int sel=0,top=0;
   const int rowH=58,y0=92,sectionGap=34,vis=std::max(1,(SH-y0-42-sectionGap)/rowH);
-  auto rowY=[&](int index){ return y0+(index-top)*rowH+(global&&index>=screenStart?sectionGap:0); };
+  auto rowY=[&](int index){ return y0+(index-top)*rowH+(global&&index>=globalTopGroupRows?sectionGap:0); };
   beginScreenFx();
   for(;;){
     if(!beginUiFrame()) return;
@@ -3070,8 +3124,9 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx, Game *game
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     int shown=std::min(vis,n);
     if(global){
-      glassPanel(colX-12,y0-10,colW+24,2*rowH+18);
-      glassPanel(colX-12,y0+2*rowH+sectionGap-10,colW+24,(shown-2)*rowH+18);
+      glassPanel(colX-12,y0-10,colW+24,globalTopGroupRows*rowH+18);
+      glassPanel(colX-12,y0+globalTopGroupRows*rowH+sectionGap-10,colW+24,
+                 (shown-globalTopGroupRows)*rowH+18);
     } else glassPanel(colX-12,y0-10,colW+24,shown*rowH+18);
     int fontHeight=TTF_FontHeight(g_font);
     float target=(float)(rowY(sel)+2);
@@ -3986,12 +4041,13 @@ int main(int argc, char **argv){
 
   g_griddbReady=griddb_global_init();
   if(!g_griddbReady&&R_SUCCEEDED(socketInitializeDefault())) g_storageSocketReady=true;
-  const char *directories[]={"sdmc:/switch",DATA_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,GAMECRC_DIR,CHEATS_DIR,DEF_GAMEDIR,BIOS_DIR,RESOURCES_DIR};
+  const char *directories[]={"sdmc:/switch",DATA_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,GAMECRC_DIR,CHEATS_DIR,DEF_GAMEDIR,BIOS_DIR,RESOURCES_DIR,LSFG_DIR};
   for(const char *directory:directories) if(!ensureDirectory(directory)) return startupFailure("Could not create the NetherSX2 data directories.");
 
   struct stat configStat{};
   bool firstRun=stat(LAUNCHER_INI,&configStat)!=0;
   storeLoad(g_global,LAUNCHER_INI);
+  const bool lsfgSettingsNormalized=normalizeLsfgStore(g_global);
   storeLoad(g_titles,TITLES_INI);
   storeLoad(g_recent,RECENT_INI);
   int sortMode=atoi(storeGet(g_global,"Wrapper/SortMode","0"));
@@ -4011,7 +4067,7 @@ int main(int argc, char **argv){
     commitAll();
     if(!storeSave(g_global,LAUNCHER_INI)) return startupFailure("Could not create launcher.ini.");
   } else {
-    bool changed=false;
+    bool changed=lsfgSettingsNormalized;
     if(!storeHas(g_global,"Wrapper/GamePathCount")){ saveGameSources(loadGameSources()); changed=true; }
     int columns=atoi(storeGet(g_global,"Wrapper/GridColumns","6"));
     int rows=atoi(storeGet(g_global,"Wrapper/GridRows","2"));
@@ -4183,20 +4239,6 @@ int main(int argc, char **argv){
   bool willChain=false;
   std::string emulatorNro;
   if(launch&&envHasNextLoad()){
-    std::string build=storeGet(g_global,"Wrapper/CoreBuild","4248");
-    if(build!="4248"&&build!="3668") build="4248";
-    std::string renderer=strcmp(storeGet(g_global,"EmuCore/GS/Renderer","14"),"12")==0?"gl":"vk";
-    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
-    std::string coreSource="romfs:/cores/emucore_"+build+".so";
-    std::string coreDestination=std::string(CORES_DIR)+"/libemucore_"+build+".so";
-    std::string emulatorSource="romfs:/emu/NetherSX2_nx_"+renderer+".nro";
-    std::string emulatorDestination=std::string(DATA_DIR)+"/NetherSX2_nx_"+renderer+".nro";
-    emulatorNro="sdmc:/switch/nethersx2/NetherSX2_nx_"+renderer+".nro";
-    bool haveCore=ensureCore(coreSource.c_str(),coreDestination.c_str(),build);
-    bool haveEmulator=ensureEmu(emulatorSource.c_str(),emulatorDestination.c_str());
-    bool haveResources=ensureResources(build);
-    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
-    if(haveCore){ std::string corePath="/switch/nethersx2/cores/libemucore_"+build+".so"; storeSet(g_global,"Wrapper/CoreSo",corePath.c_str()); }
     Store effective=g_global;
     std::string gameConfigPath,gameCRCPath;
     if(!launchKey.empty()){
@@ -4207,6 +4249,37 @@ int main(int argc, char **argv){
       gameConfigPath=toEmu(profile);
       gameCRCPath=toEmu(std::string(GAMECRC_DIR)+"/"+launchKey+".ini");
     }
+    normalizeLsfgStore(effective);
+    std::string build=storeGet(effective,"Wrapper/CoreBuild","4248");
+    if(build!="4248"&&build!="3668") build="4248";
+    std::string renderer=strcmp(storeGet(effective,"EmuCore/GS/Renderer","14"),"12")==0?"gl":"vk";
+    const bool disableThreadedPresentation=!strcmp(
+        storeGet(effective,"EmuCore/GS/DisableThreadedPresentation",
+                 renderer=="vk"?"true":"false"),"true");
+    if(build=="3668"){
+      storeSet(effective,"EmuCore/GS/ThreadedPresentation",
+               disableThreadedPresentation?"false":"true");
+      storeRemove(effective,"EmuCore/GS/DisableThreadedPresentation");
+    } else {
+      storeSet(effective,"EmuCore/GS/DisableThreadedPresentation",
+               disableThreadedPresentation?"true":"false");
+      storeRemove(effective,"EmuCore/GS/ThreadedPresentation");
+    }
+    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+    std::string coreSource="romfs:/cores/emucore_"+build+".so";
+    std::string coreDestination=std::string(CORES_DIR)+"/libemucore_"+build+".so";
+    std::string emulatorSource="romfs:/emu/NetherSX2_nx_"+renderer+".nro";
+    std::string emulatorDestination=std::string(DATA_DIR)+"/NetherSX2_nx_"+renderer+".nro";
+    emulatorNro="sdmc:/switch/nethersx2/NetherSX2_nx_"+renderer+".nro";
+    bool haveCore=ensureCore(coreSource.c_str(),coreDestination.c_str(),build);
+    bool haveEmulator=ensureEmu(emulatorSource.c_str(),emulatorDestination.c_str());
+    bool haveResources=ensureResources(build);
+    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+    if(haveCore){
+      std::string corePath="/switch/nethersx2/cores/libemucore_"+build+".so";
+      storeSet(g_global,"Wrapper/CoreSo",corePath.c_str());
+      storeSet(effective,"Wrapper/CoreSo",corePath.c_str());
+    }
     storeSet(effective,"EmuCore/DiscPath",toEmu(launchPath).c_str());
     storeRemove(effective,"Wrapper/LauncherPath");
     storeRemove(effective,"Wrapper/GameConfigPath");
@@ -4215,9 +4288,21 @@ int main(int argc, char **argv){
     if(!launcherPath.empty()) storeSet(effective,"Wrapper/LauncherPath",launcherPath.c_str());
     if(!gameConfigPath.empty()) storeSet(effective,"Wrapper/GameConfigPath",gameConfigPath.c_str());
     if(!gameCRCPath.empty()) storeSet(effective,"Wrapper/GameCRCPath",gameCRCPath.c_str());
+    const bool lsfgRequested=!strcmp(storeGet(effective,"Wrapper/LSFGEnabled","false"),"true");
+    const char *lsfgWarning=nullptr;
+    if(lsfgRequested&&renderer!="vk"){
+      storeSet(effective,"Wrapper/LSFGEnabled","false");
+      lsfgWarning="LSFG disabled for this launch: Vulkan is required";
+    } else if(lsfgRequested&&!lsfgDllInstalled()){
+      storeSet(effective,"Wrapper/LSFGEnabled","false");
+      lsfgWarning="LSFG disabled: Lossless.dll is missing";
+    }
     bool configSaved=storeSave(effective,EMU_INI);
     willChain=haveCore&&haveEmulator&&haveResources&&configSaved;
-    if(!willChain){
+    if(willChain&&lsfgWarning){
+      toast(lsfgWarning);
+      SDL_Delay(1800);
+    } else if(!willChain){
       if(!haveResources) toast("Could not extract NetherSX2 resources (SD full?)");
       else if(!haveCore||!haveEmulator) toast("Could not extract emulator files (SD full?)");
       else toast("Could not write the launch configuration");

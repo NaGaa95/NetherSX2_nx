@@ -6,7 +6,7 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    := ../romfs/fwd
 
 # cfg dir is hardcoded in main.c; don't pass it via -D (MSYS2 mangles leading-slash args).
-VERSION := 1.1.0
+VERSION := 1.1.2
 
 CFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs \
           -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft \

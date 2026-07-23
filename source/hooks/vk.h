@@ -27,6 +27,13 @@
 // trigger (egl_swap_count stays 0 on the Vulkan path).
 extern volatile int vk_present_count;
 
+// Runtime LSFG control used by the in-game quick menu. Requests are consumed
+// by the presentation thread so LSFG resources are never torn down while a
+// queue submission is still in flight.
+int vk_lsfg_is_available(void);
+int vk_lsfg_is_enabled(void);
+void vk_lsfg_request_enabled(int enabled);
+
 // Registered in the core's import table (imports.c). Everything else the core
 // discovers through vk_gipa_hook, which forwards to NVK's real vkGetInstanceProcAddr.
 PFN_vkVoidFunction VKAPI_CALL vk_gipa_hook(VkInstance instance, const char *name);

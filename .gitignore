@@ -11,3 +11,4 @@
 *.map
 /out/
 /vulkan/
+Lossless.dll

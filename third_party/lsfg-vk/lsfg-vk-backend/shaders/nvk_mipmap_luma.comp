@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// NVK/NAK-safe replacement for LSFG's all-in-one mipmap prepass.  Keeping
+// this first stage small avoids compiling a 1024-thread shader with seven
+// storage images and a shared-memory reduction tree on Tegra X1.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform Constants
+{
+    uvec2 InputOffset;
+    uint FirstIter;
+    uint FirstIterS;
+    uint AdvancedColorKind;
+    uint HdrSupport;
+    float ResolutionInvScale;
+    float Timestamp;
+} cb;
+
+layout(set = 0, binding = 16) uniform sampler InputSampler;
+layout(set = 0, binding = 32) uniform texture2D InputImage;
+layout(set = 0, binding = 48, r8) uniform writeonly image2D OutputImage;
+
+vec3 decodeColor(vec3 color)
+{
+    if (cb.AdvancedColorKind == 1u)
+        return pow(abs(color), vec3(1.0 / 2.2));
+    if (cb.HdrSupport != 0u)
+        return pow(abs(color / 7.5), vec3(1.0 / 2.2));
+    return color;
+}
+
+void main()
+{
+    ivec2 outputCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outputSize = imageSize(OutputImage);
+    if (any(greaterThanEqual(outputCoord, outputSize)))
+        return;
+
+    vec2 inputSize = vec2(textureSize(InputImage, 0));
+    vec2 uv = ((vec2(outputCoord) + vec2(0.5)) *
+               cb.ResolutionInvScale) / inputSize;
+    vec3 color = textureLod(
+        sampler2D(InputImage, InputSampler), uv, 0.0).rgb;
+    float luma = dot(vec3(0.299, 0.587, 0.114), decodeColor(color));
+    imageStore(OutputImage, outputCoord, vec4(luma));
+}

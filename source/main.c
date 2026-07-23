@@ -29,6 +29,9 @@
 #include "syslang.h"
 #include "SwitchStorageBridge.h"
 #include "CheatManager.h"
+#ifdef USE_VULKAN
+#include "hooks/vk.h"
+#endif
 
 // Android MotionEvent axis codes (handleControllerAxisEvent expects these)
 #define AAXIS_X         0
@@ -659,13 +662,41 @@ static void apply_ps2_stick(int controller, const PadConfig *config, const PadSt
 typedef enum {
   QUICK_MENU_CLOSED,
   QUICK_MENU_MAIN,
+  QUICK_MENU_FRAMERATE,
   QUICK_MENU_CHEATS,
   QUICK_MENU_MAPPING,
   QUICK_MENU_CAPTURE
 } QuickMenuMode;
 
+typedef enum {
+  QUICK_ITEM_RESUME,
+  QUICK_ITEM_STATE_SLOT,
+  QUICK_ITEM_LOAD_STATE,
+  QUICK_ITEM_SAVE_STATE,
+  QUICK_ITEM_MAPPING,
+  QUICK_ITEM_CHEATS,
+#ifdef USE_VULKAN
+  QUICK_ITEM_LSFG,
+#endif
+  QUICK_ITEM_FRAMERATE,
+  QUICK_ITEM_RESET,
+  QUICK_ITEM_EXIT,
+  QUICK_ITEM_COUNT
+} QuickMenuMainItem;
+
+typedef enum {
+  QUICK_FRAMERATE_LIMITER,
+  QUICK_FRAMERATE_NTSC,
+  QUICK_FRAMERATE_PAL,
+  QUICK_FRAMERATE_EE_CYCLE_RATE,
+  QUICK_FRAMERATE_EE_CYCLE_SKIP,
+  QUICK_FRAMERATE_BACK,
+  QUICK_FRAMERATE_COUNT
+} QuickMenuFrameRateItem;
+
 static QuickMenuMode g_quick_menu_mode;
 static int g_quick_menu_selection;
+static int g_quick_menu_framerate_selection;
 static int g_quick_menu_slot;
 static int g_quick_menu_cheat_selection;
 static int g_quick_menu_map_player;
@@ -673,10 +704,15 @@ static int g_quick_menu_map_selection;
 static int g_quick_menu_capture_armed;
 static int g_quick_menu_exit_requested;
 static int g_quick_menu_limiter_unlimited;
+static float g_quick_menu_ntsc_rate;
+static float g_quick_menu_pal_rate;
 static int g_quick_menu_ee_cycle_rate;
 static int g_quick_menu_ee_cycle_skip;
 static int g_quick_menu_restore_messages;
 static int g_quick_menu_ready;
+#ifdef USE_VULKAN
+static int g_quick_menu_lsfg_enabled;
+#endif
 
 static const char *const g_ee_cycle_rate_labels[] = {
   "50%", "60%", "75%", "100%", "130%", "180%", "300%"
@@ -721,30 +757,85 @@ static void quick_menu_release_inputs(void) {
   }
 }
 
+static bool quick_menu_item_available(int item) {
+#ifdef USE_VULKAN
+  if (item == QUICK_ITEM_LSFG) return vk_lsfg_is_available();
+#else
+  (void)item;
+#endif
+  return true;
+}
+
+static void quick_menu_move_selection(int direction) {
+  for (int i = 0; i < QUICK_ITEM_COUNT; i++) {
+    g_quick_menu_selection =
+        (g_quick_menu_selection + direction + QUICK_ITEM_COUNT) % QUICK_ITEM_COUNT;
+    if (quick_menu_item_available(g_quick_menu_selection)) return;
+  }
+}
+
 static void quick_menu_draw_main(void) {
   static const char *labels[] = {
     "Resume game", "State slot", "Load state", "Save state",
-    "Controller mapping", "Cheat codes", "Frame limiter", "EE cycle rate",
-    "EE cycle skip", "Reset console", "Exit game"
+    "Controller mapping", "Cheat codes",
+#ifdef USE_VULKAN
+    "Frame Generation",
+#endif
+    "Frame Rate Control", "Reset console", "Exit game"
   };
+  if (!quick_menu_item_available(g_quick_menu_selection))
+    quick_menu_move_selection(1);
   char text[1024] = "NETHERSX2 QUICK MENU\n\n";
   for (int i = 0; i < (int)(sizeof(labels) / sizeof(*labels)); i++) {
-    const char *marker = i == g_quick_menu_selection ? "> " : "  ";
-    if (i == 1)
+    const char *marker = i == g_quick_menu_selection &&
+                         quick_menu_item_available(i) ? "> " : "  ";
+    if (i == QUICK_ITEM_STATE_SLOT)
       text_append(text, sizeof(text), "%s%s: %d\n", marker, labels[i], g_quick_menu_slot);
-    else if (i == 6)
+#ifdef USE_VULKAN
+    else if (i == QUICK_ITEM_LSFG) {
+      if (!vk_lsfg_is_available())
+        text_append(text, sizeof(text), "  %s: Disabled\n", labels[i]);
+      else
+        text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
+                    g_quick_menu_lsfg_enabled ? "On" : "Off");
+    }
+#endif
+    else if (i == QUICK_ITEM_FRAMERATE)
+      text_append(text, sizeof(text), "%s%s >\n", marker, labels[i]);
+    else
+      text_append(text, sizeof(text), "%s%s\n", marker, labels[i]);
+  }
+  text_append(text, sizeof(text), "\nA  Select     B  Close     Left/Right  Change");
+  quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+}
+
+static void quick_menu_draw_framerate(void) {
+  static const char *labels[] = {
+    "Frame limiter", "NTSC frame rate", "PAL frame rate",
+    "EE cycle rate", "EE cycle skip", "Back"
+  };
+  char text[1024] = "FRAME RATE CONTROL\n\n";
+  for (int i = 0; i < QUICK_FRAMERATE_COUNT; i++) {
+    const char *marker = i == g_quick_menu_framerate_selection ? "> " : "  ";
+    if (i == QUICK_FRAMERATE_LIMITER)
       text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
                   g_quick_menu_limiter_unlimited ? "Unlimited" : "Limited");
-    else if (i == 7)
+    else if (i == QUICK_FRAMERATE_NTSC)
+      text_append(text, sizeof(text), "%s%s: %.2f Hz\n", marker, labels[i],
+                  g_quick_menu_ntsc_rate);
+    else if (i == QUICK_FRAMERATE_PAL)
+      text_append(text, sizeof(text), "%s%s: %.2f Hz\n", marker, labels[i],
+                  g_quick_menu_pal_rate);
+    else if (i == QUICK_FRAMERATE_EE_CYCLE_RATE)
       text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
                   g_ee_cycle_rate_labels[g_quick_menu_ee_cycle_rate + 3]);
-    else if (i == 8)
+    else if (i == QUICK_FRAMERATE_EE_CYCLE_SKIP)
       text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
                   g_ee_cycle_skip_labels[g_quick_menu_ee_cycle_skip]);
     else
       text_append(text, sizeof(text), "%s%s\n", marker, labels[i]);
   }
-  text_append(text, sizeof(text), "\nA  Select     B  Close     Left/Right  Change");
+  text_append(text, sizeof(text), "\nA  Select/Toggle     Left/Right  Change     B  Back");
   quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
 }
 
@@ -851,12 +942,23 @@ static void quick_menu_open(void) {
   g_quick_menu_mode = QUICK_MENU_MAIN;
   g_quick_menu_selection = 0;
   g_quick_menu_limiter_unlimited = !prefs_get_bool("EmuCore/GS/FrameLimitEnable", true);
+  g_quick_menu_ntsc_rate = prefs_get_float("EmuCore/GS/FramerateNTSC", 59.94f);
+  if (!isfinite(g_quick_menu_ntsc_rate) || g_quick_menu_ntsc_rate < 15.0f)
+    g_quick_menu_ntsc_rate = 15.0f;
+  if (g_quick_menu_ntsc_rate > 120.0f) g_quick_menu_ntsc_rate = 120.0f;
+  g_quick_menu_pal_rate = prefs_get_float("EmuCore/GS/FrameratePAL", 50.0f);
+  if (!isfinite(g_quick_menu_pal_rate) || g_quick_menu_pal_rate < 12.0f)
+    g_quick_menu_pal_rate = 12.0f;
+  if (g_quick_menu_pal_rate > 100.0f) g_quick_menu_pal_rate = 100.0f;
   g_quick_menu_ee_cycle_rate = prefs_get_int("EmuCore/Speedhacks/EECycleRate", 0);
   if (g_quick_menu_ee_cycle_rate < -3) g_quick_menu_ee_cycle_rate = -3;
   if (g_quick_menu_ee_cycle_rate > 3) g_quick_menu_ee_cycle_rate = 3;
   g_quick_menu_ee_cycle_skip = prefs_get_int("EmuCore/Speedhacks/EECycleSkip", 0);
   if (g_quick_menu_ee_cycle_skip < 0) g_quick_menu_ee_cycle_skip = 0;
   if (g_quick_menu_ee_cycle_skip > 3) g_quick_menu_ee_cycle_skip = 3;
+#ifdef USE_VULKAN
+  g_quick_menu_lsfg_enabled = vk_lsfg_is_enabled();
+#endif
   if (!prefs_get_bool("EmuCore/GS/OsdShowMessages", true)) {
     g_quick_menu_restore_messages = 1;
     prefs_set_bool("EmuCore/GS/OsdShowMessages", true);
@@ -960,6 +1062,13 @@ static void quick_menu_save_prefs_preserving_messages(void) {
     prefs_set_bool("EmuCore/GS/OsdShowMessages", true);
 }
 
+#ifdef USE_VULKAN
+static void quick_menu_set_lsfg_enabled(bool enabled) {
+  g_quick_menu_lsfg_enabled = enabled;
+  vk_lsfg_request_enabled(enabled);
+}
+#endif
+
 typedef enum {
   QUICK_CHEAT_UPDATE_FAILED,
   QUICK_CHEAT_UPDATE_OK,
@@ -1027,82 +1136,139 @@ static bool quick_menu_update(u64 down, u64 pressed) {
   if (!pressed) return true;
 
   if (g_quick_menu_mode == QUICK_MENU_MAIN) {
-    const int item_count = 11;
     if (pressed & HidNpadButton_Up)
-      g_quick_menu_selection = (g_quick_menu_selection + item_count - 1) % item_count;
+      quick_menu_move_selection(-1);
     if (pressed & HidNpadButton_Down)
-      g_quick_menu_selection = (g_quick_menu_selection + 1) % item_count;
-    if (g_quick_menu_selection == 1 && (pressed & HidNpadButton_Left))
+      quick_menu_move_selection(1);
+    if (g_quick_menu_selection == QUICK_ITEM_STATE_SLOT && (pressed & HidNpadButton_Left))
       g_quick_menu_slot = (g_quick_menu_slot + 9) % 10;
-    if (g_quick_menu_selection == 1 && (pressed & HidNpadButton_Right))
+    if (g_quick_menu_selection == QUICK_ITEM_STATE_SLOT && (pressed & HidNpadButton_Right))
       g_quick_menu_slot = (g_quick_menu_slot + 1) % 10;
-    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Left) &&
-        g_quick_menu_ee_cycle_rate > -3) {
-      g_quick_menu_ee_cycle_rate--;
-      prefs_set_int("EmuCore/Speedhacks/EECycleRate", g_quick_menu_ee_cycle_rate);
-      nl.applySettings(fake_env, NATIVE_CLASS);
-    }
-    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Right) &&
-        g_quick_menu_ee_cycle_rate < 3) {
-      g_quick_menu_ee_cycle_rate++;
-      prefs_set_int("EmuCore/Speedhacks/EECycleRate", g_quick_menu_ee_cycle_rate);
-      nl.applySettings(fake_env, NATIVE_CLASS);
-    }
-    if (g_quick_menu_selection == 8 && (pressed & HidNpadButton_Left) &&
-        g_quick_menu_ee_cycle_skip > 0) {
-      g_quick_menu_ee_cycle_skip--;
-      prefs_set_int("EmuCore/Speedhacks/EECycleSkip", g_quick_menu_ee_cycle_skip);
-      nl.applySettings(fake_env, NATIVE_CLASS);
-    }
-    if (g_quick_menu_selection == 8 && (pressed & HidNpadButton_Right) &&
-        g_quick_menu_ee_cycle_skip < 3) {
-      g_quick_menu_ee_cycle_skip++;
-      prefs_set_int("EmuCore/Speedhacks/EECycleSkip", g_quick_menu_ee_cycle_skip);
-      nl.applySettings(fake_env, NATIVE_CLASS);
-    }
     if (pressed & HidNpadButton_B) {
       quick_menu_close();
       return true;
     }
     if (pressed & HidNpadButton_A) {
       switch (g_quick_menu_selection) {
-        case 0: quick_menu_close(); return true;
-        case 2:
+        case QUICK_ITEM_RESUME: quick_menu_close(); return true;
+        case QUICK_ITEM_LOAD_STATE:
           nl.loadStateSlot(fake_env, NATIVE_CLASS, g_quick_menu_slot);
           quick_menu_close();
           quick_menu_status("State loaded");
           return true;
-        case 3:
+        case QUICK_ITEM_SAVE_STATE:
           nl.saveStateSlot(fake_env, NATIVE_CLASS, g_quick_menu_slot);
           quick_menu_close();
           quick_menu_status("State saved");
           return true;
-        case 4:
+        case QUICK_ITEM_MAPPING:
           g_quick_menu_mode = QUICK_MENU_MAPPING;
           g_quick_menu_map_selection = 0;
           quick_menu_draw_mapping();
           return true;
-        case 5:
+        case QUICK_ITEM_CHEATS:
           g_quick_menu_mode = QUICK_MENU_CHEATS;
           g_quick_menu_cheat_selection = 0;
           quick_menu_draw_cheats();
           return true;
-        case 6:
-          nl.toggleLimiterMode(fake_env, NATIVE_CLASS, 3);
-          g_quick_menu_limiter_unlimited = !g_quick_menu_limiter_unlimited;
+#ifdef USE_VULKAN
+        case QUICK_ITEM_LSFG:
+          if (!g_quick_menu_lsfg_enabled && !vk_lsfg_is_available()) {
+            quick_menu_status("Frame generation is disabled for this session");
+            break;
+          }
+          {
+            const bool enabled = !g_quick_menu_lsfg_enabled;
+            quick_menu_set_lsfg_enabled(enabled);
+            quick_menu_status(enabled ?
+                "Frame generation enabled for this session" :
+                "Frame generation disabled for this session");
+          }
           break;
-        case 9:
+#endif
+        case QUICK_ITEM_FRAMERATE:
+          g_quick_menu_mode = QUICK_MENU_FRAMERATE;
+          g_quick_menu_framerate_selection = 0;
+          quick_menu_draw_framerate();
+          return true;
+        case QUICK_ITEM_RESET:
           nl.resetVM(fake_env, NATIVE_CLASS);
           quick_menu_close();
           quick_menu_status("Console reset");
           return true;
-        case 10:
+        case QUICK_ITEM_EXIT:
           g_quick_menu_exit_requested = 1;
           quick_menu_close();
           return true;
       }
     }
     quick_menu_draw_main();
+    return true;
+  }
+
+  if (g_quick_menu_mode == QUICK_MENU_FRAMERATE) {
+    if (pressed & HidNpadButton_Up)
+      g_quick_menu_framerate_selection =
+          (g_quick_menu_framerate_selection + QUICK_FRAMERATE_COUNT - 1) %
+          QUICK_FRAMERATE_COUNT;
+    if (pressed & HidNpadButton_Down)
+      g_quick_menu_framerate_selection =
+          (g_quick_menu_framerate_selection + 1) % QUICK_FRAMERATE_COUNT;
+    if (pressed & HidNpadButton_B) {
+      g_quick_menu_mode = QUICK_MENU_MAIN;
+      quick_menu_draw_main();
+      return true;
+    }
+    if ((pressed & HidNpadButton_A) &&
+        g_quick_menu_framerate_selection == QUICK_FRAMERATE_BACK) {
+      g_quick_menu_mode = QUICK_MENU_MAIN;
+      quick_menu_draw_main();
+      return true;
+    }
+
+    const int direction = (pressed & HidNpadButton_Right) ? 1 :
+                          (pressed & HidNpadButton_Left) ? -1 : 0;
+    bool apply_settings = false;
+    if (g_quick_menu_framerate_selection == QUICK_FRAMERATE_LIMITER &&
+        (direction || (pressed & HidNpadButton_A))) {
+      const bool unlimited = direction ? direction > 0 :
+          !g_quick_menu_limiter_unlimited;
+      if (unlimited != (bool)g_quick_menu_limiter_unlimited) {
+        nl.toggleLimiterMode(fake_env, NATIVE_CLASS, 3);
+        g_quick_menu_limiter_unlimited = unlimited;
+        prefs_set_bool("EmuCore/GS/FrameLimitEnable", !unlimited);
+      }
+    } else if (direction &&
+               g_quick_menu_framerate_selection == QUICK_FRAMERATE_NTSC) {
+      g_quick_menu_ntsc_rate += (float)direction;
+      if (g_quick_menu_ntsc_rate < 15.0f) g_quick_menu_ntsc_rate = 15.0f;
+      if (g_quick_menu_ntsc_rate > 120.0f) g_quick_menu_ntsc_rate = 120.0f;
+      prefs_set_float("EmuCore/GS/FramerateNTSC", g_quick_menu_ntsc_rate);
+      apply_settings = true;
+    } else if (direction &&
+               g_quick_menu_framerate_selection == QUICK_FRAMERATE_PAL) {
+      g_quick_menu_pal_rate += (float)direction;
+      if (g_quick_menu_pal_rate < 12.0f) g_quick_menu_pal_rate = 12.0f;
+      if (g_quick_menu_pal_rate > 100.0f) g_quick_menu_pal_rate = 100.0f;
+      prefs_set_float("EmuCore/GS/FrameratePAL", g_quick_menu_pal_rate);
+      apply_settings = true;
+    } else if (direction &&
+               g_quick_menu_framerate_selection == QUICK_FRAMERATE_EE_CYCLE_RATE) {
+      g_quick_menu_ee_cycle_rate += direction;
+      if (g_quick_menu_ee_cycle_rate < -3) g_quick_menu_ee_cycle_rate = -3;
+      if (g_quick_menu_ee_cycle_rate > 3) g_quick_menu_ee_cycle_rate = 3;
+      prefs_set_int("EmuCore/Speedhacks/EECycleRate", g_quick_menu_ee_cycle_rate);
+      apply_settings = true;
+    } else if (direction &&
+               g_quick_menu_framerate_selection == QUICK_FRAMERATE_EE_CYCLE_SKIP) {
+      g_quick_menu_ee_cycle_skip += direction;
+      if (g_quick_menu_ee_cycle_skip < 0) g_quick_menu_ee_cycle_skip = 0;
+      if (g_quick_menu_ee_cycle_skip > 3) g_quick_menu_ee_cycle_skip = 3;
+      prefs_set_int("EmuCore/Speedhacks/EECycleSkip", g_quick_menu_ee_cycle_skip);
+      apply_settings = true;
+    }
+    if (apply_settings) nl.applySettings(fake_env, NATIVE_CLASS);
+    quick_menu_draw_framerate();
     return true;
   }
 

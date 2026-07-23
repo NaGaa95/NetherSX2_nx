@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.1.1
+APP_VERSION	:=	1.1.2
 BUILD		:=	build
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
@@ -37,6 +37,17 @@ DEFINES	:=	-D__SWITCH__ -DNETHERSX2
 RENDERER ?= GL
 ifeq ($(RENDERER),VK)
 DEFINES	+=	-DUSE_VULKAN -DGS_RENDERER=14 -DVK_USE_PLATFORM_VI_NN
+SOURCES	+=	source/lsfg \
+			third_party/lsfg-vk/lsfg-vk-common/src/helpers \
+			third_party/lsfg-vk/lsfg-vk-common/src/vulkan \
+			third_party/lsfg-vk/lsfg-vk-backend/src \
+			third_party/lsfg-vk/lsfg-vk-backend/src/extraction \
+			third_party/lsfg-vk/lsfg-vk-backend/src/helpers \
+			third_party/lsfg-vk/lsfg-vk-backend/src/shaderchains
+INCLUDES	+=	source/lsfg \
+			third_party/lsfg-vk/lsfg-vk-common/include \
+			third_party/lsfg-vk/lsfg-vk-backend/include \
+			third_party/lsfg-vk/lsfg-vk-backend/src
 else
 DEFINES	+=	-DGS_RENDERER=12
 endif
@@ -45,6 +56,9 @@ CFLAGS	:=	-g -Wall -O3 -ffunction-sections -fno-omit-frame-pointer \
 			$(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
 CXXFLAGS	:= $(CFLAGS)
+ifeq ($(RENDERER),VK)
+CXXFLAGS	+= -std=gnu++20
+endif
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)

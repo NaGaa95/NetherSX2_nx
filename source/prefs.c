@@ -174,9 +174,17 @@ static void prefs_seed_defaults(void) {
   prefs_seed("EmuCore/GS/VsyncEnable", "0");
 #if GS_RENDERER == GS_RENDERER_VK
   // NVK's WSI drives its own present thread; don't also run the core's threaded
-  // presentation during bring-up (two present paths fighting stalls the swapchain).
+  // presentation. The two bundled cores use opposite names for the same state.
   prefs_seed("EmuCore/GS/DisableThreadedPresentation", "1");
+  prefs_seed("EmuCore/GS/ThreadedPresentation", "0");
 #endif
+  prefs_seed("EmuCore/GS/SkipDuplicateFrames", "false");
+
+  // Experimental in-process LSFG-VK bridge. It is deliberately opt-in and the
+  // proprietary shader DLL is never bundled; users provide their own file.
+  prefs_seed("Wrapper/LSFGEnabled", "false");
+  prefs_seed("Wrapper/LSFGFlowScale", "0.25");
+  prefs_seed("Wrapper/LSFGPerformance", "true");
 
   // core
   prefs_seed("EmuCore/EnableCheats", "0");
@@ -235,8 +243,10 @@ void prefs_init(const char *ini_path) {
   // we never override what the user set.
   prefs_parse_file(s_ini_path);
   prefs_seed_defaults();
-
-
+  prefs_remove("Wrapper/LSFGDllPath");
+  const float lsfg_flow = prefs_get_float("Wrapper/LSFGFlowScale", 0.25f);
+  if (lsfg_flow != 0.25f && lsfg_flow != 0.5f)
+    prefs_set_float("Wrapper/LSFGFlowScale", lsfg_flow > 0.375f ? 0.5f : 0.25f);
 }
 
 void prefs_save(void) {

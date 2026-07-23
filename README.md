@@ -39,6 +39,7 @@ The launcher creates the rest of the folder tree on first run:
   resources/    <- shaders / GameIndex / fonts  (auto-extracted per core)
   covers/       <- cover art (<game-key>.png)
   gamecfg/      <- per-game launcher settings
+  lsfg/         <- optional user-supplied Lossless.dll
   forwarders/   <- HOME shortcut launch records
   launcher.ini  <- the launcher's saved config
 ```
@@ -51,6 +52,13 @@ forwarder.
 
 A PS2 BIOS dump is required and must come from your own console; the launcher
 warns at startup when `bios/` is empty.
+
+LSFG 2x Frame Generation is available for the Vulkan renderer in
+**Settings > Frame Generation**.
+You must provide your own `Lossless.dll` at `/switch/nethersx2/lsfg/Lossless.dll`.
+LSFG must be enabled before launching a game so the Vulkan session can be
+prepared. Frame Generation starts **Off** in every game and must be enabled
+manually from **L + R + Plus > Frame Generation**.
 
 ### How to build
 
@@ -93,4 +101,5 @@ game images, or the emulator core are distributed here; you must supply your own
 BIOS dump and legally-owned game images. We do not condone piracy.
 
 Unless noted otherwise, the source in this repository is under the MIT License
-(see LICENSE).
+(see LICENSE). The vendored LSFG-VK subset under `third_party/lsfg-vk` is
+GPL-3.0-or-later.
