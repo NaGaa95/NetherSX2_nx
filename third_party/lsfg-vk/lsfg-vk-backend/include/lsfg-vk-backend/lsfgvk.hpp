@@ -15,7 +15,7 @@
 
 #include <vulkan/vulkan_core.h>
 
-namespace vk { class Vulkan; }
+namespace vk { class CommandBuffer; class Vulkan; }
 
 namespace lsfgvk::backend {
 
@@ -148,6 +148,9 @@ namespace lsfgvk::backend {
         /// @throws backend::error on failure
         ///
         void scheduleFrames(Context& context);
+
+        /// Record same-queue generation passes without intermediate submissions or CPU waits.
+        void recordFrame(Context& context, const vk::CommandBuffer& commandBuffer);
 
         ///
         /// Close a frame generation context

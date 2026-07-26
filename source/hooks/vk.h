@@ -32,6 +32,7 @@ extern volatile int vk_present_count;
 // queue submission is still in flight.
 int vk_lsfg_is_available(void);
 int vk_lsfg_is_enabled(void);
+int vk_lsfg_is_high_fps_passthrough(void);
 void vk_lsfg_request_enabled(int enabled);
 
 // Registered in the core's import table (imports.c). Everything else the core

@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.2.0
+APP_VERSION	:=	1.2.1
 BUILD		:=	build
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
@@ -28,7 +28,8 @@ ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 LTOFLAGS := -flto=auto -fuse-linker-plugin
 
 # __SWITCH__ for libnx; NETHERSX2 gates the port-specific shim branches.
-DEFINES	:=	-D__SWITCH__ -DNETHERSX2
+DEFINES	:=	-D__SWITCH__ -DNETHERSX2 -DCURL_STATICLIB \
+			-DNETHERSX2_VERSION='"$(APP_VERSION)"'
 
 # --- renderer select: GL (default) or VK (Mesa NVK) ------------------------
 # GL and Vulkan are mutually exclusive (switch-mesa's libEGL/GLES and the NVK
@@ -85,11 +86,11 @@ LIBS	:= -Wl,--start-group \
 		-l:libnouveau_ws.a -l:libnvidia_headers_c.a \
 		-l:libnir.a -l:libcompiler.a -l:libcompiler_c_helpers.a \
 		-l:libmesa_util.a -l:libmesa_util_simd.a -l:libblake3.a -l:libmesa_util_c11.a \
-		-Wl,--end-group $(STORAGE_LIBS) -lz -lzstd -lnx -lstdc++ -lm
+		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lz -lzstd -lnx -lstdc++ -lm
 else
 # EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
-LIBS	:= $(STORAGE_LIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
+LIBS	:= $(STORAGE_LIBS) -lcurl -lz -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
 endif
 
 #---------------------------------------------------------------------------------

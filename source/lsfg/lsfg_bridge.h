@@ -28,8 +28,6 @@ typedef struct LsfgNxCreateInfo {
   VkDevice device;
   VkQueue queue;
   uint32_t queue_family_index;
-  VkQueue transfer_queue;
-  uint32_t transfer_queue_family_index;
   PFN_vkGetInstanceProcAddr get_instance_proc_addr;
 
   VkSwapchainKHR swapchain;

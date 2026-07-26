@@ -6,10 +6,13 @@
 
 #include <math.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -29,6 +32,7 @@
 #include "syslang.h"
 #include "SwitchStorageBridge.h"
 #include "CheatManager.h"
+#include "ra_http.h"
 #ifdef USE_VULKAN
 #include "hooks/vk.h"
 #endif
@@ -194,8 +198,9 @@ static struct {
   void (*setDefaultPadSettings)(void *env, void *cls);
   void (*setInputDevices)(void *env, void *cls, void *deviceArray);
   void (*changeSurface)(void *env, void *cls, void *surface, int w, int h, float hz);
+  void (*changeDisc)(void *env, void *cls, void *path);
   void (*runVMThread)(void *env, void *cls, void *ctx, void *bootPath, void *saveStatePath);
-  void (*stopVMThreadLoop)(void *env, void *cls, jbool wait);
+  void (*stopVMThreadLoop)(void *env, void *cls, jbool save_resume_state);
   void (*waitForSaveStateFlush)(void *env, void *cls);
   void (*resetVM)(void *env, void *cls);
   jbool(*hasValidRenderSurface)(void *env, void *cls);
@@ -208,6 +213,14 @@ static struct {
   void (*handleControllerButtonEvent)(void *env, void *cls, int dev, int code, jbool down);
   void (*handleControllerAxisEvent)(void *env, void *cls, int dev, int axis, float value);
   void (*handlePointerEvent)(void *env, void *cls, int id, float x, float y);
+  jbool(*isCheevosActive)(void *env, void *cls);
+  void *(*getCheevoList)(void *env, void *cls);
+  int (*getLeaderboardCount)(void *env, void *cls);
+  int (*getCheevoCount)(void *env, void *cls);
+  int (*getUnlockedCheevoCount)(void *env, void *cls);
+  int (*getCheevoPointsForGame)(void *env, void *cls);
+  int (*getCheevoMaximumPointsForGame)(void *env, void *cls);
+  void *(*getCheevoGameTitle)(void *env, void *cls);
 } nl;
 
 #define RESOLVE(field, sym) \
@@ -222,6 +235,7 @@ static void resolve_entry_points(void) {
   RESOLVE(isBIOSAvailable,             NLSYM("isBIOSAvailable"));
   RESOLVE(setInputDevices,             NLSYM("setInputDevices"));
   RESOLVE(changeSurface,               NLSYM("changeSurface"));
+  RESOLVE(changeDisc,                  NLSYM("changeDisc"));
   RESOLVE(runVMThread,                 NLSYM("runVMThread"));
   RESOLVE(stopVMThreadLoop,            NLSYM("stopVMThreadLoop"));
   RESOLVE(waitForSaveStateFlush,       NLSYM("waitForSaveStateFlush"));
@@ -243,6 +257,15 @@ static void resolve_entry_points(void) {
   RESOLVE(handlePointerEvent,          NLSYM("handlePointerEvent"));
   // setDefaultPadSettings is optional (default controller bindings)
   nl.setDefaultPadSettings = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("setDefaultPadSettings"));
+  // Keep RetroAchievements optional for compatibility with unexpected cores.
+  nl.isCheevosActive = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("isCheevosActive"));
+  nl.getCheevoList = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("getCheevoList"));
+  nl.getLeaderboardCount = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("getLeaderboardCount"));
+  nl.getCheevoCount = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("getCheevoCount"));
+  nl.getUnlockedCheevoCount = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("getUnlockedCheevoCount"));
+  nl.getCheevoPointsForGame = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("getCheevoPointsForGame"));
+  nl.getCheevoMaximumPointsForGame = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("getCheevoMaximumPointsForGame"));
+  nl.getCheevoGameTitle = (void *)so_try_find_addr_rx(&emu_mod, NLSYM("getCheevoGameTitle"));
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +273,7 @@ static void resolve_entry_points(void) {
 // ---------------------------------------------------------------------------
 
 static char g_disc_path[1024];
+static int g_bios_boot;
 static char g_core_so[256];   // core .so to load (Wrapper/CoreSo, default SO_NAME)
 static volatile int g_vm_running = 0;
 static uint32_t g_game_crc;
@@ -273,7 +297,7 @@ static void *emu_thread_main(void *arg) {
   pthr_pin_ee_core();
   g_vm_running = 1;
   nl.runVMThread(fake_env, NATIVE_CLASS, FAKE_CONTEXT,
-                 jni_make_string(g_disc_path), NULL);
+                 g_bios_boot ? NULL : jni_make_string(g_disc_path), NULL);
   g_vm_running = 0;
   return NULL;
 }
@@ -339,17 +363,17 @@ static void *make_input_devices(int count) {
 
 extern volatile int g_net_ready;  // imports.c -- gates the DEV9 socket shims
 
+static bool ensure_network_ready(void) {
+  if (g_net_ready) return true;
+  if (R_FAILED(socketInitializeDefault())) return false;
+  g_net_ready = 1;
+  return true;
+}
+
 // Initialize the DEV9 socket backend only when enabled.
 static void apply_network_settings(void) {
   int on = prefs_get_bool("Wrapper/Network", false);
-  if (on && !g_net_ready) {
-    if (R_SUCCEEDED(socketInitializeDefault())) {
-      g_net_ready = 1;
-    } else {
-
-      on = 0;
-    }
-  }
+  if (on && !ensure_network_ready()) on = 0;
   prefs_set_string("DEV9/Eth/EthEnable",     on ? "true" : "false");
   prefs_set_string("DEV9/Eth/EthApi",        "Sockets");
   prefs_set_string("DEV9/Eth/EthDevice",     "");
@@ -382,7 +406,7 @@ static void run_startup_sequence(void) {
   prefs_set_int("EmuCore/GS/Renderer", GS_RENDERER);
   prefs_set_string("EmuCore/DiscPath", g_disc_path);
   prefs_set_string("EmuCore/EnableFastBoot",
-                   prefs_get_bool("Wrapper/FastBoot", true) ? "1" : "0");
+                   !g_bios_boot && prefs_get_bool("Wrapper/FastBoot", true) ? "1" : "0");
   prefs_set_bool("EmuCore/Speedhacks/fastCDVD", false);
   // AspectRatio is a PCSX2 enum NAME; repair an invalid value, else respect the
   // user's. The core reads this pref directly to aspect-fit + centre the display.
@@ -485,6 +509,8 @@ static const PadMap pad_map[] = {
 
 static PadState g_pads[MAX_CONTROLLERS];
 static u64 g_pad_previous[MAX_CONTROLLERS];
+static HidAnalogStickState g_pad_stick_previous[MAX_CONTROLLERS][2];
+static uint8_t g_pad_sticks_valid[MAX_CONTROLLERS];
 
 // PS2 DualShock2 bind indices, recovered from libemucore.so's InputBindingInfo
 // array (0x75d88, stride 0x30). This is the `bind` argument of setPadValue().
@@ -544,6 +570,26 @@ static PadConfig g_pad_config[MAX_CONTROLLERS];
 static u64 g_turbo_combo;
 static int g_turbo_active;
 static int g_turbo_blocked;
+
+static void pad_invalidate_sticks(void) {
+  memset(g_pad_sticks_valid, 0, sizeof(g_pad_sticks_valid));
+}
+
+static bool pad_sticks_changed(int player, HidAnalogStickState left,
+                               HidAnalogStickState right) {
+  if (!g_pad_sticks_valid[player]) return true;
+  const HidAnalogStickState old_left = g_pad_stick_previous[player][0];
+  const HidAnalogStickState old_right = g_pad_stick_previous[player][1];
+  return left.x != old_left.x || left.y != old_left.y ||
+         right.x != old_right.x || right.y != old_right.y;
+}
+
+static void pad_remember_sticks(int player, HidAnalogStickState left,
+                                HidAnalogStickState right) {
+  g_pad_stick_previous[player][0] = left;
+  g_pad_stick_previous[player][1] = right;
+  g_pad_sticks_valid[player] = 1;
+}
 
 static u64 tok_to_hid(const char *tok) {
   if (!tok || !*tok || !strcasecmp(tok, "None")) return 0;
@@ -632,6 +678,8 @@ static void pad_load_bindings(void) {
   }
   g_vibration = prefs_get_bool("Wrapper/Vibration", true);
   g_turbo_combo = combo_to_hid(prefs_get_string("Wrapper/TurboCombo", "None"));
+  // Apply mapping/deadzone changes even when the physical sticks did not move.
+  pad_invalidate_sticks();
 }
 
 static void pad_axis(int controller, int neg_bind, int pos_bind, float v) {
@@ -665,7 +713,9 @@ typedef enum {
   QUICK_MENU_CLOSED,
   QUICK_MENU_MAIN,
   QUICK_MENU_FRAMERATE,
+  QUICK_MENU_DISC,
   QUICK_MENU_CHEATS,
+  QUICK_MENU_ACHIEVEMENTS,
   QUICK_MENU_MAPPING,
   QUICK_MENU_CAPTURE
 } QuickMenuMode;
@@ -675,8 +725,10 @@ typedef enum {
   QUICK_ITEM_STATE_SLOT,
   QUICK_ITEM_LOAD_STATE,
   QUICK_ITEM_SAVE_STATE,
+  QUICK_ITEM_CHANGE_DISC,
   QUICK_ITEM_MAPPING,
   QUICK_ITEM_CHEATS,
+  QUICK_ITEM_ACHIEVEMENTS,
 #ifdef USE_VULKAN
   QUICK_ITEM_LSFG,
 #endif
@@ -699,8 +751,11 @@ typedef enum {
 static QuickMenuMode g_quick_menu_mode;
 static int g_quick_menu_selection;
 static int g_quick_menu_framerate_selection;
+static int g_quick_menu_disc_selection;
 static int g_quick_menu_slot;
 static int g_quick_menu_cheat_selection;
+static int g_quick_menu_achievement_selection;
+static void *g_quick_achievement_list;
 static int g_quick_menu_map_player;
 static int g_quick_menu_map_selection;
 static int g_quick_menu_capture_armed;
@@ -728,6 +783,15 @@ static NxCheatList g_quick_cheats;
 static char g_quick_cheat_path[256];
 static int g_quick_cheat_load_ok;
 
+#define QUICK_DISC_MAX 64
+typedef struct {
+  char path[sizeof(g_disc_path)];
+  char name[192];
+  int current;
+} QuickDiscEntry;
+static QuickDiscEntry g_quick_discs[QUICK_DISC_MAX];
+static int g_quick_disc_count;
+
 static void text_append(char *buffer, size_t size, const char *format, ...) {
   size_t used = strlen(buffer);
   if (used >= size - 1) return;
@@ -747,6 +811,7 @@ static void quick_menu_status(const char *message) {
 }
 
 static void quick_menu_release_inputs(void) {
+  pad_invalidate_sticks();
   if (!nl.setPadValue) return;
   for (int player = 0; player < g_controller_count; player++) {
     PadConfig *config = &g_pad_config[player];
@@ -760,6 +825,8 @@ static void quick_menu_release_inputs(void) {
 }
 
 static bool quick_menu_item_available(int item) {
+  if (item == QUICK_ITEM_ACHIEVEMENTS)
+    return nl.isCheevosActive && nl.getCheevoList;
 #ifdef USE_VULKAN
   if (item == QUICK_ITEM_LSFG) return vk_lsfg_is_available();
 #else
@@ -779,7 +846,7 @@ static void quick_menu_move_selection(int direction) {
 static void quick_menu_draw_main(void) {
   static const char *labels[] = {
     "Resume game", "State slot", "Load state", "Save state",
-    "Controller mapping", "Cheat codes",
+    "Change disc", "Controller mapping", "Cheat codes", "Achievements",
 #ifdef USE_VULKAN
     "Frame Generation",
 #endif
@@ -799,10 +866,19 @@ static void quick_menu_draw_main(void) {
         text_append(text, sizeof(text), "  %s: Disabled\n", labels[i]);
       else
         text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
-                    g_quick_menu_lsfg_enabled ? "On" : "Off");
+                    !g_quick_menu_lsfg_enabled ? "Off" :
+                    (vk_lsfg_is_high_fps_passthrough() ?
+                        "On (native FPS protected)" : "On"));
     }
 #endif
-    else if (i == QUICK_ITEM_FRAMERATE)
+    else if (i == QUICK_ITEM_ACHIEVEMENTS) {
+      const bool enabled = prefs_get_bool("Achievements/Enabled", false) &&
+                           prefs_get_string("Achievements/Username", "")[0] &&
+                           prefs_get_string("Achievements/Token", "")[0];
+      text_append(text, sizeof(text), "%s%s%s\n", marker, labels[i],
+                  enabled ? " >" : ": Disabled");
+    }
+    else if (i == QUICK_ITEM_CHANGE_DISC || i == QUICK_ITEM_FRAMERATE)
       text_append(text, sizeof(text), "%s%s >\n", marker, labels[i]);
     else
       text_append(text, sizeof(text), "%s%s\n", marker, labels[i]);
@@ -838,6 +914,90 @@ static void quick_menu_draw_framerate(void) {
       text_append(text, sizeof(text), "%s%s\n", marker, labels[i]);
   }
   text_append(text, sizeof(text), "\nA  Select/Toggle     Left/Right  Change     B  Back");
+  quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+}
+
+static bool quick_disc_extension_supported(const char *name) {
+  const char *extension = strrchr(name, '.');
+  if (!extension) return false;
+  static const char *const extensions[] = {
+    ".iso", ".chd", ".cso", ".zso", ".bin", ".mdf", ".img", ".gz", ".nrg"
+  };
+  for (unsigned i = 0; i < sizeof(extensions) / sizeof(*extensions); i++)
+    if (!strcasecmp(extension, extensions[i])) return true;
+  return false;
+}
+
+static int quick_disc_compare(const void *left, const void *right) {
+  const QuickDiscEntry *a = (const QuickDiscEntry *)left;
+  const QuickDiscEntry *b = (const QuickDiscEntry *)right;
+  return strcasecmp(a->name, b->name);
+}
+
+static void quick_menu_refresh_discs(void) {
+  g_quick_disc_count = 0;
+  g_quick_menu_disc_selection = 0;
+  if (!g_disc_path[0]) return;
+
+  const char *slash = strrchr(g_disc_path, '/');
+  if (!slash) return;
+  char directory[sizeof(g_disc_path)];
+  size_t directory_length = (size_t)(slash - g_disc_path) + 1;
+  if (directory_length >= sizeof(directory)) return;
+  memcpy(directory, g_disc_path, directory_length);
+  directory[directory_length] = '\0';
+
+  DIR *handle = opendir(directory);
+  if (!handle) return;
+  struct dirent *entry;
+  while (g_quick_disc_count < QUICK_DISC_MAX && (entry = readdir(handle))) {
+    if (entry->d_name[0] == '.' || !quick_disc_extension_supported(entry->d_name))
+      continue;
+    QuickDiscEntry *disc = &g_quick_discs[g_quick_disc_count];
+    if (snprintf(disc->path, sizeof(disc->path), "%s%s", directory,
+                 entry->d_name) >= (int)sizeof(disc->path))
+      continue;
+    struct stat info;
+    if (stat(disc->path, &info) != 0 || !S_ISREG(info.st_mode)) continue;
+    snprintf(disc->name, sizeof(disc->name), "%s", entry->d_name);
+    disc->current = !strcmp(disc->path, g_disc_path);
+    g_quick_disc_count++;
+  }
+  closedir(handle);
+  qsort(g_quick_discs, (size_t)g_quick_disc_count,
+        sizeof(g_quick_discs[0]), quick_disc_compare);
+  for (int i = 0; i < g_quick_disc_count; i++)
+    if (g_quick_discs[i].current) {
+      g_quick_menu_disc_selection = i;
+      break;
+    }
+}
+
+static void quick_menu_draw_discs(void) {
+  char text[1536] = "CHANGE DISC\n\n";
+  if (!g_quick_disc_count) {
+    text_append(text, sizeof(text),
+                "No PS2 disc images were found beside the current disc.\n\n> Back\n");
+  } else {
+    const int item_count = g_quick_disc_count + 1;
+    int first = g_quick_menu_disc_selection > 3 ?
+        g_quick_menu_disc_selection - 3 : 0;
+    if (first > item_count - 7) first = item_count > 7 ? item_count - 7 : 0;
+    int last = first + 7;
+    if (last > item_count) last = item_count;
+    for (int item = first; item < last; item++) {
+      const char *marker = item == g_quick_menu_disc_selection ? "> " : "  ";
+      if (item == g_quick_disc_count) {
+        text_append(text, sizeof(text), "%sBack\n", marker);
+      } else {
+        const QuickDiscEntry *disc = &g_quick_discs[item];
+        text_append(text, sizeof(text), "%s%s %.92s\n", marker,
+                    disc->current ? "[inserted]" : "          ", disc->name);
+      }
+    }
+  }
+  text_append(text, sizeof(text),
+              "\nDisc images are read from the current game's folder.\nA  Insert     B  Back");
   quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
 }
 
@@ -893,6 +1053,102 @@ static void quick_menu_draw_cheats(void) {
       text_append(text, sizeof(text), "\nOnly the first %d codes are shown.", NX_CHEAT_MAX_ENTRIES);
   }
   text_append(text, sizeof(text), "\nA  Toggle     Left  Off     Right  On     B  Back");
+  quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+}
+
+static bool quick_menu_achievements_configured(void) {
+  return prefs_get_bool("Achievements/Enabled", false) &&
+         prefs_get_string("Achievements/Username", "")[0] &&
+         prefs_get_string("Achievements/Token", "")[0];
+}
+
+static void quick_menu_refresh_achievements(void) {
+  g_quick_achievement_list = NULL;
+  if (quick_menu_achievements_configured() && nl.getCheevoList)
+    g_quick_achievement_list = nl.getCheevoList(fake_env, NATIVE_CLASS);
+  const int count = jni_obj_array_len(g_quick_achievement_list);
+  if (g_quick_menu_achievement_selection > count)
+    g_quick_menu_achievement_selection = count;
+}
+
+static void quick_menu_draw_achievements(void) {
+  char text[2048] = "RETROACHIEVEMENTS\n\n";
+  if (!quick_menu_achievements_configured()) {
+    text_append(text, sizeof(text),
+                "Disabled. Sign in and enable achievements from the launcher.\n\n> Back");
+    text_append(text, sizeof(text), "\n\nA/B  Back");
+    quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+    return;
+  }
+
+  const bool active = nl.isCheevosActive &&
+                      nl.isCheevosActive(fake_env, NATIVE_CLASS);
+  const char *game_title = "";
+  if (nl.getCheevoGameTitle) {
+    void *title = nl.getCheevoGameTitle(fake_env, NATIVE_CLASS);
+    const char *value = jni_string_utf(title);
+    if (value) game_title = value;
+  }
+  int total = nl.getCheevoCount ? nl.getCheevoCount(fake_env, NATIVE_CLASS) : 0;
+  int unlocked = nl.getUnlockedCheevoCount ?
+      nl.getUnlockedCheevoCount(fake_env, NATIVE_CLASS) : 0;
+  int points = nl.getCheevoPointsForGame ?
+      nl.getCheevoPointsForGame(fake_env, NATIVE_CLASS) : 0;
+  int maximum_points = nl.getCheevoMaximumPointsForGame ?
+      nl.getCheevoMaximumPointsForGame(fake_env, NATIVE_CLASS) : 0;
+  int leaderboards = nl.getLeaderboardCount ?
+      nl.getLeaderboardCount(fake_env, NATIVE_CLASS) : 0;
+  if (total < 0) total = 0;
+  if (unlocked < 0) unlocked = 0;
+  if (points < 0) points = 0;
+  if (maximum_points < 0) maximum_points = 0;
+  if (leaderboards < 0) leaderboards = 0;
+
+  if (game_title[0]) text_append(text, sizeof(text), "%.72s\n", game_title);
+  text_append(text, sizeof(text), "%d/%d unlocked  -  %d/%d points",
+              unlocked, total, points, maximum_points);
+  if (leaderboards)
+    text_append(text, sizeof(text), "  -  %d leaderboard%s", leaderboards,
+                leaderboards == 1 ? "" : "s");
+  text_append(text, sizeof(text), "\n\n");
+
+  const int count = jni_obj_array_len(g_quick_achievement_list);
+  if (!active) {
+    text_append(text, sizeof(text),
+                "Connecting, or the current game is not identified yet.\n\n> Back\n");
+  } else if (!count) {
+    text_append(text, sizeof(text),
+                "This game has no achievements, or they are still loading.\n\n> Back\n");
+  } else {
+    if (g_quick_menu_achievement_selection > count)
+      g_quick_menu_achievement_selection = count;
+    int first = g_quick_menu_achievement_selection > 2 ?
+        g_quick_menu_achievement_selection - 2 : 0;
+    if (first > count - 5) first = count > 5 ? count - 5 : 0;
+    int last = first + 6;
+    if (last > count + 1) last = count + 1;
+    for (int item = first; item < last; item++) {
+      const char *marker = item == g_quick_menu_achievement_selection ? "> " : "  ";
+      if (item == count) {
+        text_append(text, sizeof(text), "%sBack\n", marker);
+        continue;
+      }
+      void *achievement = jni_obj_array_get(g_quick_achievement_list, item);
+      const bool locked = jni_obj_get_int(achievement, "locked", 1) != 0;
+      const int value = jni_obj_get_int(achievement, "points", 0);
+      text_append(text, sizeof(text), "%s%s %.58s (%d)\n", marker,
+                  locked ? "[ ]" : "[x]",
+                  jni_obj_get_string(achievement, "title", "Achievement"), value);
+    }
+    if (g_quick_menu_achievement_selection < count) {
+      void *selected = jni_obj_array_get(g_quick_achievement_list,
+                                          g_quick_menu_achievement_selection);
+      const char *description = jni_obj_get_string(selected, "description", "");
+      if (description[0])
+        text_append(text, sizeof(text), "\n%.130s\n", description);
+    }
+  }
+  text_append(text, sizeof(text), "\nUp/Down  Browse     X  Refresh     B  Back");
   quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
 }
 
@@ -1163,6 +1419,11 @@ static bool quick_menu_update(u64 down, u64 pressed) {
           quick_menu_close();
           quick_menu_status("State saved");
           return true;
+        case QUICK_ITEM_CHANGE_DISC:
+          g_quick_menu_mode = QUICK_MENU_DISC;
+          quick_menu_refresh_discs();
+          quick_menu_draw_discs();
+          return true;
         case QUICK_ITEM_MAPPING:
           g_quick_menu_mode = QUICK_MENU_MAPPING;
           g_quick_menu_map_selection = 0;
@@ -1173,18 +1434,24 @@ static bool quick_menu_update(u64 down, u64 pressed) {
           g_quick_menu_cheat_selection = 0;
           quick_menu_draw_cheats();
           return true;
+        case QUICK_ITEM_ACHIEVEMENTS:
+          g_quick_menu_mode = QUICK_MENU_ACHIEVEMENTS;
+          g_quick_menu_achievement_selection = 0;
+          quick_menu_refresh_achievements();
+          quick_menu_draw_achievements();
+          return true;
 #ifdef USE_VULKAN
         case QUICK_ITEM_LSFG:
           if (!g_quick_menu_lsfg_enabled && !vk_lsfg_is_available()) {
-            quick_menu_status("Frame generation is disabled for this session");
+            quick_menu_status("Frame generation is disabled");
             break;
           }
           {
             const bool enabled = !g_quick_menu_lsfg_enabled;
             quick_menu_set_lsfg_enabled(enabled);
             quick_menu_status(enabled ?
-                "Frame generation enabled for this session" :
-                "Frame generation disabled for this session");
+                "Frame generation enabled" :
+                "Frame generation disabled");
           }
           break;
 #endif
@@ -1205,6 +1472,42 @@ static bool quick_menu_update(u64 down, u64 pressed) {
       }
     }
     quick_menu_draw_main();
+    return true;
+  }
+
+  if (g_quick_menu_mode == QUICK_MENU_DISC) {
+    const int item_count = g_quick_disc_count + 1;
+    if (pressed & HidNpadButton_Up)
+      g_quick_menu_disc_selection =
+          (g_quick_menu_disc_selection + item_count - 1) % item_count;
+    if (pressed & HidNpadButton_Down)
+      g_quick_menu_disc_selection =
+          (g_quick_menu_disc_selection + 1) % item_count;
+    if ((pressed & HidNpadButton_B) ||
+        ((pressed & HidNpadButton_A) &&
+         g_quick_menu_disc_selection == g_quick_disc_count)) {
+      g_quick_menu_mode = QUICK_MENU_MAIN;
+      quick_menu_draw_main();
+      return true;
+    }
+    if ((pressed & HidNpadButton_A) &&
+        g_quick_menu_disc_selection < g_quick_disc_count) {
+      QuickDiscEntry *disc = &g_quick_discs[g_quick_menu_disc_selection];
+      if (disc->current) {
+        quick_menu_status("This disc is already inserted");
+      } else {
+        nl.changeDisc(fake_env, NATIVE_CLASS, jni_make_string(disc->path));
+        snprintf(g_disc_path, sizeof(g_disc_path), "%s", disc->path);
+        prefs_set_disc_path(g_disc_path);
+        prefs_set_string("EmuCore/DiscPath", g_disc_path);
+        quick_menu_close();
+        char status[256];
+        snprintf(status, sizeof(status), "Inserted %.220s", disc->name);
+        quick_menu_status(status);
+        return true;
+      }
+    }
+    quick_menu_draw_discs();
     return true;
   }
 
@@ -1312,6 +1615,28 @@ static bool quick_menu_update(u64 down, u64 pressed) {
     return true;
   }
 
+  if (g_quick_menu_mode == QUICK_MENU_ACHIEVEMENTS) {
+    const int count = jni_obj_array_len(g_quick_achievement_list);
+    const int item_count = count + 1;
+    if (pressed & HidNpadButton_Up)
+      g_quick_menu_achievement_selection =
+          (g_quick_menu_achievement_selection + item_count - 1) % item_count;
+    if (pressed & HidNpadButton_Down)
+      g_quick_menu_achievement_selection =
+          (g_quick_menu_achievement_selection + 1) % item_count;
+    if (pressed & HidNpadButton_X)
+      quick_menu_refresh_achievements();
+    if ((pressed & HidNpadButton_B) ||
+        ((pressed & HidNpadButton_A) &&
+         g_quick_menu_achievement_selection == count)) {
+      g_quick_menu_mode = QUICK_MENU_MAIN;
+      quick_menu_draw_main();
+      return true;
+    }
+    quick_menu_draw_achievements();
+    return true;
+  }
+
   const int item_count = (int)NUM_PS2_BUTTONS + 2;
   if (pressed & HidNpadButton_Up)
     g_quick_menu_map_selection = (g_quick_menu_map_selection + item_count - 1) % item_count;
@@ -1358,7 +1683,6 @@ static void turbo_set_active(int active) {
 }
 
 static void update_gamepads(void) {
-  quick_menu_persist_game_crc();
   for (int player = 0; player < g_controller_count; player++)
     padUpdate(&g_pads[player]);
   const u64 menu_down = padGetButtons(&g_pads[0]);
@@ -1381,34 +1705,42 @@ static void update_gamepads(void) {
     PadConfig *config = &g_pad_config[player];
     const u64 down = padGetButtons(pad);
     const u64 changed = down ^ g_pad_previous[player];
+    const HidAnalogStickState ls = padGetStickPos(pad, 0);
+    const HidAnalogStickState rs = padGetStickPos(pad, 1);
+    const bool sticks_changed = pad_sticks_changed(player, ls, rs);
     if (nl.setPadValue) {
       for (int i = 0; i < config->bind_count; i++) {
         if (!(changed & config->binds[i].hid)) continue;
         nl.setPadValue(fake_env, NATIVE_CLASS, player, config->binds[i].bind,
                        (down & config->binds[i].hid) ? 1.0f : 0.0f);
       }
-      const HidAnalogStickState ls = padGetStickPos(pad, 0);
-      const HidAnalogStickState rs = padGetStickPos(pad, 1);
-      apply_ps2_stick(player, config, &config->left_stick, ls, rs,
-                      PB_LLEFT, PB_LRIGHT, PB_LDOWN, PB_LUP);
-      apply_ps2_stick(player, config, &config->right_stick, ls, rs,
-                      PB_RLEFT, PB_RRIGHT, PB_RDOWN, PB_RUP);
+      if (sticks_changed) {
+        apply_ps2_stick(player, config, &config->left_stick, ls, rs,
+                        PB_LLEFT, PB_LRIGHT, PB_LDOWN, PB_LUP);
+        apply_ps2_stick(player, config, &config->right_stick, ls, rs,
+                        PB_RLEFT, PB_RRIGHT, PB_RDOWN, PB_RUP);
+      }
     } else {
       for (unsigned i = 0; i < sizeof(pad_map) / sizeof(*pad_map); i++) {
         if (changed & pad_map[i].hid)
           nl.handleControllerButtonEvent(fake_env, NATIVE_CLASS, player, pad_map[i].keycode,
                                          (down & pad_map[i].hid) ? 1 : 0);
       }
-      const float scale = 1.f / 32767.0f;
-      const HidAnalogStickState ls = padGetStickPos(pad, 0);
-      const HidAnalogStickState rs = padGetStickPos(pad, 1);
-      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_X,  (float)ls.x *  scale);
-      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_Y,  (float)ls.y * -scale);
-      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_Z,  (float)rs.x *  scale);
-      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_RZ, (float)rs.y * -scale);
-      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_LTRIGGER, (down & HidNpadButton_ZL) ? 1.f : 0.f);
-      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_RTRIGGER, (down & HidNpadButton_ZR) ? 1.f : 0.f);
+      if (sticks_changed) {
+        const float scale = 1.f / 32767.0f;
+        nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_X,  (float)ls.x *  scale);
+        nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_Y,  (float)ls.y * -scale);
+        nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_Z,  (float)rs.x *  scale);
+        nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_RZ, (float)rs.y * -scale);
+      }
+      if (changed & HidNpadButton_ZL)
+        nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_LTRIGGER,
+                                     (down & HidNpadButton_ZL) ? 1.f : 0.f);
+      if (changed & HidNpadButton_ZR)
+        nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_RTRIGGER,
+                                     (down & HidNpadButton_ZR) ? 1.f : 0.f);
     }
+    if (sticks_changed) pad_remember_sticks(player, ls, rs);
     g_pad_previous[player] = down;
   }
 }
@@ -1465,11 +1797,20 @@ int main(void) {
 
   // settings store: load nethersx2.ini + seed OpenGL/folder defaults
   prefs_init(PREFS_PATH);
+  // Enforce Casual mode and require complete credentials before startup.
+  prefs_set_bool("Achievements/ChallengeMode", false);
+  prefs_set_bool("Achievements/Leaderboards", false);
+  prefs_set_bool("Achievements/TestMode", false);
+  prefs_set_bool("Achievements/UnofficialTestMode", false);
+  if (!prefs_get_string("Achievements/Username", "")[0] ||
+      !prefs_get_string("Achievements/Token", "")[0])
+    prefs_set_bool("Achievements/Enabled", false);
   fastmem_set_mode(!strcmp(prefs_get_string("Wrapper/FastmemMode", "hybrid"), "hybrid") ?
                        FASTMEM_MODE_ON : FASTMEM_MODE_OFF);
   pad_load_bindings();
+  g_bios_boot = prefs_get_bool("Wrapper/BootBIOS", false);
   snprintf(g_disc_path, sizeof(g_disc_path), "%s",
-           prefs_get_string("EmuCore/DiscPath", DEFAULT_DISC_PATH));
+           g_bios_boot ? "" : prefs_get_string("EmuCore/DiscPath", DEFAULT_DISC_PATH));
   char storage_error[256];
   if (!switchStorageInitializeForPath(DATA_ROOT "/launcher.ini", g_disc_path, sizeof(g_disc_path),
                                       storage_error, sizeof(storage_error)))
@@ -1477,6 +1818,11 @@ int main(void) {
   prefs_set_disc_path(g_disc_path);
   if (switchStorageSocketReady())
     g_net_ready = 1;
+  if (prefs_get_bool("Wrapper/Network", false) ||
+      prefs_get_bool("Achievements/Enabled", false)) {
+    // DEV9 remains controlled separately by apply_network_settings.
+    (void)ensure_network_ready();
+  }
 
   snprintf(g_core_so, sizeof(g_core_so), "%s",
            prefs_get_string("Wrapper/CoreSo", SO_NAME));
@@ -1518,6 +1864,8 @@ int main(void) {
   so_free_temp(&emu_mod);
 
   jni_init();
+  if (prefs_get_bool("Achievements/Enabled", false))
+    ra_http_init();
   NATIVE_CLASS = jni_obj_new("xyz/aethersx2/android/NativeLibrary");
   FAKE_CONTEXT = jni_obj_new("android/content/Context");
   FAKE_SURFACE = jni_obj_new("android/view/Surface");
@@ -1538,36 +1886,49 @@ int main(void) {
   extern volatile int egl_swap_count;
 #define FRAME_COUNT egl_swap_count
 #endif
-  u64 ticks = 0;
+  u64 input_polls = 0;
   int boosting = 1;
   int quick_menu_hint_shown = 0;
   const int cpu_boost_present_limit = 60;
 
+  // Poll HID at 1 kHz; keep housekeeping at 125 Hz and forward only changes.
+  const uint64_t input_poll_interval_ns = UINT64_C(1000000);
+  const uint64_t housekeeping_divisor = 8;
+  const uint64_t vm_exit_grace_polls = 2000;
+
   pthr_pin_bg_core();
 
-  while (appletMainLoop() && !g_quick_menu_exit_requested) {
+  int applet_running = 1;
+  while (applet_running && !g_quick_menu_exit_requested) {
     if (crash_in_progress())
       for (;;) svcSleepThread(1000000000ULL);
-    ++ticks;
-    const int frame_count = FRAME_COUNT;
-    if (frame_count > 0)
-      g_quick_menu_ready = 1;
-    update_gamepads();
-    update_touch();
-    svcSleepThread(1000000000ull / 120); // ~120 Hz input polling
-    if (boosting && FRAME_COUNT >= cpu_boost_present_limit) {
-      // One second at 60 FPS (two seconds for a duplicate-skipped 30 FPS game)
-      // is enough to cover core and renderer startup without holding FastLoad.
-      cpu_boost(0);
-      boosting = 0;
-    }
-    if (!quick_menu_hint_shown && FRAME_COUNT >= 300) {
-      quick_menu_status("Quick menu: L + R + Plus");
-      quick_menu_hint_shown = 1;
+
+    if ((input_polls % housekeeping_divisor) == 0) {
+      applet_running = appletMainLoop();
+      if (!applet_running) break;
+      quick_menu_persist_game_crc();
+      update_touch();
+
+      const int frame_count = FRAME_COUNT;
+      if (frame_count > 0)
+        g_quick_menu_ready = 1;
+      if (boosting && frame_count >= cpu_boost_present_limit) {
+        // Cover startup without holding the CPU boost into gameplay.
+        cpu_boost(0);
+        boosting = 0;
+      }
+      if (!quick_menu_hint_shown && frame_count >= 300) {
+        quick_menu_status("Quick menu: L + R + Plus");
+        quick_menu_hint_shown = 1;
+      }
     }
 
-    if (!g_vm_running && ticks > 240)       // VM thread exited -> shut down
+    update_gamepads();
+    ++input_polls;
+
+    if (!g_vm_running && input_polls > vm_exit_grace_polls)
       break;
+    svcSleepThread(input_poll_interval_ns);
   }
 
   if (g_quick_menu_mode != QUICK_MENU_CLOSED)
@@ -1576,18 +1937,21 @@ int main(void) {
 
   const int has_next_load = envHasNextLoad();
   const char *launcher_path = prefs_get_string("Wrapper/LauncherPath", "");
-  if (g_quick_menu_exit_requested && has_next_load) {
-    if (launcher_path[0])
-      envSetNextLoad(launcher_path, launcher_path);
-  }
+  if (g_quick_menu_exit_requested && has_next_load && launcher_path[0])
+    envSetNextLoad(launcher_path, launcher_path);
 
   // The boot-time stop filter must be disabled during shutdown.
   { extern volatile int g_allow_stop; g_allow_stop = 1; }
-  nl.stopVMThreadLoop(fake_env, NATIVE_CLASS, 1);
+  // Explicit Exit skips the slow resume-state save; system close still keeps it.
+  const jbool save_resume_state = g_quick_menu_exit_requested ? 0 : 1;
+  nl.stopVMThreadLoop(fake_env, NATIVE_CLASS, save_resume_state);
   pthread_join(emu_thread, NULL);
   nl.waitForSaveStateFlush(fake_env, NATIVE_CLASS);
+  // Mirror Android's achievements shutdown before JNI services disappear.
+  core_shutdown_achievements();
   if (nl.JNI_OnUnload)
     nl.JNI_OnUnload(fake_vm, NULL);
+  ra_http_shutdown();
   core_shutdown_mtgs();
   libc_finalize_core();
   pthr_shutdown();

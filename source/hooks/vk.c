@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <time.h>
 #include "../util.h"
 #include "../config.h"
 #include "../prefs.h"
@@ -47,9 +48,7 @@ static VkDevice         tracked_device;
 static uint32_t         tracked_instance_api = VK_API_VERSION_1_0;
 static QueueRecord      tracked_queues[MAX_TRACKED_QUEUES];
 static uint32_t         tracked_queue_count;
-static VkQueue          lsfg_transfer_queue;
 static uint32_t         lsfg_main_queue_family = VK_QUEUE_FAMILY_IGNORED;
-static uint32_t         lsfg_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
 
 static VkSwapchainKHR tracked_swapchain;
 static VkExtent2D     tracked_swapchain_extent;
@@ -61,6 +60,14 @@ static int lsfg_device_capable;
 static int lsfg_session_prepared;
 static int lsfg_enabled_requested;
 static int lsfg_runtime_available;
+/* Measure source timing before LSFG; two 60 Hz FIFO presents would halve a
+ * native 50/60 FPS game. */
+static uint64_t lsfg_last_source_present_ns;
+static double lsfg_source_interval_ns;
+static unsigned lsfg_source_samples;
+static unsigned lsfg_high_fps_slow_samples;
+static int lsfg_previous_requested;
+static int lsfg_rate_decision = -1; /* -1: measuring, 0: generate, 1: passthrough */
 
 static PFN_vkCreateDevice real_create_device;
 static PFN_vkGetDeviceQueue real_get_device_queue;
@@ -80,6 +87,10 @@ int vk_lsfg_is_available(void) {
 
 int vk_lsfg_is_enabled(void) {
   return lsfg_requested();
+}
+
+int vk_lsfg_is_high_fps_passthrough(void) {
+  return lsfg_requested() && lsfg_rate_decision == 1;
 }
 
 void vk_lsfg_request_enabled(int enabled) {
@@ -176,11 +187,10 @@ static int extension_enabled(const VkDeviceCreateInfo *create_info,
   return 0;
 }
 
-static VkResult find_lsfg_queue_families(
+static VkResult find_lsfg_main_queue_family(
     VkPhysicalDevice physical_device,
     const VkDeviceCreateInfo *create_info,
-    uint32_t *main_family,
-    uint32_t *transfer_family) {
+    uint32_t *main_family) {
   uint32_t count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &count, NULL);
   if (!count) return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -190,18 +200,8 @@ static VkResult find_lsfg_queue_families(
   vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &count, properties);
 
   uint32_t main = VK_QUEUE_FAMILY_IGNORED;
-  uint32_t transfer = VK_QUEUE_FAMILY_IGNORED;
-  for (uint32_t i = 0; i < count; ++i) {
-    const VkQueueFlags flags = properties[i].queueFlags;
-    if (properties[i].queueCount && (flags & VK_QUEUE_TRANSFER_BIT) &&
-        !(flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
-      transfer = i;
-      break;
-    }
-  }
 
-  /* Prefer the application's graphics queue; it is also the present queue on
-   * NVK. Fall back to a requested compute queue for completeness. */
+  /* NVK's graphics/present queue supports the fused LSFG transfer work. */
   for (uint32_t pass = 0; pass < 2 && main == VK_QUEUE_FAMILY_IGNORED; ++pass) {
     const VkQueueFlags wanted = pass ? VK_QUEUE_COMPUTE_BIT : VK_QUEUE_GRAPHICS_BIT;
     for (uint32_t i = 0; i < create_info->queueCreateInfoCount; ++i) {
@@ -216,27 +216,8 @@ static VkResult find_lsfg_queue_families(
 
   free(properties);
   *main_family = main;
-  *transfer_family = transfer;
   return main == VK_QUEUE_FAMILY_IGNORED ?
       VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS;
-}
-
-static int normal_queue_family_enabled(const VkDeviceCreateInfo *create_info,
-                                       uint32_t family) {
-  for (uint32_t i = 0; i < create_info->queueCreateInfoCount; ++i) {
-    const VkDeviceQueueCreateInfo *queue_info = &create_info->pQueueCreateInfos[i];
-    if (queue_info->queueFamilyIndex == family && queue_info->queueCount &&
-        queue_info->flags == 0)
-      return 1;
-  }
-  return 0;
-}
-
-static void append_unique_queue_family(uint32_t *families, uint32_t *count,
-                                       uint32_t family) {
-  for (uint32_t i = 0; i < *count; ++i)
-    if (families[i] == family) return;
-  families[(*count)++] = family;
 }
 
 static void reset_tracked_swapchain(void) {
@@ -245,7 +226,47 @@ static void reset_tracked_swapchain(void) {
   memset(&tracked_swapchain_extent, 0, sizeof(tracked_swapchain_extent));
   tracked_swapchain_lsfg_compatible = 0;
   lsfg_init_attempted = 0;
+  lsfg_last_source_present_ns = 0;
+  lsfg_source_interval_ns = 0.0;
+  lsfg_source_samples = 0;
+  lsfg_high_fps_slow_samples = 0;
+  lsfg_previous_requested = 0;
+  lsfg_rate_decision = -1;
   __atomic_store_n(&lsfg_runtime_available, 0, __ATOMIC_RELEASE);
+}
+
+static uint64_t lsfg_monotonic_ns(void) {
+  struct timespec value;
+  if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
+  return (uint64_t)value.tv_sec * UINT64_C(1000000000) + (uint64_t)value.tv_nsec;
+}
+
+static uint64_t lsfg_observe_source_present(void) {
+  const uint64_t now = lsfg_monotonic_ns();
+  uint64_t interval = 0;
+  if (now && lsfg_last_source_present_ns && now > lsfg_last_source_present_ns) {
+    interval = now - lsfg_last_source_present_ns;
+    /* Ignore menu stalls, swapchain transitions, and implausibly short bursts. */
+    if (interval >= UINT64_C(4000000) && interval <= UINT64_C(100000000)) {
+      if (!lsfg_source_samples)
+        lsfg_source_interval_ns = (double)interval;
+      else
+        lsfg_source_interval_ns =
+            lsfg_source_interval_ns * 0.875 + (double)interval * 0.125;
+      if (lsfg_source_samples < 120) ++lsfg_source_samples;
+    } else {
+      interval = 0;
+    }
+  }
+  lsfg_last_source_present_ns = now;
+  return interval;
+}
+
+static int lsfg_source_is_high_rate(void) {
+  /* Conservative boundary between 30 FPS and a slightly dipping 50/60 FPS game. */
+  return lsfg_source_samples >= 8 &&
+         lsfg_source_interval_ns > 0.0 &&
+         lsfg_source_interval_ns < 30000000.0;
 }
 
 // surface: Android create-info -> NVK VI surface. ci->window is the core's
@@ -286,7 +307,6 @@ vkCreateDevice_shim(VkPhysicalDevice physical_device,
   int augmented = 0;
   int configure_lsfg = prepare_lsfg;
   uint32_t main_family = VK_QUEUE_FAMILY_IGNORED;
-  uint32_t transfer_family = VK_QUEUE_FAMILY_IGNORED;
   VkResult configuration_error = VK_SUCCESS;
 
   VkDeviceCreateInfo modified = *create_info;
@@ -300,36 +320,12 @@ vkCreateDevice_shim(VkPhysicalDevice physical_device,
   VkBool32 old_timeline_value = VK_FALSE;
 
   const char **extensions = NULL;
-  VkDeviceQueueCreateInfo *queue_infos = NULL;
-  float transfer_priority = 1.0f;
 
   if (configure_lsfg) {
-    configuration_error = find_lsfg_queue_families(
-        physical_device, create_info, &main_family, &transfer_family);
+    configuration_error = find_lsfg_main_queue_family(
+        physical_device, create_info, &main_family);
     if (configuration_error != VK_SUCCESS) {
       configure_lsfg = 0;
-    }
-  }
-
-  if (configure_lsfg && transfer_family != VK_QUEUE_FAMILY_IGNORED &&
-      !normal_queue_family_enabled(create_info, transfer_family)) {
-    queue_infos = malloc(sizeof(*queue_infos) *
-                         (create_info->queueCreateInfoCount + 1));
-    if (!queue_infos) {
-      configuration_error = VK_ERROR_OUT_OF_HOST_MEMORY;
-      configure_lsfg = 0;
-    } else {
-      memcpy(queue_infos, create_info->pQueueCreateInfos,
-             sizeof(*queue_infos) * create_info->queueCreateInfoCount);
-      queue_infos[create_info->queueCreateInfoCount] =
-          (VkDeviceQueueCreateInfo) {
-              .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-              .queueFamilyIndex = transfer_family,
-              .queueCount = 1,
-              .pQueuePriorities = &transfer_priority,
-          };
-      modified.queueCreateInfoCount = create_info->queueCreateInfoCount + 1;
-      modified.pQueueCreateInfos = queue_infos;
     }
   }
 
@@ -400,34 +396,18 @@ vkCreateDevice_shim(VkPhysicalDevice physical_device,
   if (existing_timeline) existing_timeline->timelineSemaphore = old_timeline_value;
   if (existing_vulkan12) existing_vulkan12->timelineSemaphore = old_timeline_value;
   free(extensions);
-  free(queue_infos);
 
   lsfg_device_capable = 0;
   if (result == VK_SUCCESS) {
     tracked_physical_device = physical_device;
     tracked_device = *out;
     tracked_queue_count = 0;
-    lsfg_transfer_queue = VK_NULL_HANDLE;
     lsfg_main_queue_family = VK_QUEUE_FAMILY_IGNORED;
-    lsfg_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
     reset_tracked_swapchain();
 
     if (configure_lsfg && augmented) {
       lsfg_main_queue_family = main_family;
       lsfg_device_capable = 1;
-      if (transfer_family != VK_QUEUE_FAMILY_IGNORED) {
-        PFN_vkGetDeviceQueue get_queue = (PFN_vkGetDeviceQueue)
-            vkGetDeviceProcAddr(*out, "vkGetDeviceQueue");
-        if (!get_queue) get_queue = vkGetDeviceQueue;
-        get_queue(*out, transfer_family, 0, &lsfg_transfer_queue);
-      }
-      if (lsfg_transfer_queue) {
-        lsfg_transfer_queue_family = transfer_family;
-        remember_queue(lsfg_transfer_queue, transfer_family);
-      } else {
-        if (transfer_family != VK_QUEUE_FAMILY_IGNORED)
-          lsfg_device_capable = 0;
-      }
     }
   }
   return result;
@@ -463,7 +443,6 @@ vkCreateSwapchainKHR_shim(VkDevice device,
     reset_tracked_swapchain();
 
   VkSwapchainCreateInfoKHR modified = *create_info;
-  uint32_t *sharing_families = NULL;
   int compatible = 0;
   const int requested = lsfg_requested();
   const int want_lsfg = lsfg_device_capable;
@@ -493,54 +472,21 @@ vkCreateSwapchainKHR_shim(VkDevice device,
         (capabilities.supportedUsageFlags & transfer_usage) == transfer_usage &&
         (swapchain_properties.optimalTilingFeatures & copy_features) == copy_features &&
         (rgba_properties.optimalTilingFeatures & copy_features) == copy_features) {
-      int sharing_ready = 1;
-      if (lsfg_transfer_queue &&
-          lsfg_transfer_queue_family != VK_QUEUE_FAMILY_IGNORED) {
-        const uint32_t original_count =
-            create_info->imageSharingMode == VK_SHARING_MODE_CONCURRENT ?
-            create_info->queueFamilyIndexCount : 0;
-        sharing_families = malloc(sizeof(*sharing_families) *
-                                  (original_count + 2));
-        if (!sharing_families) {
-          sharing_ready = 0;
-        } else {
-          uint32_t sharing_count = 0;
-          for (uint32_t i = 0; i < original_count; ++i)
-            append_unique_queue_family(sharing_families, &sharing_count,
-                                       create_info->pQueueFamilyIndices[i]);
-          append_unique_queue_family(sharing_families, &sharing_count,
-                                     lsfg_main_queue_family);
-          append_unique_queue_family(sharing_families, &sharing_count,
-                                     lsfg_transfer_queue_family);
-
-          modified.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
-          modified.queueFamilyIndexCount = sharing_count;
-          modified.pQueueFamilyIndices = sharing_families;
-        }
-      }
-
-      if (sharing_ready) {
-        modified.imageUsage |= transfer_usage;
-        // Match the upstream no-pacing path and give the doubled FIFO stream
-        // as much headroom as the VI surface permits.
-        uint32_t desired = modified.minImageCount + 2;
-        if (capabilities.maxImageCount && desired > capabilities.maxImageCount)
-          desired = capabilities.maxImageCount;
-        if (desired > modified.minImageCount) modified.minImageCount = desired;
-        modified.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-        compatible = 1;
-
-      }
+      modified.imageUsage |= transfer_usage;
+      // Give the doubled FIFO stream all image headroom exposed by VI.
+      uint32_t desired = modified.minImageCount + 2;
+      if (capabilities.maxImageCount && desired > capabilities.maxImageCount)
+        desired = capabilities.maxImageCount;
+      if (desired > modified.minImageCount) modified.minImageCount = desired;
+      modified.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+      compatible = 1;
     }
   }
 
-  if (requested && want_lsfg && have_dll && !compatible) {
-    free(sharing_families);
+  if (requested && want_lsfg && have_dll && !compatible)
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
-  }
 
   VkResult result = create_fn(device, compatible ? &modified : create_info, alloc, out);
-  free(sharing_families);
   if (result == VK_SUCCESS) {
     reset_tracked_swapchain();
     tracked_swapchain = *out;
@@ -567,9 +513,7 @@ vkDestroyDevice_shim(VkDevice device, const VkAllocationCallbacks *alloc) {
     tracked_device = VK_NULL_HANDLE;
     tracked_physical_device = VK_NULL_HANDLE;
     tracked_queue_count = 0;
-    lsfg_transfer_queue = VK_NULL_HANDLE;
     lsfg_main_queue_family = VK_QUEUE_FAMILY_IGNORED;
-    lsfg_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
     lsfg_device_capable = 0;
   }
   PFN_vkDestroyDevice destroy_fn = real_destroy_device ?
@@ -616,9 +560,6 @@ static int lsfg_try_create(VkQueue queue) {
       .device = tracked_device,
       .queue = queue,
       .queue_family_index = queue_family,
-      .transfer_queue = lsfg_transfer_queue ? lsfg_transfer_queue : queue,
-      .transfer_queue_family_index = lsfg_transfer_queue ?
-          lsfg_transfer_queue_family : queue_family,
       .get_instance_proc_addr = vkGetInstanceProcAddr,
       .swapchain = tracked_swapchain,
       .extent = tracked_swapchain_extent,
@@ -638,10 +579,51 @@ static VkResult VKAPI_CALL
 vkQueuePresentKHR_shim(VkQueue q, const VkPresentInfoKHR *pi) {
   ++vk_present_count;
   const int requested = lsfg_requested();
+  uint64_t source_interval = 0;
+
+  /* FIFO back-pressure invalidates source timing after generation starts. */
+  if (!requested || lsfg_rate_decision != 0)
+    source_interval = lsfg_observe_source_present();
+
+  if (requested != lsfg_previous_requested) {
+    if (requested) {
+      lsfg_rate_decision = lsfg_source_samples >= 8 ?
+          (lsfg_source_is_high_rate() ? 1 : 0) : -1;
+      lsfg_high_fps_slow_samples = 0;
+    } else {
+      lsfg_rate_decision = -1;
+      lsfg_last_source_present_ns = 0;
+      lsfg_source_interval_ns = 0.0;
+      lsfg_source_samples = 0;
+      lsfg_high_fps_slow_samples = 0;
+    }
+    lsfg_previous_requested = requested;
+  }
+
   if (!requested && lsfg_runtime) {
     lsfg_destroy_runtime();
     lsfg_init_attempted = 0;
   }
+
+  if (requested && lsfg_rate_decision < 0 && lsfg_source_samples >= 8)
+    lsfg_rate_decision = lsfg_source_is_high_rate() ? 1 : 0;
+
+  if (requested && lsfg_rate_decision == 1) {
+    /* Engage LSFG after a sustained transition from 50/60 to 25/30 FPS. */
+    if (source_interval >= UINT64_C(31500000))
+      ++lsfg_high_fps_slow_samples;
+    else if (source_interval)
+      lsfg_high_fps_slow_samples = 0;
+    if (lsfg_high_fps_slow_samples < 16)
+      return real_qpresent ? real_qpresent(q, pi) : vkQueuePresentKHR(q, pi);
+    lsfg_rate_decision = 0;
+    lsfg_high_fps_slow_samples = 0;
+  }
+
+  /* Keep native presentation active until source-rate classification completes. */
+  if (requested && lsfg_rate_decision < 0)
+    return real_qpresent ? real_qpresent(q, pi) : vkQueuePresentKHR(q, pi);
+
   if (pi && pi->swapchainCount == 1 && pi->pSwapchains &&
       pi->pSwapchains[0] == tracked_swapchain &&
       requested) {
@@ -819,9 +801,7 @@ vkCreateInstance_hook(const VkInstanceCreateInfo *ci,
     tracked_physical_device = VK_NULL_HANDLE;
     tracked_device = VK_NULL_HANDLE;
     tracked_queue_count = 0;
-    lsfg_transfer_queue = VK_NULL_HANDLE;
     lsfg_main_queue_family = VK_QUEUE_FAMILY_IGNORED;
-    lsfg_transfer_queue_family = VK_QUEUE_FAMILY_IGNORED;
     lsfg_device_capable = 0;
     lsfg_session_prepared = lsfg_launch_prepared;
     // The launcher switch is an availability gate, not the initial runtime

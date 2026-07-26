@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -47,23 +46,27 @@ VkImageMemoryBarrier imageBarrier(VkImage image,
     };
 }
 
-struct PresentSync {
-    explicit PresentSync(const vk::Vulkan& vulkan)
-        : generated(vulkan), original(vulkan) {}
+struct FrameSlot {
+    explicit FrameSlot(const vk::Vulkan& vulkan)
+        : frame(vulkan), restore(vulkan), completion(vulkan), acquired(vulkan),
+          generated(vulkan), original(vulkan) {}
 
+    vk::CommandBuffer frame;
+    vk::CommandBuffer restore;
+    vk::Fence completion;
+    vk::Semaphore acquired;
     vk::Semaphore generated;
     vk::Semaphore original;
+    bool pending{};
 };
 
 } // namespace
 
 struct LsfgNxRuntime {
     explicit LsfgNxRuntime(const LsfgNxCreateInfo& info)
-        : swapchain(info.swapchain),
-          extent(info.extent) {
+        : swapchain(info.swapchain), extent(info.extent) {
         if (!info.instance || !info.physical_device || !info.device || !info.queue ||
-                !info.transfer_queue ||
-                info.transfer_queue_family_index == VK_QUEUE_FAMILY_IGNORED ||
+                info.queue_family_index == VK_QUEUE_FAMILY_IGNORED ||
                 !info.get_instance_proc_addr || !info.swapchain ||
                 !info.swapchain_images || !info.swapchain_image_count ||
                 !info.extent.width || !info.extent.height ||
@@ -93,38 +96,21 @@ struct LsfgNxRuntime {
         context = &backend->openLocalContext(
             extent.width, extent.height,
             false, 1.0F / flowScale, info.performance_mode, 1,
-            info.transfer_queue_family_index);
+            VK_QUEUE_FAMILY_IGNORED);
         vulkan = &backend->vulkan();
-
-        if (info.transfer_queue != info.queue ||
-                info.transfer_queue_family_index != info.queue_family_index) {
-            transferVulkan.emplace(
-                info.instance, info.device, info.physical_device,
-                info.transfer_queue_family_index, info.transfer_queue, false,
-                vulkan->fi(), vulkan->df(), std::nullopt, std::nullopt);
-            copyVulkan = &*transferVulkan;
-        } else {
-            copyVulkan = vulkan;
-        }
 
         if (!vulkan->df().AcquireNextImageKHR || !vulkan->df().QueuePresentKHR)
             throw std::runtime_error("swapchain entry points are unavailable");
 
-        captureCommand.emplace(*copyVulkan);
-        outputCommand.emplace(*copyVulkan);
-        originalCommand.emplace(*copyVulkan);
-        frameFence.emplace(*vulkan);
-        acquireSemaphore.emplace(*vulkan);
-
-        const size_t syncCount = std::max<size_t>(swapchainImages.size(), 3);
-        presentSyncs.reserve(syncCount);
-        for (size_t i = 0; i < syncCount; ++i)
-            presentSyncs.emplace_back(*vulkan);
+        const size_t slotCount = std::max<size_t>(swapchainImages.size(), 3);
+        slots.reserve(slotCount);
+        for (size_t i = 0; i < slotCount; ++i)
+            slots.emplace_back(*vulkan);
     }
 
     ~LsfgNxRuntime() {
         if (vulkan && vulkan->df().DeviceWaitIdle)
-            vulkan->df().DeviceWaitIdle(vulkan->dev());
+            (void)vulkan->df().DeviceWaitIdle(vulkan->dev());
     }
 
     LsfgNxRuntime(const LsfgNxRuntime&) = delete;
@@ -144,116 +130,98 @@ struct LsfgNxRuntime {
         if (originalImageIndex >= swapchainImages.size())
             throw std::runtime_error("swapchain image index out of range");
 
-        if (frameFencePending) {
-            if (!frameFence->wait(*vulkan))
-                throw std::runtime_error("timeout waiting for LSFG frame fence");
-            frameFencePending = false;
-        }
-        frameFence->reset(*vulkan);
+        FrameSlot& slot = prepareSlot();
 
-        /* Backend fidx 0 expects the current frame in source slot 0 and the
-         * previous frame in slot 1. Since the bridge warms up one real frame
-         * before backend fidx 0, start that warm-up in slot 1. */
-        const size_t sourceIndex =
-            static_cast<size_t>((realFrameIndex + 1U) & 1U);
+        /* Warm up the previous-frame source slot before the first interpolation. */
+        const size_t sourceIndex = static_cast<size_t>((realFrameIndex + 1U) & 1U);
         const VkImage sourceImage = backend->sourceImage(*context, sourceIndex);
-        recordCapture(swapchainImages.at(originalImageIndex), sourceImage,
-            sourceInitialized.at(sourceIndex));
 
         std::vector<VkSemaphore> applicationWaits;
-        if (info.waitSemaphoreCount)
+        if (info.waitSemaphoreCount) {
             applicationWaits.assign(info.pWaitSemaphores,
                 info.pWaitSemaphores + info.waitSemaphoreCount);
-
-        PresentSync& sync = presentSyncs.at(syncCursor++ % presentSyncs.size());
-
-        /* Warm up both alternating source images before the first interpolation. */
-        if (realFrameIndex == 0) {
-            captureCommand->submit(*copyVulkan,
-                std::move(applicationWaits), VK_NULL_HANDLE, 0,
-                {sync.original.handle()}, VK_NULL_HANDLE, 0,
-                frameFence->handle());
-            sourceInitialized.at(sourceIndex) = true;
-            frameFencePending = true;
-            ++realFrameIndex;
-            return presentOriginal(queue, info, originalImageIndex,
-                sync.original.handle(), true);
         }
 
-        const uint64_t sourceValue = backend->nextSourceValue(*context);
-        const uint64_t generatedValue = backend->generatedValue(*context, 0);
-        const VkSemaphore timeline = backend->syncSemaphore(*context);
+        slot.frame.begin(*vulkan);
+        recordCapture(slot.frame, swapchainImages.at(originalImageIndex), sourceImage,
+            sourceInitialized.at(sourceIndex));
 
-        /* The copy submission signals the timeline before LSFG's compute work
-         * consumes the captured source image. */
-        captureCommand->submit(*copyVulkan,
+        if (realFrameIndex == 0) {
+            slot.frame.end(*vulkan);
+            slot.frame.submit(*vulkan,
+                std::move(applicationWaits), VK_NULL_HANDLE, 0,
+                {slot.original.handle()}, VK_NULL_HANDLE, 0,
+                slot.completion.handle());
+            sourceInitialized.at(sourceIndex) = true;
+            slot.pending = true;
+            ++realFrameIndex;
+            return presentOriginal(
+                queue, info, originalImageIndex, slot.original.handle(), true);
+        }
+
+        backend->recordFrame(*context, slot.frame);
+
+        /* VI permits one acquired image: present generated, reacquire, then restore real. */
+        recordOutput(slot.frame, backend->destinationImage(*context, 0),
+            swapchainImages.at(originalImageIndex));
+        slot.frame.end(*vulkan);
+        slot.frame.submit(*vulkan,
             std::move(applicationWaits), VK_NULL_HANDLE, 0,
-            {}, timeline, sourceValue);
+            {slot.generated.handle()}, VK_NULL_HANDLE, 0);
         sourceInitialized.at(sourceIndex) = true;
 
-        backend->scheduleFrames(*context);
-
-        /* Nintendo's VI swapchain can expose only the surface minimum plus one
-         * image. The application already owns that one image while inside its
-         * present call, so trying to acquire another image here violates the
-         * maximum-acquired-image rule and NVK reports VK_ERROR_OUT_OF_DATE_KHR.
-         *
-         * The real frame already resides in the current LSFG source image.
-         * Reuse the application-owned image for the generated frame, release
-         * it through presentation, then acquire one image and restore that
-         * captured source into it. FIFO order remains generated -> real, while
-         * at most one swapchain image is acquired at any point. */
-        recordOutput(backend->destinationImage(*context, 0),
-            swapchainImages.at(originalImageIndex), true);
-        outputCommand->submit(*copyVulkan,
-            {}, timeline, generatedValue,
-            {sync.generated.handle()}, VK_NULL_HANDLE, 0);
-
-        VkResult generatedResult = presentGenerated(
-            queue, info, originalImageIndex, sync.generated.handle());
+        const VkResult generatedResult = presentGenerated(
+            queue, info, originalImageIndex, slot.generated.handle());
         if (generatedResult != VK_SUCCESS && generatedResult != VK_SUBOPTIMAL_KHR)
             return generatedResult;
 
         uint32_t restoredImageIndex{};
         const VkResult acquireResult = vulkan->df().AcquireNextImageKHR(
             vulkan->dev(), swapchain, UINT64_MAX,
-            acquireSemaphore->handle(), VK_NULL_HANDLE,
-            &restoredImageIndex);
-        if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR)
+            slot.acquired.handle(), VK_NULL_HANDLE, &restoredImageIndex);
+        if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
             throw std::runtime_error("vkAcquireNextImageKHR after generated present failed: " +
                 std::to_string(acquireResult));
+        }
         if (restoredImageIndex >= swapchainImages.size())
             throw std::runtime_error("acquired original-frame image index out of range");
 
-        recordOriginal(sourceImage, swapchainImages.at(restoredImageIndex));
-        originalCommand->submit(*copyVulkan,
-            {acquireSemaphore->handle()}, timeline, generatedValue,
-            {sync.original.handle()}, VK_NULL_HANDLE, 0,
-            frameFence->handle());
-        frameFencePending = true;
+        slot.restore.begin(*vulkan);
+        recordOriginal(slot.restore, sourceImage, swapchainImages.at(restoredImageIndex));
+        slot.restore.end(*vulkan);
+        slot.restore.submit(*vulkan,
+            {slot.acquired.handle()}, VK_NULL_HANDLE, 0,
+            {slot.original.handle()}, VK_NULL_HANDLE, 0,
+            slot.completion.handle());
+        slot.pending = true;
 
-        VkResult originalResult = presentOriginal(
-            queue, info, restoredImageIndex, sync.original.handle(), false);
-
+        const VkResult originalResult = presentOriginal(
+            queue, info, restoredImageIndex, slot.original.handle(), false);
         ++realFrameIndex;
         return originalResult;
     }
 
 private:
-    void recordCapture(VkImage swapchainImage, VkImage sourceImage,
-            bool sourceWasInitialized) {
-        const bool separateQueue = copyVulkan != vulkan;
-        captureCommand->begin(*copyVulkan);
-        captureCommand->copyImage(*copyVulkan,
+    FrameSlot& prepareSlot() {
+        FrameSlot& slot = slots.at(slotCursor++ % slots.size());
+        if (slot.pending) {
+            if (!slot.completion.wait(*vulkan))
+                throw std::runtime_error("timeout waiting for LSFG frame slot");
+            slot.pending = false;
+        }
+        slot.completion.reset(*vulkan);
+        return slot;
+    }
+
+    void recordCapture(const vk::CommandBuffer& command, VkImage swapchainImage,
+            VkImage sourceImage, bool sourceWasInitialized) const {
+        command.copyImage(*vulkan,
             {
                 imageBarrier(swapchainImage,
-                    separateQueue ? 0 : VK_ACCESS_MEMORY_READ_BIT,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                    VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
                 imageBarrier(sourceImage,
-                    separateQueue ? 0 :
-                        (sourceWasInitialized ? VK_ACCESS_SHADER_READ_BIT : 0),
+                    sourceWasInitialized ? VK_ACCESS_SHADER_READ_BIT : 0,
                     VK_ACCESS_TRANSFER_WRITE_BIT,
                     sourceWasInitialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
@@ -261,83 +229,56 @@ private:
             {swapchainImage, sourceImage}, extent,
             {
                 imageBarrier(swapchainImage,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    separateQueue ? 0 : VK_ACCESS_MEMORY_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
                 imageBarrier(sourceImage,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    separateQueue ? 0 : VK_ACCESS_SHADER_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_IMAGE_LAYOUT_GENERAL)
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL)
             });
-        captureCommand->end(*copyVulkan);
     }
 
-    void recordOutput(VkImage generatedImage, VkImage swapchainImage,
-            bool applicationOwned) {
-        const bool separateQueue = copyVulkan != vulkan;
-        outputCommand->begin(*copyVulkan);
-        outputCommand->copyImage(*copyVulkan,
+    void recordOutput(const vk::CommandBuffer& command, VkImage generatedImage,
+            VkImage swapchainImage) const {
+        command.copyImage(*vulkan,
             {
                 imageBarrier(generatedImage,
-                    separateQueue ? 0 : VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
                 imageBarrier(swapchainImage,
-                    applicationOwned && !separateQueue ?
-                        VK_ACCESS_MEMORY_READ_BIT : 0,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    applicationOwned ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
-                        VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
             },
             {generatedImage, swapchainImage}, extent,
             {
                 imageBarrier(generatedImage,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    separateQueue ? 0 : VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_IMAGE_LAYOUT_GENERAL),
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
                 imageBarrier(swapchainImage,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    separateQueue ? 0 : VK_ACCESS_MEMORY_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
             });
-        outputCommand->end(*copyVulkan);
     }
 
-    void recordOriginal(VkImage sourceImage, VkImage swapchainImage) {
-        const bool separateQueue = copyVulkan != vulkan;
-        originalCommand->begin(*copyVulkan);
-        originalCommand->copyImage(*copyVulkan,
+    void recordOriginal(const vk::CommandBuffer& command, VkImage sourceImage,
+            VkImage swapchainImage) const {
+        command.copyImage(*vulkan,
             {
                 imageBarrier(sourceImage,
-                    separateQueue ? 0 : VK_ACCESS_SHADER_READ_BIT,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                    VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
                 imageBarrier(swapchainImage,
                     0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
             },
             {sourceImage, swapchainImage}, extent,
             {
                 imageBarrier(sourceImage,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    separateQueue ? 0 : VK_ACCESS_SHADER_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_IMAGE_LAYOUT_GENERAL),
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
                 imageBarrier(swapchainImage,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    separateQueue ? 0 : VK_ACCESS_MEMORY_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
             });
-        originalCommand->end(*copyVulkan);
     }
 
     VkResult presentGenerated(VkQueue queue, const VkPresentInfoKHR& original,
@@ -368,20 +309,11 @@ private:
     std::unique_ptr<lsfgvk::backend::Instance> backend;
     lsfgvk::backend::Context *context{};
     const vk::Vulkan *vulkan{};
-    std::optional<vk::Vulkan> transferVulkan;
-    const vk::Vulkan *copyVulkan{};
-
-    std::optional<vk::CommandBuffer> captureCommand;
-    std::optional<vk::CommandBuffer> outputCommand;
-    std::optional<vk::CommandBuffer> originalCommand;
-    std::optional<vk::Fence> frameFence;
-    std::optional<vk::Semaphore> acquireSemaphore;
-    std::vector<PresentSync> presentSyncs;
+    std::vector<FrameSlot> slots;
 
     std::array<bool, 2> sourceInitialized{false, false};
     uint64_t realFrameIndex{};
-    size_t syncCursor{};
-    bool frameFencePending{};
+    size_t slotCursor{};
 };
 
 extern "C" LsfgNxRuntime *lsfg_nx_create(const LsfgNxCreateInfo *info) {

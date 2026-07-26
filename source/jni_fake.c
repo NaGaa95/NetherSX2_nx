@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "config.h"
 #include "util.h"
@@ -16,6 +17,7 @@
 #include "prefs.h"
 #include "filehelper.h"
 #include "cert_data.h"
+#include "ra_http.h"
 
 #define JNI_OK 0
 #define JNI_VERSION_1_6 0x00010006
@@ -159,8 +161,38 @@ void jni_obj_set_int(void *obj, const char *field, int32_t v) {
   if (f) { f->type = 'I'; f->v.i = v; }
 }
 int32_t jni_obj_get_int(void *obj, const char *field, int32_t def) {
-  FakeField *f = obj_field(obj, field);
-  return f && (f->type == 'I' || f->type == 'Z') ? f->v.i : def;
+  FakeObject *o = obj;
+  if (!o || o->tag != TAG_OBJECT || !field) return def;
+  for (int i = 0; i < o->nfields; i++) {
+    FakeField *f = &o->fields[i];
+    if (!strcmp(f->name, field))
+      return (f->type == 'I' || f->type == 'Z') ? f->v.i : def;
+  }
+  return def;
+}
+int64_t jni_obj_get_long(void *obj, const char *field, int64_t def) {
+  FakeObject *o = obj;
+  if (!o || o->tag != TAG_OBJECT || !field) return def;
+  for (int i = 0; i < o->nfields; i++) {
+    FakeField *f = &o->fields[i];
+    if (!strcmp(f->name, field))
+      return f->type == 'J' ? f->v.j :
+             (f->type == 'I' || f->type == 'Z') ? f->v.i : def;
+  }
+  return def;
+}
+const char *jni_obj_get_string(void *obj, const char *field,
+                               const char *def) {
+  FakeObject *o = obj;
+  if (!o || o->tag != TAG_OBJECT || !field) return def;
+  for (int i = 0; i < o->nfields; i++) {
+    FakeField *f = &o->fields[i];
+    if (!strcmp(f->name, field) && f->type == 's') {
+      const char *value = jni_string_utf(f->v.o);
+      return value ? value : def;
+    }
+  }
+  return def;
 }
 void jni_obj_set_float(void *obj, const char *field, float v) {
   FakeField *f = obj_field(obj, field);
@@ -189,6 +221,16 @@ void *jni_make_byte_array(const void *data, int len) {
   if (data && a->len)
     memcpy(a->data, data, a->len);
   return a;
+}
+
+static const uint8_t *byte_array_data(void *arr, size_t *size) {
+  FakeByteArray *a = arr;
+  if (!a || a->tag != TAG_BYTARR) {
+    if (size) *size = 0;
+    return NULL;
+  }
+  if (size) *size = (size_t)a->len;
+  return a->data;
 }
 
 void *jni_make_object_array(int n) {
@@ -225,21 +267,27 @@ void *jni_obj_array_get(void *arr, int i) {
 #define MAX_IDS 512
 static FakeID id_pool[MAX_IDS];
 static int id_count = 0;
+static pthread_mutex_t id_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static FakeID *get_id(const char *name, const char *sig) {
   if (!name) name = "";
   if (!sig) sig = "";
-  for (int i = 0; i < id_count; i++)
-    if (!strcmp(id_pool[i].name, name) && !strcmp(id_pool[i].sig, sig))
+  pthread_mutex_lock(&id_mutex);
+  for (int i = 0; i < id_count; i++) {
+    if (!strcmp(id_pool[i].name, name) && !strcmp(id_pool[i].sig, sig)) {
+      pthread_mutex_unlock(&id_mutex);
       return &id_pool[i];
+    }
+  }
   if (id_count >= MAX_IDS) {
-
+    pthread_mutex_unlock(&id_mutex);
     return &id_pool[0];
   }
   FakeID *id = &id_pool[id_count++];
   id->tag = TAG_ID;
   strncpy(id->name, name, sizeof(id->name) - 1);
   strncpy(id->sig, sig, sizeof(id->sig) - 1);
+  pthread_mutex_unlock(&id_mutex);
   return id;
 }
 
@@ -261,6 +309,42 @@ static void *get_prefs_obj(void) {
 
 // forward decl: dispatch_object needs to read a field back off the receiver
 static void *field_object(void *obj, const char *name);
+
+static bool object_has_label(void *obj, const char *label) {
+  FakeObject *o = obj;
+  return o && o->tag == TAG_OBJECT && label && !strcmp(o->label, label);
+}
+
+static bool is_url_downloader(void *obj) {
+  return object_has_label(obj, "xyz/aethersx2/android/URLDownloader");
+}
+
+static juint url_downloader_request(void *recv, bool is_post, va_list va) {
+  if (!is_url_downloader(recv)) return 0;
+
+  void *jurl = va_arg(va, void *);
+  const char *url = obj_str(jurl);
+  const void *post_data = NULL;
+  size_t post_size = 0;
+  if (is_post) {
+    void *jdata = va_arg(va, void *);
+    post_data = byte_array_data(jdata, &post_size);
+  }
+
+  RaHttpResponse response = {0};
+  const bool ok = ra_http_request(
+      url, jni_obj_get_string(recv, "__user_agent", ""),
+      post_data, post_size, is_post, &response);
+  jni_obj_set_int(recv, "__status", response.status_code);
+  jni_obj_set_string(recv, "__content_type",
+                     response.content_type ? response.content_type : "");
+  const int data_size = response.data_size > INT32_MAX ? INT32_MAX :
+                        (int)response.data_size;
+  void *data = jni_make_byte_array(response.data, data_size);
+  jni_obj_set_object(recv, "__data", data);
+  ra_http_response_clear(&response);
+  return ok ? 1 : 0;
+}
 
 // ---------------------------------------------------------------------------
 // native -> Java dispatch (by method name)
@@ -321,7 +405,7 @@ static void *stringset_for_key(const char *key) {
 }
 
 // -- boolean-returning calls --------------------------------------------------
-static juint dispatch_boolean(const char *name, va_list va) {
+static juint dispatch_boolean(void *recv, const char *name, va_list va) {
 
   // SharedPreferences.contains(key)
   if (!strcmp(name, "contains")) {
@@ -357,15 +441,16 @@ static juint dispatch_boolean(const char *name, va_list va) {
   // NativeLibrary.playSoundAsync(path) -> not supported
   if (!strcmp(name, "playSoundAsync"))
     return 0;
-  // URLDownloader.get/post -> no network
-  if (!strcmp(name, "get") || !strcmp(name, "post"))
-    return 0;
+  if (!strcmp(name, "get"))
+    return url_downloader_request(recv, false, va);
+  if (!strcmp(name, "post"))
+    return url_downloader_request(recv, true, va);
 
   return 0;
 }
 
 // -- int-returning calls ------------------------------------------------------
-static juint dispatch_int(const char *name, va_list va) {
+static juint dispatch_int(void *recv, const char *name, va_list va) {
 
   // SharedPreferences.getInt(key, default)
   if (!strcmp(name, "getInt")) {
@@ -379,9 +464,8 @@ static juint dispatch_int(const char *name, va_list va) {
     void *jmode = va_arg(va, void *);
     return (juint)(int32_t)fh_open_fd(obj_str(juri), obj_str(jmode));
   }
-  // URLDownloader.getStatusCode() -> nothing fetched
-  if (!strcmp(name, "getStatusCode"))
-    return 0;
+  if (!strcmp(name, "getStatusCode") && is_url_downloader(recv))
+    return (juint)jni_obj_get_int(recv, "__status", 0);
 
   return 0;
 }
@@ -606,11 +690,12 @@ static void *dispatch_object(void *recv, const char *name, const char *sig, va_l
   if (!strcmp(name, "valueOf"))
     return jni_make_object("android/graphics/Bitmap$Config");
 
-  // URLDownloader.getContentType()/getData() -> nothing fetched
-  if (!strcmp(name, "getContentType"))
-    return jni_make_string("");
-  if (!strcmp(name, "getData"))
-    return jni_make_byte_array(NULL, 0);
+  if (!strcmp(name, "getContentType") && is_url_downloader(recv))
+    return jni_make_string(jni_obj_get_string(recv, "__content_type", ""));
+  if (!strcmp(name, "getData") && is_url_downloader(recv)) {
+    void *data = field_object(recv, "__data");
+    return data ? data : jni_make_byte_array(NULL, 0);
+  }
 
   // Class.getName()/getSimpleName() -> the class label we stashed on the class
   // object (GetObjectClass copies the source object's label). Return it non-null
@@ -812,9 +897,53 @@ static juint j_ret0_3(void *env, void *a, void *b) { (void)env; (void)a; (void)b
 // info classes in UI paths. We hand back an empty fake object; filehelper.c
 // builds the field-populated ones it returns directly.
 static void *j_NewObjectV(void *env, void *cls, FakeID *id, va_list va) {
-  (void)env; (void)id; (void)va;
+  (void)env;
   FakeObject *c = cls;
-  return jni_make_object((c && c->tag == TAG_OBJECT) ? c->label : "object");
+  const char *label = (c && c->tag == TAG_OBJECT) ? c->label : "object";
+  void *object = jni_make_object(label);
+  if (!id || strcmp(id->name, "<init>")) return object;
+
+  if (!strcmp(label, "xyz/aethersx2/android/URLDownloader")) {
+    void *user_agent = va_arg(va, void *);
+    jni_obj_set_string(object, "__user_agent", obj_str(user_agent));
+    jni_obj_set_int(object, "__status", 0);
+    jni_obj_set_string(object, "__content_type", "");
+    jni_obj_set_object(object, "__data", jni_make_byte_array(NULL, 0));
+  } else if (!strcmp(label, "xyz/aethersx2/android/Achievement")) {
+    const int achievement_id = va_arg(va, int);
+    void *title = va_arg(va, void *);
+    void *description = va_arg(va, void *);
+    void *badge_path = va_arg(va, void *);
+    const int points = va_arg(va, int);
+    const int locked = va_arg(va, int);
+    jni_obj_set_int(object, "id", achievement_id);
+    jni_obj_set_string(object, "title", obj_str(title));
+    jni_obj_set_string(object, "description", obj_str(description));
+    jni_obj_set_string(object, "badge_path", obj_str(badge_path));
+    jni_obj_set_int(object, "points", points);
+    jni_obj_set_bool(object, "locked", locked);
+  } else if (!strcmp(label, "xyz/aethersx2/android/Leaderboard")) {
+    const int leaderboard_id = va_arg(va, int);
+    void *title = va_arg(va, void *);
+    void *description = va_arg(va, void *);
+    const int active = va_arg(va, int);
+    jni_obj_set_int(object, "id", leaderboard_id);
+    jni_obj_set_string(object, "title", obj_str(title));
+    jni_obj_set_string(object, "description", obj_str(description));
+    jni_obj_set_bool(object, "active", active);
+  } else if (!strcmp(label, "xyz/aethersx2/android/Leaderboard$Entry")) {
+    const int rank = va_arg(va, int);
+    void *user = va_arg(va, void *);
+    void *score = va_arg(va, void *);
+    const int64_t submitted = va_arg(va, int64_t);
+    const int is_self = va_arg(va, int);
+    jni_obj_set_int(object, "rank", rank);
+    jni_obj_set_string(object, "user", obj_str(user));
+    jni_obj_set_string(object, "score", obj_str(score));
+    jni_obj_set_long(object, "submitted", submitted);
+    jni_obj_set_bool(object, "self", is_self);
+  }
+  return object;
 }
 static void *j_NewObject(void *env, void *cls, FakeID *id, ...) {
   va_list va; va_start(va, id);
@@ -830,11 +959,11 @@ static void *j_NewObjectA(void *env, void *cls, FakeID *id, void *args) {
 
 // --- Call<type>Method (instance) --------------------------------------------
 static juint j_CallBooleanMethodV(void *env, void *obj, FakeID *id, va_list va) {
-  (void)env; (void)obj; return dispatch_boolean(id->name, va);
+  (void)env; return dispatch_boolean(obj, id->name, va);
 }
 static juint j_CallBooleanMethod(void *env, void *obj, FakeID *id, ...) {
   va_list va; va_start(va, id);
-  juint r = dispatch_boolean(id->name, va);
+  juint r = dispatch_boolean(obj, id->name, va);
   va_end(va); return r;
 }
 static void *j_CallObjectMethodV(void *env, void *obj, FakeID *id, va_list va) {
@@ -855,11 +984,11 @@ static void j_CallVoidMethod(void *env, void *obj, FakeID *id, ...) {
   va_end(va);
 }
 static juint j_CallIntMethodV(void *env, void *obj, FakeID *id, va_list va) {
-  (void)env; (void)obj; return dispatch_int(id->name, va);
+  (void)env; return dispatch_int(obj, id->name, va);
 }
 static juint j_CallIntMethod(void *env, void *obj, FakeID *id, ...) {
   va_list va; va_start(va, id);
-  juint r = dispatch_int(id->name, va);
+  juint r = dispatch_int(obj, id->name, va);
   va_end(va); return r;
 }
 static int64_t j_CallLongMethodV(void *env, void *obj, FakeID *id, va_list va) {
@@ -889,11 +1018,11 @@ static void *j_CallStaticObjectMethod(void *env, void *cls, FakeID *id, ...) {
   va_end(va); return r;
 }
 static juint j_CallStaticBooleanMethodV(void *env, void *cls, FakeID *id, va_list va) {
-  (void)env; (void)cls; return dispatch_boolean(id->name, va);
+  (void)env; return dispatch_boolean(cls, id->name, va);
 }
 static juint j_CallStaticBooleanMethod(void *env, void *cls, FakeID *id, ...) {
   va_list va; va_start(va, id);
-  juint r = dispatch_boolean(id->name, va);
+  juint r = dispatch_boolean(cls, id->name, va);
   va_end(va); return r;
 }
 static void j_CallStaticVoidMethodV(void *env, void *cls, FakeID *id, va_list va) {
@@ -905,11 +1034,11 @@ static void j_CallStaticVoidMethod(void *env, void *cls, FakeID *id, ...) {
   va_end(va);
 }
 static juint j_CallStaticIntMethodV(void *env, void *cls, FakeID *id, va_list va) {
-  (void)env; (void)cls; return dispatch_int(id->name, va);
+  (void)env; return dispatch_int(cls, id->name, va);
 }
 static juint j_CallStaticIntMethod(void *env, void *cls, FakeID *id, ...) {
   va_list va; va_start(va, id);
-  juint r = dispatch_int(id->name, va);
+  juint r = dispatch_int(cls, id->name, va);
   va_end(va); return r;
 }
 static int64_t j_CallStaticLongMethodV(void *env, void *cls, FakeID *id, va_list va) {

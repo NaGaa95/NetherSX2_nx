@@ -74,6 +74,41 @@ CoreVersion g_core_version = CORE_VER_UNKNOWN;
 
 int core_is_3668(void) { return g_core_version == CORE_VER_V22N_3668; }
 
+int core_shutdown_achievements(void) {
+  typedef struct {
+    uintptr_t shutdown;
+    uint32_t downloader_load;
+    uint32_t downloader_clear;
+  } AchievementOffsets;
+  static const AchievementOffsets offsets_4248 = {
+    0x81b720, 0xf943c6c0, 0xf903c6df
+  };
+  static const AchievementOffsets offsets_3668 = {
+    0x80fce0, 0xf9431ac0, 0xf9031adf
+  };
+
+  const AchievementOffsets *offsets =
+      g_core_version == CORE_VER_V22N_4248 ? &offsets_4248 :
+      g_core_version == CORE_VER_V22N_3668 ? &offsets_3668 : NULL;
+  if (!offsets || offsets->shutdown + 0x12c > emu_mod.load_size)
+    return -1;
+
+  const uintptr_t base = (uintptr_t)emu_mod.load_virtbase;
+  const uint32_t *code = (const uint32_t *)(base + offsets->shutdown);
+  // Reject core binaries that do not match this fixed shutdown offset.
+  if (code[0] != 0xd10143ff || code[1] != 0xa9027bfd ||
+      code[2] != 0xa90357f6 || code[3] != 0xa9044ff4 ||
+      code[0x114 / 4] != offsets->downloader_load ||
+      code[0x118 / 4] != offsets->downloader_clear ||
+      code[0x11c / 4] != 0xb4000080 ||
+      code[0x120 / 4] != 0xf9400008 ||
+      code[0x124 / 4] != 0xf9400508 ||
+      code[0x128 / 4] != 0xd63f0100)
+    return -1;
+
+  return ((int (*)(void))(base + offsets->shutdown))() ? 1 : 0;
+}
+
 int core_shutdown_mtgs(void) {
   typedef struct {
     uintptr_t object;

@@ -46,11 +46,12 @@
 extern uintptr_t __stack_chk_fail;
 int *__errno(void);
 
-// BSD/bionic legacy `_ctype_`: [0] is the EOF guard, [c+1] holds the mask for
-// char c. Vendored libs in the core index it as `_ctype_[(c)+1]`. We provide our
-// own (no dependence on / collision with newlib's symbol) and fill it from the C
-// locale in update_imports() so isalpha/isdigit-via-table stay correct.
+// BSD/bionic legacy `_ctype_`: the imported OBJECT is itself a pointer to a
+// table where [0] is the EOF guard and [c+1] holds the mask for char c. Keep the
+// pointer as a distinct data symbol; exporting the table address directly makes
+// the core load its first eight classification bytes as a pointer.
 unsigned char g_ctype_table[1 + 256];
+unsigned char *g_ctype_ptr = g_ctype_table;
 
 // stdout/stderr are DATA imports (FILE* variables); point them into fake_sF so
 // the stdio shims recognise them. fake_sF is uint8_t[3][0x100] in libc_shim.c.
@@ -271,7 +272,7 @@ DynLibFunction dynlib_functions[] = {
   { "__vsnprintf_chk", (uintptr_t)&__vsnprintf_chk_fake },
   { "__vsprintf_chk", (uintptr_t)&__vsprintf_chk_fake },
   { "__write_chk", (uintptr_t)&__write_chk_fake },
-  { "_ctype_", (uintptr_t)&g_ctype_table[0] },
+  { "_ctype_", (uintptr_t)&g_ctype_ptr },
   { "abort", (uintptr_t)&abort_fake },
   { "acos", (uintptr_t)&acos },
   { "acosf", (uintptr_t)&acosf },

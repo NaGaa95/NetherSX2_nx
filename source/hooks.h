@@ -19,6 +19,7 @@ typedef enum {
 } CoreVersion;
 extern CoreVersion g_core_version;
 int core_is_3668(void);
+int core_shutdown_achievements(void);
 int core_shutdown_mtgs(void);
 
 void egl_gl_ownership_park(void);

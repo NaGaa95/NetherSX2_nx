@@ -33,6 +33,7 @@
 #include "SwitchStorage.h"
 #include "CheatManager.h"
 #include "ui_audio.h"
+#include "retroachievements.h"
 
 // SDL uses Xbox button names.
 #define BTN_CONFIRM  SDL_CONTROLLER_BUTTON_B
@@ -51,6 +52,7 @@ static const char *DEF_GAMEDIR= "sdmc:/switch/nethersx2/games";
 static const char *BIOS_DIR   = "sdmc:/switch/nethersx2/bios";
 static const char *RESOURCES_DIR = "sdmc:/switch/nethersx2/resources";
 static const char *LSFG_DIR = "sdmc:/switch/nethersx2/lsfg";
+static const char *EMU_HOST_DIR = "sdmc:/switch/nethersx2/.emu";
 static const char *LSFG_DLL_FILE = "sdmc:/switch/nethersx2/lsfg/Lossless.dll";
 
 struct KV { std::string k, v; };
@@ -173,6 +175,48 @@ static bool removeLegacySmcSettings(Store &store) {
   return changed;
 }
 
+static bool setStoreDefault(Store &store,const char *key,const char *value) {
+  if(storeHas(store,key)) return false;
+  storeSet(store,key,value);
+  return true;
+}
+
+static bool setStoreValue(Store &store,const char *key,const char *value) {
+  if(!strcmp(storeGet(store,key,""),value)&&storeHas(store,key)) return false;
+  storeSet(store,key,value);
+  return true;
+}
+
+static bool normalizeRetroAchievementsStore(Store &store) {
+  bool changed=false;
+  changed|=setStoreDefault(store,"Achievements/Enabled","false");
+  changed|=setStoreDefault(store,"Achievements/Username","");
+  changed|=setStoreDefault(store,"Achievements/Token","");
+  changed|=setStoreDefault(store,"Achievements/RichPresence","true");
+  changed|=setStoreDefault(store,"Achievements/Notifications","true");
+  changed|=setStoreDefault(store,"Achievements/SoundEffects","true");
+  changed|=setStoreDefault(store,"Achievements/PrimedIndicators","true");
+  changed|=setStoreDefault(store,"Achievements/NotificationsDuration","5");
+  // NetherSX2-nx intentionally implements Casual achievements only.
+  changed|=setStoreValue(store,"Achievements/ChallengeMode","false");
+  changed|=setStoreValue(store,"Achievements/Leaderboards","false");
+  changed|=setStoreValue(store,"Achievements/TestMode","false");
+  changed|=setStoreValue(store,"Achievements/UnofficialTestMode","false");
+  if((!storeGet(store,"Achievements/Username","")[0]||
+      !storeGet(store,"Achievements/Token","")[0])&&
+      !strcmp(storeGet(store,"Achievements/Enabled","false"),"true"))
+    changed|=setStoreValue(store,"Achievements/Enabled","false");
+  return changed;
+}
+
+static void applyGlobalRetroAchievementsSettings(Store &effective) {
+  storeRemovePrefix(effective,"Achievements/");
+  for(const auto &entry:g_global.kv)
+    if(entry.k.compare(0,13,"Achievements/")==0)
+      storeSet(effective,entry.k.c_str(),entry.v.c_str());
+  normalizeRetroAchievementsStore(effective);
+}
+
 static bool recoverAtomicFile(const std::string &path) {
   const std::string tmp = path + ".tmp";
   const std::string old = path + ".old";
@@ -228,6 +272,15 @@ static bool storeSave(Store &s, const char *path) {
   std::string text = "# NetherSX2 launcher\n";
   for (auto &e : s.kv) text += e.k + " = " + e.v + "\n";
   return writeAtomicText(path, text);
+}
+
+static bool syncRetroAchievementsToEmulatorConfig() {
+  // Keep an existing launch configuration in sync, including sign-out.
+  if (!regularFileExists(EMU_INI)) return true;
+  Store emulatorConfig;
+  storeLoad(emulatorConfig,EMU_INI);
+  applyGlobalRetroAchievementsSettings(emulatorConfig);
+  return storeSave(emulatorConfig,EMU_INI);
 }
 
 static const char *iniGet(const char *key, const char *def) {
@@ -294,6 +347,9 @@ static const Choice C_interp[]   = { {"Nearest","0"}, {"Linear","1"}, {"Cubic","
 static const Choice C_sync[]     = { {"TimeStretch","0"}, {"Async","1"}, {"None","2"} };
 static const Choice C_eecr[]     = { {"50%","-3"}, {"60%","-2"}, {"75%","-1"}, {"100%","0"}, {"130%","1"}, {"180%","2"}, {"300%","3"} };
 static const Choice C_eecs[]     = { {"Off","0"}, {"Mild","1"}, {"Moderate","2"}, {"Maximum","3"} };
+static const Choice C_rounding[] = { {"Nearest","0"}, {"Negative","1"}, {"Positive","2"}, {"Chop / Zero","3"} };
+static const Choice C_eeClamp[]  = { {"None","0"}, {"Normal","1"}, {"Extra + Preserve Sign","2"}, {"Full","3"} };
+static const Choice C_vuClamp[]  = { {"None","0"}, {"Normal","1"}, {"Extra","2"}, {"Extra + Preserve Sign","3"} };
 static const Choice C_syslang[]  = { {"Auto","auto"}, {"English","1"}, {"Japanese","0"},
                                      {"French","2"}, {"Spanish","3"}, {"German","4"}, {"Italian","5"},
                                      {"Dutch","6"}, {"Portuguese","7"}, {"Don't change","off"} };
@@ -307,7 +363,7 @@ static const Choice C_launcherTheme[] = { {"XMB (PS3)","xmb"}, {"Glow","animated
 static const Choice C_gridColumns[] = { {"3","3"}, {"4","4"}, {"5","5"}, {"6","6"}, {"7","7"}, {"8","8"} };
 static const Choice C_gridRows[] = { {"1","1"}, {"2","2"}, {"3","3"} };
 
-enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_FRAMEGEN, SCR_AUDIO, SCR_EMU, SCR_FRAMERATE, SCR_NETWORK, SCR_CONTROLLER, SCR_COUNT };
+enum { SCR_GRAPHICS, SCR_ENHANCE, SCR_FRAMEGEN, SCR_AUDIO, SCR_EMU, SCR_ADVANCED, SCR_GAMEFIXES, SCR_FRAMERATE, SCR_NETWORK, SCR_CONTROLLER, SCR_COUNT };
 
 static const Opt S_graphics[] = {
   O_CHOICE("Renderer",         "EmuCore/GS/Renderer", C_backend, "14"),
@@ -373,6 +429,44 @@ static const Opt S_emu[] = {
   O_CHOICE("Sync to refresh",  "EmuCore/GS/SyncToHostRefreshRate", C_bool, "false"),
   O_CHOICE("Game patches",     "EmuCore/EnablePatches", C_bool, "true"),
 };
+static const Opt S_gamefixes[] = {
+  O_CHOICE("FPU multiply hack",       "EmuCore/Gamefixes/FpuMulHack", C_bool, "false"),
+  O_CHOICE("FPU negative divide hack","EmuCore/Gamefixes/FpuNegDivHack", C_bool, "false"),
+  O_CHOICE("Software renderer for FMVs", "EmuCore/Gamefixes/SoftwareRendererFMVHack", C_bool, "false"),
+  O_CHOICE("Skip MPEG hack",          "EmuCore/Gamefixes/SkipMPEGHack", C_bool, "false"),
+  O_CHOICE("Preload TLB hack",        "EmuCore/Gamefixes/GoemonTlbHack", C_bool, "false"),
+  O_CHOICE("EE timing hack",          "EmuCore/Gamefixes/EETimingHack", C_bool, "false"),
+  O_CHOICEG("Instant DMA hack",       "EmuCore/Gamefixes/InstantDMAHack", C_bool, "false", "Wrapper/CoreBuild", "3668"),
+  O_CHOICE("OPH flag hack",           "EmuCore/Gamefixes/OPHFlagHack", C_bool, "false"),
+  O_CHOICE("Emulate GIF FIFO",        "EmuCore/Gamefixes/GIFFIFOHack", C_bool, "false"),
+  O_CHOICE("DMA busy hack",           "EmuCore/Gamefixes/DMABusyHack", C_bool, "false"),
+  O_CHOICE("Delay VIF1 stalls",       "EmuCore/Gamefixes/VIF1StallHack", C_bool, "false"),
+  O_CHOICE("Emulate VIF FIFO",        "EmuCore/Gamefixes/VIFFIFOHack", C_bool, "false"),
+  O_CHOICE("Full VU0 synchronization","EmuCore/Gamefixes/FullVU0SyncHack", C_bool, "false"),
+  O_CHOICE("VU I-bit hack",           "EmuCore/Gamefixes/IbitHack", C_bool, "false"),
+  O_CHOICE("VU add/sub hack",         "EmuCore/Gamefixes/VuAddSubHack", C_bool, "false"),
+  O_CHOICE("VU overflow hack",        "EmuCore/Gamefixes/VUOverflowHack", C_bool, "false"),
+  O_CHOICE("VU synchronization",      "EmuCore/Gamefixes/VUSyncHack", C_bool, "false"),
+  O_CHOICE("VU XGKick sync",          "EmuCore/Gamefixes/XgKickHack", C_bool, "false"),
+  O_CHOICE("Force blit FPS detection", "EmuCore/Gamefixes/BlitInternalFPSHack", C_bool, "false"),
+};
+static const Opt S_advanced[] = {
+  O_CHOICE("EE rounding mode",       "EmuCore/CPU/FPU.Roundmode", C_rounding, "3"),
+  O_CHOICE("EE clamping mode",       "EmuCore/CPU/Recompiler/FPUClampMode", C_eeClamp, "1"),
+  O_CHOICE("EE recompiler",          "EmuCore/CPU/Recompiler/EnableEE", C_bool, "true"),
+  O_CHOICE("EE cache (slow)",        "EmuCore/CPU/Recompiler/EnableEECache", C_bool, "false"),
+  O_CHOICE("Wait loop detection",    "EmuCore/Speedhacks/WaitLoop", C_bool, "true"),
+  O_CHOICE("INTC spin detection",    "EmuCore/Speedhacks/IntcStat", C_bool, "true"),
+  O_CHOICE("Pause on TLB miss",      "EmuCore/CPU/Recompiler/PauseOnTLBMiss", C_bool, "false"),
+  O_CHOICE("VU0 rounding mode",      "EmuCore/CPU/VU0.Roundmode", C_rounding, "3"),
+  O_CHOICE("VU0 clamping mode",      "EmuCore/CPU/Recompiler/VU0ClampMode", C_vuClamp, "1"),
+  O_CHOICE("VU0 recompiler",         "EmuCore/CPU/Recompiler/EnableVU0", C_bool, "true"),
+  O_CHOICE("VU1 rounding mode",      "EmuCore/CPU/VU1.Roundmode", C_rounding, "3"),
+  O_CHOICE("VU1 clamping mode",      "EmuCore/CPU/Recompiler/VU1ClampMode", C_vuClamp, "1"),
+  O_CHOICE("VU1 recompiler",         "EmuCore/CPU/Recompiler/EnableVU1", C_bool, "true"),
+  O_CHOICE("IOP recompiler",         "EmuCore/CPU/Recompiler/EnableIOP", C_bool, "true"),
+  O_CHOICE("Automatic game fixes",   "EmuCore/EnableGameFixes", C_bool, "true"),
+};
 static const Opt S_network[] = {
   O_CHOICE("Network adapter",  "Wrapper/Network", C_bool, "false"),
   O_TEXTG ("Custom DNS server", "Wrapper/NetDNS", "", "Wrapper/Network", "false"),
@@ -428,10 +522,277 @@ static const Screen g_screens[SCR_COUNT] = {
   { "Frame Generation",      S_framegen, (int)(sizeof(S_framegen)/sizeof(Opt)),   false },
   { "Audio",               S_audio,      (int)(sizeof(S_audio)/sizeof(Opt)),      false },
   { "Emulation / System",  S_emu,        (int)(sizeof(S_emu)/sizeof(Opt)),        false },
+  { "Advanced",            S_advanced,   (int)(sizeof(S_advanced)/sizeof(Opt)),   false },
+  { "Game Fixes",          S_gamefixes,  (int)(sizeof(S_gamefixes)/sizeof(Opt)),  false },
   { "Frame Rate Control",  S_framerate,  (int)(sizeof(S_framerate)/sizeof(Opt)),  false },
   { "Network (experimental)", S_network, (int)(sizeof(S_network)/sizeof(Opt)),    false },
   { "Controller",          S_controller, (int)(sizeof(S_controller)/sizeof(Opt)), true  },
 };
+
+struct SettingHelpEntry {
+  const char *key;
+  const char *kind;
+  const char *text;
+};
+
+/* Condensed Android/PCSX2 and Switch-specific setting help. */
+static const SettingHelpEntry SETTING_HELP[] = {
+  {"EmuCore/GS/Renderer", "Graphics backend",
+   "Chooses the graphics backend used by the emulator. Vulkan (NVK) is recommended for Switch performance and is required for frame generation. OpenGL can help diagnose renderer-specific compatibility issues."},
+  {"EmuCore/GS/upscale_multiplier", "Resolution / performance",
+   "Sets the internal resolution used for 3D rendering. Higher scales improve clarity but increase GPU load; sub-native scales reduce GPU work at the cost of image quality. Pre-rendered FMV resolution does not change."},
+  {"EmuCore/GS/AspectRatio", "Display geometry",
+   "Chooses the shape of the final game image. 4:3 preserves the original PS2 display, 16:9 is intended for compatible games or widescreen patches, and Stretch fills the screen by distorting the image."},
+  {"EmuCore/GS/FMVAspectRatioSwitch", "Video display",
+   "Overrides the aspect ratio used for pre-rendered movie sequences independently of gameplay. Leave it Off unless a game's FMV is shown with the wrong shape."},
+  {"EmuCore/GS/VsyncEnable", "Frame pacing / latency",
+   "Synchronizes presentation with the Switch display to reduce tearing. It can add latency or reduce performance headroom; Adaptive synchronizes only when emulation can keep up."},
+  {"EmuCore/GS/SkipDuplicateFrames", "Performance / latency trade-off",
+   "Avoids presenting unchanged frames in many 25/30 FPS games. This is not emulation frame skipping: the frame is still rendered. It can free GPU time and helps frame generation, but may worsen pacing or input latency."},
+  {"EmuCore/GS/DisableThreadedPresentation", "Frame pacing / performance",
+   "Controls whether final presentation may run on its own thread. Leave this Off for normal threaded presentation and better overlap. Turn it On only when diagnosing a presentation or compatibility problem, as throughput can decrease."},
+  {"EmuCore/GS/filter", "Texture filtering",
+   "Selects where bilinear filtering is used on PS2 textures. PS2 follows each game's request; Forced smooths more surfaces, while Nearest keeps hard pixel edges. Forced filtering can blur 2D sprites."},
+  {"EmuCore/GS/MaxAnisotropy", "Texture filtering",
+   "Improves texture clarity at steep viewing angles. Higher values add some GPU work and are most useful when rendering above native resolution."},
+  {"EmuCore/GS/OsdShowFPS", "Performance display",
+   "Shows the emulator's on-screen frame-rate and speed information while a game is running."},
+  {"EmuCore/GS/OsdShowMessages", "On-screen display",
+   "Shows emulator status and warning messages over the game image."},
+  {"EmuCore/EnableWideScreenPatches", "Game patches",
+   "Loads compatible widescreen PNACH patches so supported games render a wider view instead of stretching 4:3 output. Not every game has a patch, and some patches can affect menus or effects."},
+  {"EmuCore/EnableNoInterlacingPatches", "Game patches",
+   "Loads compatible no-interlacing PNACH patches. These can reduce flicker and simplify deinterlacing, but game-specific patches may introduce visual issues."},
+
+  {"EmuCore/GS/accurate_blending_unit", "Accuracy / performance",
+   "Controls how accurately unsupported PS2 GS blend modes are reproduced in shaders. Higher levels fix more effects but can carry a large GPU cost. Basic is the recommended starting point."},
+  {"EmuCore/GS/deinterlace_mode", "Video processing",
+   "Chooses how interlaced PS2 output is converted for the progressive Switch display. Auto follows the game; manual modes are useful only when a title shows combing, shaking, or an incorrect field order."},
+  {"EmuCore/GS/dithering_ps2", "Image accuracy",
+   "Controls PS2 dithering, which reduces visible color banding. Scaled enlarges the dither pattern with internal resolution; Unscaled keeps the native-sized pattern; Off removes it."},
+  {"EmuCore/GS/UserHacks_TriFilter", "Texture filtering",
+   "Samples between nearby mip levels to reduce texture transitions and angled-surface blur. Automatic follows safe defaults, PS2 follows the game's request, and Forced applies it more broadly with extra GPU cost."},
+  {"EmuCore/GS/mipmap_hw", "Rendering compatibility",
+   "Emulates the GS texture mipmapping used by many games. Disabling it can break rendering or cause distant-texture artifacts, so keep it enabled unless testing a specific workaround."},
+  {"EmuCore/GS/CRCHackLevel", "Game-specific fixes",
+   "Controls automatic renderer fixes selected from the game's CRC. Auto is recommended. Lower levels may leave graphical problems; Aggressive can remove effects or geometry while fixing difficult titles."},
+  {"EmuCore/GS/texture_preloading", "Performance / memory",
+   "Uploads complete textures instead of only the regions currently used. Full usually avoids redundant transfers and improves performance, but consumes more memory and can slow a small number of games."},
+  {"EmuCore/GS/paltex", "CPU / GPU trade-off",
+   "Moves color-palette texture conversion from the CPU to the GPU. It can help CPU-limited games but adds GPU work; results depend on the title and renderer."},
+  {"EmuCore/GS/pcrtc_antiblur", "Visual enhancement",
+   "Applies internal anti-blur fixes to many games. The image is often clearer, although it is less faithful to the original PS2 output and can affect titles that rely on the blur."},
+  {"EmuCore/GS/TVShader", "Post-processing",
+   "Applies a display shader that imitates scanlines or CRT/television patterns. This changes only the final image and adds GPU work."},
+  {"EmuCore/GS/CASMode", "Post-processing",
+   "Applies Contrast Adaptive Sharpening to the final image. Sharpen Only adds clarity; Sharpen + Upscale also participates in scaling. Strong sharpening can emphasize aliasing or noise."},
+  {"EmuCore/GS/CASSharpness", "Post-processing",
+   "Sets the strength of Contrast Adaptive Sharpening. Higher values produce a crisper image but can create halos or emphasize pixel shimmer."},
+  {"EmuCore/GS/ShadeBoost", "Color adjustment",
+   "Enables manual brightness, contrast, and saturation adjustments on the final game image. It does not change the emulated game's own lighting."},
+  {"EmuCore/GS/ShadeBoost_Brightness", "Color adjustment",
+   "Adjusts final-image brightness while Shade Boost is enabled. The default value keeps the original balance."},
+  {"EmuCore/GS/ShadeBoost_Contrast", "Color adjustment",
+   "Adjusts final-image contrast while Shade Boost is enabled. Extreme values can hide shadow or highlight detail."},
+  {"EmuCore/GS/ShadeBoost_Saturation", "Color adjustment",
+   "Adjusts final-image color saturation while Shade Boost is enabled. The default value keeps the original color intensity."},
+  {"EmuCore/GS/LoadTextureReplacements", "Custom textures",
+   "Loads replacement textures prepared for the current game. This increases storage and memory use; matching depends on the game's texture hashes and replacement pack."},
+  {"EmuCore/GS/SoftwareRendererFMV", "Game-specific workaround",
+   "Temporarily uses the software renderer for FMV sequences. It can fix videos that hardware rendering displays incorrectly, but costs substantial CPU time during those scenes."},
+  {"EmuCore/GS/HWDownloadMode", "Accuracy / performance",
+   "Changes synchronization for data read back from the GPU. Accurate is safest. Less synchronized modes may improve demanding games but can break effects, videos, or other rendering that depends on GS downloads."},
+
+  {"Wrapper/LSFGEnabled", "Frame generation",
+   "Makes LSFG 2x available for this launch. Frame generation still starts Off in-game and must be enabled from the overlay. On Switch's 60 Hz output, 25/30 FPS sources are interpolated while native 50/60 FPS sources automatically stay on the normal presentation path so emulation is never halved. Requires Vulkan and Lossless.dll and may add artifacts or latency."},
+  {"Wrapper/LSFGFlowScale", "Frame generation quality",
+   "Sets the resolution used for optical-flow analysis. Half can retain more motion detail but costs considerably more GPU time and memory; Quarter is recommended on Switch."},
+  {"Wrapper/LSFGPerformance", "Frame generation performance",
+   "Uses LSFG's lighter performance-oriented path. Keep it enabled on Switch unless testing image quality with ample GPU headroom."},
+
+  {"SPU2/Mixing/FinalVolume", "Audio output",
+   "Sets the final emulator volume sent to the Switch audio output. It does not change the game's internal volume setting."},
+  {"SPU2/Mixing/Interpolation", "Audio quality / performance",
+   "Chooses how the SPU2 reconstructs audio samples. Higher-quality interpolation can sound smoother but uses more CPU; Catmull-Rom is the normal quality setting."},
+  {"SPU2/Output/SynchMode", "Audio synchronization",
+   "TimeStretch adjusts audio smoothly when emulation timing varies and is recommended. Async keeps audio independent of emulation speed; None performs no synchronization and can crackle or drift."},
+  {"SPU2/Output/Latency", "Audio latency / stability",
+   "Sets the emulated audio buffer length. Lower values reduce response delay but are more likely to crackle when frame times fluctuate; higher values are safer but add latency."},
+  {"SPU2/Output/OutputLatency", "Audio latency / stability",
+   "Sets additional buffering in the Switch output path. Reduce it for lower audio delay, or raise it if sound underruns and crackles persist."},
+
+  {"Wrapper/CoreBuild", "Compatibility core",
+   "Selects which bundled NetherSX2 Android core is loaded. Patched 4248 is the normal choice; Classic 3668 is retained for games or behavior that are more compatible with the older core."},
+  {"Wrapper/FastmemMode", "CPU performance",
+   "Uses fast mapped access for emulated PS2 memory while retaining NetherSX2_nx's self-modifying-code invalidation. It is a major CPU optimization. Disabling it keeps the safe slower memory path for troubleshooting."},
+  {"Wrapper/SystemLanguage", "PS2 firmware",
+   "Sets the language stored in the PS2 BIOS NVM before launch. Auto follows the Switch language when supported; Don't change preserves the existing BIOS setting."},
+  {"EmuCore/Speedhacks/EECycleRate", "CPU speed control",
+   "Underclocks or overclocks the emulated Emotion Engine. Lower values can reduce host CPU load but may lower a game's internal frame rate or break timing. Higher values greatly increase CPU requirements."},
+  {"EmuCore/Speedhacks/EECycleSkip", "CPU timing hack",
+   "Makes the emulated Emotion Engine skip work cycles. It helps a small set of demanding games, but usually harms performance, pacing, or compatibility. Keep it Off unless a game specifically benefits."},
+  {"Wrapper/FastBoot", "Boot behavior",
+   "Skips the PS2 BIOS boot animation and starts the selected game directly. Disable it when a title or BIOS function requires a full boot."},
+  {"EmuCore/Speedhacks/vuThread", "CPU threading",
+   "Runs VU1 work on another CPU thread. It is normally a useful Switch speedup, but a small number of games are incompatible or may hang."},
+  {"EmuCore/Speedhacks/vu1Instant", "CPU performance",
+   "Uses the optimized Instant VU1 synchronization path when compatible. It usually improves performance, but should be disabled if a game develops VU-related graphics or timing errors."},
+  {"EmuCore/Speedhacks/vuFlagHack", "CPU performance",
+   "Optimizes VU flag calculations for a useful speedup with high compatibility. Disable it only when diagnosing VU graphics or calculation errors in a specific game."},
+  {"EmuCore/GS/SyncToHostRefreshRate", "Frame pacing",
+   "Slightly adjusts emulation speed so the guest refresh aligns with the Switch display. This can make animation smoother, but it only applies when the rates are already close and may change speed by less than one percent."},
+  {"EmuCore/EnablePatches", "Game compatibility",
+   "Loads the normal game-specific PNACH patches supplied with the core. These fixes are separate from user-selectable cheat codes and are recommended for compatibility."},
+
+  {"EmuCore/Gamefixes/FpuMulHack", "Manual game fix",
+   "Changes FPU multiplication behavior for Tales of Destiny. Leave it Off for unrelated games."},
+  {"EmuCore/Gamefixes/FpuNegDivHack", "Manual game fix",
+   "Changes negative FPU division behavior for Gundam games. Leave it Off for unrelated games."},
+  {"EmuCore/Gamefixes/SoftwareRendererFMVHack", "Manual game fix",
+   "Uses the software renderer for complex FMV sequences which do not render correctly in hardware mode. FMV playback will require substantially more CPU performance."},
+  {"EmuCore/Gamefixes/SkipMPEGHack", "Manual game fix",
+   "Skips MPEG videos and FMVs in games which otherwise hang or freeze while playing them."},
+  {"EmuCore/Gamefixes/GoemonTlbHack", "Manual game fix",
+   "Preloads TLB entries to avoid translation misses in Goemon titles."},
+  {"EmuCore/Gamefixes/EETimingHack", "Manual game fix",
+   "Applies a general-purpose Emotion Engine timing workaround used by games such as Digital Devil Saga and SSX."},
+  {"EmuCore/Gamefixes/InstantDMAHack", "Manual game fix (4248 only)",
+   "Completes DMA operations immediately to work around cache-emulation problems such as those in Fire Pro Wrestling Z. The Classic 3668 core does not expose this setting."},
+  {"EmuCore/Gamefixes/OPHFlagHack", "Manual game fix",
+   "Changes GIF OPH flag behavior for titles including Bleach Blade Battlers, Growlanser II and III, and Wizardry."},
+  {"EmuCore/Gamefixes/GIFFIFOHack", "Manual game fix",
+   "Emulates the GIF FIFO more accurately. This can fix FIFA Street 2 but is slower than the normal path."},
+  {"EmuCore/Gamefixes/DMABusyHack", "Manual game fix",
+   "Adjusts DMA busy-state timing for games including Mana Khemia, Metal Saga, and Pilot Down: Behind Enemy Lines."},
+  {"EmuCore/Gamefixes/VIF1StallHack", "Manual game fix",
+   "Delays VIF1 stalls to fix the SOCOM II HUD and the Spy Hunter loading hang."},
+  {"EmuCore/Gamefixes/VIFFIFOHack", "Manual game fix",
+   "Simulates VIF1 FIFO read-ahead for games such as Test Drive Unlimited and Transformers."},
+  {"EmuCore/Gamefixes/FullVU0SyncHack", "Manual game fix",
+   "Forces tight VU0 synchronization on every COP2 instruction. This improves accuracy but can reduce performance."},
+  {"EmuCore/Gamefixes/IbitHack", "Manual game fix",
+   "Avoids constant VU recompilation in games such as Scarface: The World Is Yours and Crash Tag Team Racing."},
+  {"EmuCore/Gamefixes/VuAddSubHack", "Manual game fix",
+   "Changes VU add/subtract behavior for tri-Ace games including Star Ocean 3, Radiata Stories, and Valkyrie Profile 2."},
+  {"EmuCore/Gamefixes/VUOverflowHack", "Manual game fix",
+   "Checks for VU floating-point overflows required by games such as Superman Returns."},
+  {"EmuCore/Gamefixes/VUSyncHack", "Manual game fix",
+   "Lets the VUs run behind the EE to avoid synchronization problems when games read or write VU registers."},
+  {"EmuCore/Gamefixes/XgKickHack", "Manual game fix",
+   "Uses more accurate VU XGKick timing. It can fix geometry and synchronization problems but is slower."},
+  {"EmuCore/Gamefixes/BlitInternalFPSHack", "Manual game fix",
+   "Uses framebuffer blits to estimate a game's internal frame rate when normal detection produces a false result."},
+
+  {"EmuCore/CPU/FPU.Roundmode", "Advanced EE accuracy",
+   "Changes how the Emotion Engine FPU rounds results. Chop / Zero is the normal PS2-compatible choice; use another mode only for a game known to require it."},
+  {"EmuCore/CPU/Recompiler/FPUClampMode", "Advanced EE accuracy",
+   "Controls how aggressively EE floating-point values are clamped. Normal is recommended; stricter modes can fix specific games but may reduce accuracy elsewhere."},
+  {"EmuCore/CPU/Recompiler/EnableEE", "CPU execution mode",
+   "Uses the fast EE just-in-time recompiler. Disabling it is intended only for compatibility diagnosis and is far too slow for normal play."},
+  {"EmuCore/CPU/Recompiler/EnableEECache", "CPU compatibility",
+   "Emulates the EE cache for titles which depend on it. This is substantially slower and should remain Off unless a game specifically needs it."},
+  {"EmuCore/Speedhacks/WaitLoop", "CPU optimization",
+   "Detects EE wait loops and skips idle work. It provides a moderate speedup in some games with very few compatibility side effects."},
+  {"EmuCore/Speedhacks/IntcStat", "CPU optimization",
+   "Detects EE interrupt-controller spin loops. This can provide a large speedup in affected games and is normally safe."},
+  {"EmuCore/CPU/Recompiler/PauseOnTLBMiss", "Developer diagnostic",
+   "Pauses emulation after an EE TLB miss. This is a debugging aid and should remain Off for gameplay."},
+  {"EmuCore/CPU/VU0.Roundmode", "Advanced VU accuracy",
+   "Changes rounding for Vector Unit 0. Chop / Zero is the default; other modes are compatibility overrides for specific games."},
+  {"EmuCore/CPU/VU1.Roundmode", "Advanced VU accuracy",
+   "Changes rounding for Vector Unit 1. Chop / Zero is the default; other modes are compatibility overrides for specific games."},
+  {"EmuCore/CPU/Recompiler/VU0ClampMode", "Advanced VU accuracy",
+   "Controls VU0 floating-point clamping. Normal is recommended unless a known game fix requires another mode."},
+  {"EmuCore/CPU/Recompiler/VU1ClampMode", "Advanced VU accuracy",
+   "Controls VU1 floating-point clamping. Normal is recommended unless a known game fix requires another mode."},
+  {"EmuCore/CPU/Recompiler/EnableVU0", "VU execution mode",
+   "Uses the fast VU0 micro recompiler. Turning it Off is for compatibility diagnosis and sharply reduces performance."},
+  {"EmuCore/CPU/Recompiler/EnableVU1", "VU execution mode",
+   "Uses the fast VU1 recompiler. Turning it Off is for compatibility diagnosis and sharply reduces performance."},
+  {"EmuCore/CPU/Recompiler/EnableIOP", "IOP execution mode",
+   "Uses the fast IOP just-in-time recompiler. Disabling it is intended only for compatibility diagnosis."},
+  {"EmuCore/EnableGameFixes", "Automatic compatibility",
+   "Allows the core to apply known fixes from GameIndex.yaml. Keep this On unless diagnosing an incorrect automatic game fix."},
+
+  {"Wrapper/Network", "Experimental networking",
+   "Enables NetherSX2_nx's experimental PS2 network-adapter path for games that support online or LAN networking. Leave it disabled when unused."},
+  {"Wrapper/NetDNS", "Experimental networking",
+   "Overrides the DNS server used by the emulated network adapter. Leave it on Auto unless a replacement service or network setup requires a specific address."},
+
+  {"Wrapper/ControllerCount", "Controller input",
+   "Sets how many PS2 controller ports NetherSX2_nx accepts from connected Switch controllers. Use 2 for local multiplayer; each player should connect their controller before launching the game."},
+  {"Wrapper/Vibration", "Controller feedback",
+   "Forwards PS2 DualShock vibration to connected Switch controllers. Disable it to avoid rumble or reduce controller battery use."},
+  {"Wrapper/TurboCombo", "Hotkey binding",
+   "Assigns a unique Switch button or multi-button combination to PS2 turbo speed. Press A, hold every button in the combination, then release them. None leaves turbo unmapped."},
+  {"Wrapper/Pad1/LeftStick", "Analog mapping",
+   "Chooses which Switch analog stick controls the PS2 left stick. Set it to None to leave that emulated stick unmapped."},
+  {"Wrapper/Pad1/RightStick", "Analog mapping",
+   "Chooses which Switch analog stick controls the PS2 right stick. Set it to None to leave that emulated stick unmapped."},
+  {"Wrapper/Pad1/LeftStickInvertX", "Analog mapping",
+   "Reverses horizontal input on the emulated PS2 left stick."},
+  {"Wrapper/Pad1/LeftStickInvertY", "Analog mapping",
+   "Reverses vertical input on the emulated PS2 left stick."},
+  {"Wrapper/Pad1/RightStickInvertX", "Analog mapping",
+   "Reverses horizontal input on the emulated PS2 right stick."},
+  {"Wrapper/Pad1/RightStickInvertY", "Analog mapping",
+   "Reverses vertical input on the emulated PS2 right stick."},
+  {"Wrapper/Pad1/Deadzone", "Analog input",
+   "Sets how far a Switch stick must move before NetherSX2 registers input. Raise it to hide stick drift; lower it for more immediate small movements."},
+
+  {"EmuCore/GS/FrameLimitEnable", "Speed control",
+   "Keeps emulation at the selected normal, turbo, or slow-motion target. Disabling it lets the game run as fast as the Switch can manage."},
+  {"Framerate/NominalScalar", "Speed control",
+   "Sets the target speed during normal play. Reaching the target is not guaranteed when a game exceeds available CPU or GPU performance."},
+  {"Framerate/TurboScalar", "Speed control",
+   "Sets the target used while the configured turbo hotkey is active. Higher values require proportionally more CPU and GPU performance."},
+  {"Framerate/SlomoScalar", "Speed control",
+   "Sets the target used by slow-motion mode."},
+  {"EmuCore/GS/FramerateNTSC", "Emulated video timing",
+   "Sets the base refresh rate used by NTSC games. The normal value is 59.94 Hz. Changing it alters game timing and should be treated as a compatibility or speed experiment."},
+  {"EmuCore/GS/FrameratePAL", "Emulated video timing",
+   "Sets the base refresh rate used by PAL games. The normal value is 50 Hz. Changing it alters game timing and should be treated as a compatibility or speed experiment."},
+
+  {"Wrapper/Theme", "Launcher appearance",
+   "Changes the launcher background and visual style. It does not affect gameplay rendering or performance inside the emulator."},
+  {"Wrapper/GridColumns", "Library layout",
+   "Sets how many game covers appear across each library row. More columns make each cover smaller."},
+  {"Wrapper/GridRows", "Library layout",
+   "Sets how many cover rows appear on one library page. More rows make each cover smaller."},
+  {"Wrapper/ShowGameTitles", "Library layout",
+   "Shows or hides game names below their covers in the launcher library."},
+  {"Wrapper/UiAnimations", "Launcher appearance",
+   "Enables launcher transitions, moving selection highlights, and animated theme effects."},
+  {"Wrapper/UiSounds", "Launcher audio",
+   "Enables navigation, confirmation, and back sound effects in the SDL launcher."},
+};
+
+struct SettingHelpInfo {
+  const char *kind;
+  std::string text;
+};
+
+static SettingHelpInfo settingHelpFor(const Opt &option) {
+  if(option.key){
+    for(const SettingHelpEntry &entry:SETTING_HELP)
+      if(!strcmp(entry.key,option.key)) return {entry.kind,entry.text};
+    if(!strncmp(option.key,"Wrapper/Pad1/",13)&&option.ch==C_btn)
+      return {"Controller mapping",
+              std::string("Maps PS2 ")+option.label+" to a Switch controller button. Press A on this row, then press the desired button; choose None to leave it unmapped."};
+    if(option.type==OT_HOTKEY)
+      return {"Hotkey binding",
+              std::string("Assigns a Switch button or button combination to ")+option.label+". Press A, hold every button in the combination, then release them."};
+  }
+  if(option.type==OT_SUBMENU){
+    if(option.sub==SCR_ENHANCE)
+      return {"Settings group","Contains advanced GS accuracy controls, visual enhancements, and game-specific rendering workarounds. Higher accuracy often requires more GPU performance."};
+    if(option.sub==SCR_FRAMERATE)
+      return {"Settings group","Contains the frame limiter, normal/turbo/slow-motion targets, and the base NTSC/PAL video rates. Changing base video timing can affect game logic."};
+  }
+  if(option.type==OT_STATUS)
+    return {"Required component","Shows whether Lossless.dll is installed in NetherSX2_nx's fixed frame-generation folder. LSFG options cannot be enabled while it is missing."};
+  return {"Setting","Changes this launcher or emulator option. Use the default value when troubleshooting an unexpected game-specific problem."};
+}
 
 static void commitAll() {
   for (int s = 0; s < SCR_COUNT; s++)
@@ -1221,6 +1582,7 @@ struct Game {
   bool triedCover = false;
   bool hasCfg = false;
   bool legacyUnique = false;
+  bool biosBoot = false;
   int region = 0;
   long long added = 0;
   long long played = 0;
@@ -1283,12 +1645,14 @@ static int detectRegion(const std::string &file) {
 static void applySort() {
   auto cmpTitle = [](const Game &a, const Game &b){ return strcasecmp(a.title.c_str(), b.title.c_str()) < 0; };
   std::sort(g_games.begin(), g_games.end(), [&](const Game &a, const Game &b){
+    if (a.biosBoot != b.biosBoot) return a.biosBoot;
     if (g_sort == SORT_RECENT && a.played != b.played) return a.played > b.played;
     if (g_sort == SORT_ADDED  && a.added  != b.added)  return a.added  > b.added;
     return cmpTitle(a, b);
   });
 }
 static void recordPlayed(const Game &game){
+  if (game.biosBoot) return;
   long long seq = atoll(storeGet(g_global,"Wrapper/PlaySeq","0")) + 1;
   char b[24]; snprintf(b,sizeof(b),"%lld",seq);
   storeSet(g_global,"Wrapper/PlaySeq",b);
@@ -1567,9 +1931,17 @@ static void scanGames(const std::vector<std::string> &sourcePaths) {
     game.played = atoll(gameStoreGet(g_recent, game, "0"));
     game.hasCfg = gameFileExists(GAMECFG_DIR, game, ".ini");
   }
+  Game bios;
+  bios.title = "PS2 BIOS";
+  bios.file = "System Menu";
+  bios.key = "__ps2_bios__";
+  bios.biosBoot = true;
+  g_games.push_back(std::move(bios));
   applySort();
 }
-static std::string coverPath(const Game &g) { return std::string(COVERS_DIR) + "/" + g.key + ".png"; }
+static std::string coverPath(const Game &g) {
+  return g.biosBoot ? "romfs:/bios-cover.png" : std::string(COVERS_DIR) + "/" + g.key + ".png";
+}
 static std::string existingCoverPath(const Game &g) {
   const std::string current = coverPath(g);
   if (regularFileExists(current)) return current;
@@ -1729,6 +2101,7 @@ static bool pathAtOrBelow(const std::string &path,const std::string &root) {
 }
 
 static std::string gameLocationLabel(const Game &game) {
+  if(game.biosBoot) return "PS2 system menu  \xc2\xb7  BIOS";
   const std::string path=normalizeLocationPath(game.path);
   if(path.empty()) return "Unknown location";
   for(const auto &share:loadSmbSharesFromStore()){
@@ -2661,6 +3034,93 @@ static void listCol(int *colX,int *colW,int *labelX,int *valX){
 }
 static int listVis(){ int v=(SH-LIST_Y0-72)/ROW_H; return v<1?1:v; }
 
+static void showHelpCard(const char *section,const char *title,const char *kind,
+                         const std::string &description,const char *current,
+                         const char *scope) {
+  for(;;){
+    if(!beginUiFrame()) return;
+    SDL_Event event;
+    while(pollUiEvent(event)){
+      pumpStick(event);
+      int touchX=0,touchY=0;
+      if(touchFeed(event,&touchX,&touchY)==TOUCH_TAP) return;
+      if(event.type==SDL_CONTROLLERBUTTONDOWN&&
+         (event.cbutton.button==BTN_CONFIRM||
+          event.cbutton.button==BTN_CANCEL||
+          event.cbutton.button==BTN_SETTINGS)) return;
+    }
+
+    clearUiBackground();
+    const int panelWidth=std::min(SW-120,1000);
+    const int panelHeight=std::min(SH-96,500);
+    const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
+    glassPanel(panelX,panelY,panelWidth,panelHeight);
+    border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
+    drawText(g_font_sm,panelX+40,panelY+24,
+             section&&*section?section:"Settings",COL_DIM);
+    drawText(g_font_big,panelX+40,panelY+58,
+             title&&*title?title:"Setting help",COL_VAL);
+
+    std::string metadata=kind&&*kind?kind:"Setting";
+    if(scope&&*scope){ metadata+="  |  "; metadata+=scope; }
+    drawText(g_font_sm,panelX+40,panelY+114,metadata.c_str(),COL_SEL);
+    int bodyY=panelY+164;
+    if(current&&*current){
+      const char *prefix="Current: ";
+      drawText(g_font_sm,panelX+40,panelY+146,prefix,COL_DIM);
+      drawScrollTextL(g_font_sm,panelX+40+textW(g_font_sm,prefix),panelY+146,
+                      panelWidth-80-textW(g_font_sm,prefix),current,COL_TXT);
+      bodyY=panelY+198;
+    }
+    fillRect(panelX+40,bodyY-18,panelWidth-80,2,(SDL_Color){70,78,92,210});
+    drawWrapped(g_font,panelX+40,bodyY,panelWidth-80,32,7,
+                description.c_str(),COL_TXT);
+    drawTextC(g_font_sm,SW/2,panelY+panelHeight-42,
+              "A / B / X  Close       Touch anywhere to close",COL_DIM);
+    SDL_RenderPresent(g_ren);
+    SDL_Delay(8);
+  }
+}
+
+static void showOptionHelp(const char *section,const Opt &option,
+                           const char *scope) {
+  SettingHelpInfo help=settingHelpFor(option);
+  char value[256]={};
+  const char *current=nullptr;
+  if(option.type!=OT_SUBMENU){
+    optValue(option,value,sizeof(value));
+    current=value;
+  }
+  showHelpCard(section,option.label,help.kind,help.text,current,scope);
+}
+
+static const char *settingsScreenDescription(int screen) {
+  switch(screen){
+    case SCR_GRAPHICS:
+      return "Selects the graphics backend, internal resolution, display shape, presentation behavior, texture filtering, on-screen display, and common visual patches.";
+    case SCR_ENHANCE:
+      return "Contains advanced GS accuracy controls, visual enhancements, custom-texture support, and game-specific rendering workarounds. Higher accuracy often requires more GPU time.";
+    case SCR_FRAMEGEN:
+      return "Configures Vulkan-only LSFG 2x support for a launch. It interpolates 25/30 FPS sources to the 60 Hz display; native 50/60 FPS sources automatically use protected passthrough to avoid slowing emulation.";
+    case SCR_AUDIO:
+      return "Controls final volume, SPU2 interpolation, synchronization, and buffering. Smaller buffers reduce audio delay but are less tolerant of uneven performance.";
+    case SCR_EMU:
+      return "Selects the Android core and controls fastmem, PS2 firmware language, EE/VU performance settings, boot behavior, frame-rate controls, and compatibility patches.";
+    case SCR_ADVANCED:
+      return "Exposes the Android core's per-game EE, VU and IOP execution, rounding, clamping, cache, and diagnostic controls. Defaults are strongly recommended unless a game needs a documented override.";
+    case SCR_GAMEFIXES:
+      return "Provides manual per-game workarounds from NetherSX2 Android. Automatic fixes from GameIndex.yaml remain active; leave these extra switches Off unless a game specifically needs one.";
+    case SCR_FRAMERATE:
+      return "Controls the frame limiter, normal/turbo/slow-motion target speeds, and base NTSC/PAL video rates. Base-rate changes can alter game timing.";
+    case SCR_NETWORK:
+      return "Configures the experimental PS2 network-adapter path and an optional custom DNS server for compatible games or replacement services.";
+    case SCR_CONTROLLER:
+      return "Configures controller ports, vibration, PS2-to-Switch button and stick mappings, analog deadzone, and the multi-button turbo-speed hotkey.";
+    default:
+      return "Opens this group of emulator settings.";
+  }
+}
+
 static void renderSettings(int scr,int sel,int top,const char *ctx){
   clearUiBackground();
   const Screen &S=g_screens[scr];
@@ -2687,6 +3147,8 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     int thH=trH*vis/S.n, denom=(S.n-vis>0?S.n-vis:1);
     fillRect(trX,trY+(trH-thH)*top/denom,4,thH,COL_SEL);
   }
+  drawTextC(g_font_sm,SW/2,SH-38,
+            "Left / Right  Change       A  Choose       X  Help       B  Back",COL_DIM);
   drawFadeIn();
   SDL_RenderPresent(g_ren);
 }
@@ -2814,6 +3276,10 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
           else optAdjust(o,1);
           break;
         }
+        case BTN_SETTINGS:
+          showOptionHelp(S.title,S.opts[sel],ctx&&*ctx?"Per-game setting":"Global setting");
+          beginScreenFx();
+          break;
         case BTN_CANCEL: return;
       }
       int vis=listVis(); if(sel<top) top=sel; if(sel>=top+vis) top=sel-vis+1; if(top<0)top=0;
@@ -2865,6 +3331,14 @@ static void launcherSettingsScreen() {
           else optAdjust(option,1);
           applyChange();
         }
+      } else if(event.cbutton.button==BTN_SETTINGS){
+        if(sel<optionCount)
+          showOptionHelp("Launcher",S_launcher[sel],"Launcher setting");
+        else
+          showHelpCard("Launcher","Download all covers","Library artwork",
+                       "Downloads missing cover artwork for the whole library from SteamGridDB. Existing local covers are kept.",
+                       nullptr,"Launcher action");
+        beginScreenFx();
       } else if(event.cbutton.button==BTN_CANCEL){ finish(); return; }
       if(sel<top) top=sel;
       if(sel>=top+visible) top=sel-visible+1;
@@ -2890,7 +3364,8 @@ static void launcherSettingsScreen() {
         drawTextR(g_font,valX,y,value,current?COL_VAL:COL_DIM);
       }
     }
-    drawTextC(g_font_sm,SW/2,SH-38,"Left / Right  Change       A  Choose       B  Back",COL_DIM);
+    drawTextC(g_font_sm,SW/2,SH-38,
+              "Left / Right  Change       A  Choose       X  Help       B  Back",COL_DIM);
     drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
   }
 }
@@ -3114,15 +3589,182 @@ static void runCheatSettings(Game &game,uint32_t crc) {
   }
 }
 
+static bool retroAchievementsLoggedIn() {
+  return storeGet(g_global,"Achievements/Username","")[0]&&
+         storeGet(g_global,"Achievements/Token","")[0];
+}
+
+static bool retroAchievementsSignIn() {
+  if(!g_griddbReady){
+    modalMessage("RetroAchievements",{"The network service is unavailable.","Check the Switch internet connection and try again."});
+    return false;
+  }
+
+  const std::string initialUsername=storeGet(g_global,"Achievements/Username","");
+  char usernameBuffer[96]{};
+  snprintf(usernameBuffer,sizeof(usernameBuffer),"%s",
+           initialUsername.c_str());
+  if(!promptTextMode("RetroAchievements username",initialUsername.c_str(),
+                     usernameBuffer,sizeof(usernameBuffer),false,false,
+                     "Sign in to enable Casual achievements.","Username"))
+    return false;
+  const std::string username=trim(usernameBuffer);
+  if(username.empty()||username.find_first_of("\r\n")!=std::string::npos){
+    modalMessage("RetroAchievements",{"Enter a valid username."});
+    return false;
+  }
+
+  char password[192]{};
+  if(!promptTextMode("RetroAchievements password","",password,sizeof(password),
+                     true,false,"","Password")){
+    retroAchievementsClearSecret(password,sizeof(password));
+    return false;
+  }
+
+  toast("Signing in to RetroAchievements...");
+  SDL_RenderPresent(g_ren);
+  RetroAchievementsLoginResponse response;
+  const RetroAchievementsLoginResult result=
+      retroAchievementsLoginWithPassword(username,password,response);
+  retroAchievementsClearSecret(password,sizeof(password));
+  if(result!=RetroAchievementsLoginResult::Success){
+    modalMessage("RetroAchievements sign-in failed",{
+      response.error.empty()?"The account could not be signed in.":response.error
+    });
+    return false;
+  }
+  if(response.username.find_first_of("\r\n")!=std::string::npos||
+     response.token.find_first_of("\r\n")!=std::string::npos||
+     response.token.size()>=256){
+    modalMessage("RetroAchievements",{"The server returned an invalid account token."});
+    return false;
+  }
+
+  storeSet(g_global,"Achievements/Username",response.username.c_str());
+  storeSet(g_global,"Achievements/Token",response.token.c_str());
+  storeSet(g_global,"Achievements/Enabled","true");
+  normalizeRetroAchievementsStore(g_global);
+  if(!storeSave(g_global,LAUNCHER_INI)){
+    modalMessage("RetroAchievements",{"Signed in, but launcher.ini could not be saved."});
+    return false;
+  }
+  syncRetroAchievementsToEmulatorConfig();
+  modalMessage("RetroAchievements",{"Signed in as "+response.username+".",
+               "Achievements will activate the next time a game starts."});
+  return true;
+}
+
+static void retroAchievementsScreen() {
+  enum { RA_ACCOUNT,RA_ENABLED,RA_PRESENCE,RA_NOTIFICATIONS,
+         RA_SIGN_IN,RA_SIGN_OUT,RA_BACK,RA_ROW_COUNT };
+  static int savedSelection=0;
+  int sel=std::max(0,std::min(savedSelection,RA_ROW_COUNT-1));
+  constexpr int rowH=58,y0=110;
+  auto setToggle=[&](const char *key,bool value){
+    storeSet(g_global,key,value?"true":"false");
+    normalizeRetroAchievementsStore(g_global);
+    storeSave(g_global,LAUNCHER_INI);
+    syncRetroAchievementsToEmulatorConfig();
+  };
+  auto activate=[&](int direction){
+    const bool loggedIn=retroAchievementsLoggedIn();
+    if(sel==RA_ACCOUNT||sel==RA_SIGN_IN){
+      retroAchievementsSignIn();
+    } else if(sel==RA_ENABLED){
+      if(!loggedIn){ retroAchievementsSignIn(); return; }
+      const bool current=!strcmp(storeGet(g_global,"Achievements/Enabled","false"),"true");
+      setToggle("Achievements/Enabled",direction?direction>0:!current);
+    } else if(sel==RA_PRESENCE){
+      const bool current=!strcmp(storeGet(g_global,"Achievements/RichPresence","true"),"true");
+      setToggle("Achievements/RichPresence",direction?direction>0:!current);
+    } else if(sel==RA_NOTIFICATIONS){
+      const bool current=!strcmp(storeGet(g_global,"Achievements/Notifications","true"),"true");
+      setToggle("Achievements/Notifications",direction?direction>0:!current);
+    } else if(sel==RA_SIGN_OUT&&loggedIn&&
+              confirmBox("Sign out of RetroAchievements?",{
+                "The saved account token will be removed.","Achievements will be disabled."})){
+      storeSet(g_global,"Achievements/Enabled","false");
+      storeSet(g_global,"Achievements/Username","");
+      storeSet(g_global,"Achievements/Token","");
+      normalizeRetroAchievementsStore(g_global);
+      storeSave(g_global,LAUNCHER_INI);
+      syncRetroAchievementsToEmulatorConfig();
+    }
+  };
+
+  beginScreenFx();
+  for(;;){
+    if(!beginUiFrame()){ savedSelection=sel; return; }
+    SDL_Event event; navRepeat();
+    while(pollUiEvent(event)){
+      pumpStick(event); int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
+      if(touch==TOUCH_SWIPE_L&&sel>=RA_ENABLED&&sel<=RA_NOTIFICATIONS){ activate(-1); continue; }
+      if(touch==TOUCH_SWIPE_R&&sel>=RA_ENABLED&&sel<=RA_NOTIFICATIONS){ activate(1); continue; }
+      if(touch==TOUCH_TAP){
+        if(ty<topBarH()||ty>=SH-40){ savedSelection=sel; return; }
+        for(int row=0;row<RA_ROW_COUNT;row++){
+          int y=y0+row*rowH;
+          if(ty>=y&&ty<y+rowH){ sel=row; if(sel==RA_BACK){ savedSelection=sel; return; } activate(0); break; }
+        }
+        continue;
+      }
+      if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
+      if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) sel=(sel+RA_ROW_COUNT-1)%RA_ROW_COUNT;
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%RA_ROW_COUNT;
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT&&sel>=RA_ENABLED&&sel<=RA_NOTIFICATIONS) activate(-1);
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT&&sel>=RA_ENABLED&&sel<=RA_NOTIFICATIONS) activate(1);
+      else if(event.cbutton.button==BTN_CONFIRM){
+        if(sel==RA_BACK){ savedSelection=sel; return; }
+        activate(0);
+        beginScreenFx();
+      } else if(event.cbutton.button==BTN_CANCEL){ savedSelection=sel; return; }
+    }
+
+    const bool loggedIn=retroAchievementsLoggedIn();
+    const bool enabled=loggedIn&&!strcmp(storeGet(g_global,"Achievements/Enabled","false"),"true");
+    clearUiBackground();
+    drawHeader("RetroAchievements",nullptr);
+    int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
+    glassPanel(colX-12,y0-10,colW+24,RA_ROW_COUNT*rowH+18);
+    float target=(float)(y0+sel*rowH+2);
+    g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
+    fillRect(colX,(int)g_hy,colW,rowH-4,COL_FOCUS);
+    fillRect(colX,(int)g_hy,5,rowH-4,COL_SEL);
+    const char *labels[RA_ROW_COUNT]={"Account","Achievements","Rich presence","Notifications",
+                                      loggedIn?"Change account":"Sign in","Sign out","Back"};
+    const char *values[RA_ROW_COUNT]={
+      loggedIn?storeGet(g_global,"Achievements/Username",""):"Not signed in",
+      enabled?"On":"Off",
+      !strcmp(storeGet(g_global,"Achievements/RichPresence","true"),"true")?"On":"Off",
+      !strcmp(storeGet(g_global,"Achievements/Notifications","true"),"true")?"On":"Off",
+      ">",loggedIn?">":"Unavailable","<"
+    };
+    const int fontHeight=TTF_FontHeight(g_font),smallHeight=TTF_FontHeight(g_font_sm);
+    for(int row=0;row<RA_ROW_COUNT;row++){
+      const int slot=y0+row*rowH,y=slot+(rowH-fontHeight)/2;
+      const bool current=row==sel;
+      const bool available=row!=RA_SIGN_OUT||loggedIn;
+      drawText(g_font,labelX,y,labels[row],current&&available?COL_VAL:(available?COL_TXT:COL_DIM));
+      drawTextR(g_font_sm,valX,slot+(rowH-smallHeight)/2,values[row],
+                current&&available?COL_VAL:COL_DIM);
+    }
+    drawTextC(g_font_sm,SW/2,SH-38,"A  Select       Left / Right  Change       B  Back",COL_DIM);
+    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+  }
+}
+
 static void runSettingsRoot(SDL_GameController *pad, const char *ctx, Game *game) {
-  static const int order[] = { SCR_FRAMEGEN, SCR_EMU, SCR_GRAPHICS, SCR_AUDIO, SCR_NETWORK, SCR_CONTROLLER };
-  const int nscr=(int)(sizeof(order)/sizeof(*order));
   const bool global=!(ctx&&*ctx);
+  static const int globalOrder[] = { SCR_FRAMEGEN, SCR_EMU, SCR_GRAPHICS, SCR_AUDIO, SCR_NETWORK, SCR_CONTROLLER };
+  static const int gameOrder[] = { SCR_FRAMEGEN, SCR_EMU, SCR_ADVANCED, SCR_GAMEFIXES, SCR_GRAPHICS, SCR_AUDIO, SCR_NETWORK, SCR_CONTROLLER };
+  const int *order=global?globalOrder:gameOrder;
+  const int nscr=global?(int)(sizeof(globalOrder)/sizeof(*globalOrder)):
+                         (int)(sizeof(gameOrder)/sizeof(*gameOrder));
   const bool hasCheatRow=!global&&game;
-  const int launcherRow=0,libraryRow=1,cheatRow=0;
-  const int screenStart=global?2:(hasCheatRow?1:0);
-  const int globalTopGroupRows=3;
-  const int n=nscr+(global?2:(hasCheatRow?1:0));
+  const int launcherRow=0,libraryRow=1,retroAchievementsRow=2,cheatRow=0;
+  const int screenStart=global?3:(hasCheatRow?1:0);
+  const int globalTopGroupRows=4;
+  const int n=nscr+(global?3:(hasCheatRow?1:0));
   const uint32_t gameCRC=hasCheatRow?loadGameCRC(*game):0;
   int sel=0,top=0;
   const int rowH=58,y0=92,sectionGap=34,vis=std::max(1,(SH-y0-42-sectionGap)/rowH);
@@ -3145,8 +3787,33 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx, Game *game
       else if(event.cbutton.button==BTN_CONFIRM){
         if(global&&sel==launcherRow) launcherSettingsScreen();
         else if(global&&sel==libraryRow) libraryStorageScreen();
+        else if(global&&sel==retroAchievementsRow) retroAchievementsScreen();
         else if(hasCheatRow&&sel==cheatRow) runCheatSettings(*game,gameCRC);
         else runSettings(order[sel-screenStart],pad,ctx);
+        beginScreenFx();
+      } else if(event.cbutton.button==BTN_SETTINGS){
+        if(global&&sel==launcherRow)
+          showHelpCard("Settings","Launcher","Launcher appearance",
+                       "Changes the SDL launcher's theme, library grid, labels, animations, sounds, and cover downloads.",
+                       nullptr,"Settings category");
+        else if(global&&sel==libraryRow)
+          showHelpCard("Settings","Library & storage","Game and file management",
+                       "Manages scanned game folders, local and removable files, and SMB network shares used by the launcher.",
+                       nullptr,"Settings category");
+        else if(global&&sel==retroAchievementsRow)
+          showHelpCard("Settings","RetroAchievements","Online achievements",
+                       "Signs in to RetroAchievements and controls Casual achievements, rich presence, and unlock notifications. Account credentials are stored as a reusable token after sign-in.",
+                       nullptr,"Settings category");
+        else if(hasCheatRow&&sel==cheatRow)
+          showHelpCard("Game settings","Cheat codes","Per-game PNACH codes",
+                       "Reads named cheat sections from the game's CRC-based PNACH file and lets each code be enabled or disabled separately. Launch the game once if its CRC is not known yet.",
+                       nullptr,"Per-game setting");
+        else {
+          const int screen=order[sel-screenStart];
+          showHelpCard(global?"Settings":"Game settings",g_screens[screen].title,
+                       "Settings category",settingsScreenDescription(screen),nullptr,
+                       global?"Global settings":"Per-game overrides");
+        }
         beginScreenFx();
       } else if(event.cbutton.button==BTN_CANCEL) return;
       if(sel<top) top=sel;
@@ -3177,6 +3844,13 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx, Game *game
       } else if(global&&index==libraryRow){
         drawText(g_font,labelX,y,"Library & storage",current?COL_VAL:COL_TXT);
         drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"games / files / network",current?COL_VAL:COL_DIM);
+      } else if(global&&index==retroAchievementsRow){
+        const bool loggedIn=retroAchievementsLoggedIn();
+        const bool enabled=loggedIn&&!strcmp(storeGet(g_global,"Achievements/Enabled","false"),"true");
+        drawText(g_font,labelX,y,"RetroAchievements",current?COL_VAL:COL_TXT);
+        drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,
+                  enabled?storeGet(g_global,"Achievements/Username",""):(loggedIn?"Off":"Not signed in"),
+                  current?COL_VAL:COL_DIM);
       } else if(hasCheatRow&&index==cheatRow){
         drawText(g_font,labelX,y,"Cheat codes",current?COL_VAL:COL_TXT);
         if(gameCRC){ char value[24]; snprintf(value,sizeof(value),"CRC %08X",gameCRC); drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,value,current?COL_VAL:COL_DIM); }
@@ -3187,6 +3861,7 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx, Game *game
       }
     }
     if(n>vis){ int trackH=vis*rowH,trackX=colX+colW+16; fillRect(trackX,y0,4,trackH,(SDL_Color){40,44,54,255}); int thumbH=std::max(16,trackH*vis/n),denom=std::max(1,n-vis); fillRect(trackX,y0+(trackH-thumbH)*top/denom,4,thumbH,COL_SEL); }
+    drawTextC(g_font_sm,SW/2,SH-38,"A  Open       X  Help       B  Back",COL_DIM);
     drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
   }
 }
@@ -3435,7 +4110,8 @@ static void downloadAllCovers() {
   }
   mkdir(COVERS_DIR,0777);
   std::vector<int> pending;
-  for(int index=0;index<(int)g_games.size();index++) if(!regularFileExists(existingCoverPath(g_games[index]))) pending.push_back(index);
+  for(int index=0;index<(int)g_games.size();index++)
+    if(!g_games[index].biosBoot&&!regularFileExists(existingCoverPath(g_games[index]))) pending.push_back(index);
   if(pending.empty()){ toast("All covers already downloaded"); SDL_Delay(1200); return; }
   int total=(int)pending.size(),done=0,ok=0,fail=0; bool cancel=false;
   for(int item=0;item<total&&!cancel;item++){
@@ -3607,7 +4283,52 @@ static void forwarderWizard(Game &g) {
   if(iconTex) SDL_DestroyTexture(iconTex);
 }
 
+static int biosGameMenu(Game &g, SDL_GameController *pad) {
+  (void)pad;
+  const char *items[] = { "Boot PS2 BIOS", "Back" };
+  const int n=2;
+  int sel=0;
+  beginScreenFx();
+  for(;;){
+    if(!beginUiFrame()) return 0;
+    SDL_Event event; navRepeat();
+    while(pollUiEvent(event)){
+      pumpStick(event);
+      int tx=0,ty=0; TouchKind touch=touchFeed(event,&tx,&ty);
+      if(touch==TOUCH_TAP){
+        if(ty>=SH-40) return 0;
+        for(int i=0;i<n;i++){ int y=250+i*62; if(ty>=y-8&&ty<y+50){ sel=i; SDL_Event press{}; press.type=SDL_CONTROLLERBUTTONDOWN; press.cbutton.button=BTN_CONFIRM; SDL_PushEvent(&press); break; } }
+        continue;
+      }
+      if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
+      if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) sel=(sel+n-1)%n;
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%n;
+      else if(event.cbutton.button==BTN_CANCEL) return 0;
+      else if(event.cbutton.button==BTN_CONFIRM){
+        if(sel==0) return 1;
+        return 0;
+      }
+    }
+    clearUiBackground();
+    g_cover_budget=1; ensureCover(g);
+    const int cw=300,ch=450,cx=90,cy=(SH-ch)/2;
+    fillRect(cx+5,cy+7,cw,ch,(SDL_Color){0,0,0,60});
+    if(g.cover){ SDL_SetTextureAlphaMod(g.cover,255); SDL_SetTextureColorMod(g.cover,255,255,255); SDL_Rect dst={cx,cy,cw,ch}; SDL_RenderCopy(g_ren,g.cover,nullptr,&dst); border(cx,cy,cw,ch,2,COL_DIM); }
+    else { fillRect(cx,cy,cw,ch,(SDL_Color){40,44,54,255}); border(cx,cy,cw,ch,2,COL_DIM); }
+    drawText(g_font_big,cx+cw+70,130,"PS2 BIOS",COL_TXT);
+    drawText(g_font_sm,cx+cw+72,178,"Boot the console firmware without a disc",COL_DIM);
+    const int mx=cx+cw+64,mw=SW-mx-70;
+    float target=(float)(250+sel*62-8);
+    g_hy=(!g_uiAnimations||g_hy<0)?target:g_hy+(target-g_hy)*0.30f;
+    fillRect(mx,(int)g_hy,mw,50,COL_FOCUS); fillRect(mx,(int)g_hy,5,50,COL_SEL);
+    for(int i=0;i<n;i++) drawText(g_font,cx+cw+94,250+i*62,items[i],i==sel?COL_VAL:COL_TXT);
+    drawTextC(g_font_sm,SW/2,SH-38,"A  Select       B  Back",COL_DIM);
+    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+  }
+}
+
 static int perGameMenu(Game &g, SDL_GameController *pad) {
+  if(g.biosBoot) return biosGameMenu(g,pad);
   const char *items[] = { "Launch", "Game settings", "Rename game", "Download cover (SteamGridDB)", "Create HOME shortcut", "Clear game settings", "Delete game" };
   int n=7, sel=0;
   std::string gp = std::string(GAMECFG_DIR) + "/" + g.key + ".ini";
@@ -3816,6 +4537,26 @@ static bool ensureEmu(const char *src,const char *dst) {
   return extractFromRomfs(src,dst,true)&&sameNroBuild(src,dst);
 }
 
+static void migrateLegacyEmuHosts() {
+  static const char *renderers[]={"vk","gl"};
+  for(const char *renderer:renderers){
+    const std::string filename=std::string("NetherSX2_nx_")+renderer+".nro";
+    const std::string legacy=std::string(DATA_DIR)+"/"+filename;
+    struct stat st{};
+    if(stat(legacy.c_str(),&st)!=0||!S_ISREG(st.st_mode)) continue;
+
+    const std::string source=std::string("romfs:/emu/")+filename;
+    const std::string hidden=std::string(EMU_HOST_DIR)+"/"+filename;
+    if(!ensureEmu(source.c_str(),hidden.c_str())) continue;
+
+    if(remove(legacy.c_str())==0){
+      remove((legacy+".tmp").c_str());
+      remove((legacy+".old").c_str());
+      fsdevCommitDevice("sdmc");
+    }
+  }
+}
+
 struct GLay { int cols, rows, cw, chh, gapx, gapy, x0, y0, titleH; };
 static GLay gridLayout(){
   GLay g;
@@ -3929,6 +4670,13 @@ static void renderGrid(int sel,int top,const char*gamedirLabel){
       SDL_SetTextureAlphaMod(g.cover,fa);
       SDL_SetTextureColorMod(g.cover,cur?255:150,cur?255:150,cur?255:150);
       SDL_Rect d={x,y,L.cw,L.chh}; SDL_RenderCopy(g_ren,g.cover,nullptr,&d);
+      if(g.biosBoot){
+        const int badgeH=std::max(24,L.chh/7);
+        fillRect(x,y+L.chh-badgeH,L.cw,badgeH,(SDL_Color){2,10,32,220});
+        const std::string badge=ellipsizedText(g_font_sm,"PS2 BIOS",L.cw-8);
+        drawTextC(g_font_sm,x+L.cw/2,y+L.chh-badgeH+(badgeH-TTF_FontHeight(g_font_sm))/2,
+                  badge.c_str(),cur?COL_VAL:COL_TXT);
+      }
     }
     else { fillRect(x,y,L.cw,L.chh,COL_CARD); drawTextC(g_font_sm,x+L.cw/2,y+L.chh/2-8,"NO COVER",COL_DIM); }
     border(x,y,L.cw,L.chh,1,(SDL_Color){12,13,18,255});
@@ -4075,14 +4823,16 @@ int main(int argc, char **argv){
 
   g_griddbReady=griddb_global_init();
   if(!g_griddbReady&&R_SUCCEEDED(socketInitializeDefault())) g_storageSocketReady=true;
-  const char *directories[]={"sdmc:/switch",DATA_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,GAMECRC_DIR,CHEATS_DIR,DEF_GAMEDIR,BIOS_DIR,RESOURCES_DIR,LSFG_DIR};
+  const char *directories[]={"sdmc:/switch",DATA_DIR,EMU_HOST_DIR,COVERS_DIR,CORES_DIR,GAMECFG_DIR,GAMECRC_DIR,CHEATS_DIR,DEF_GAMEDIR,BIOS_DIR,RESOURCES_DIR,LSFG_DIR};
   for(const char *directory:directories) if(!ensureDirectory(directory)) return startupFailure("Could not create the NetherSX2 data directories.");
+  migrateLegacyEmuHosts();
 
   struct stat configStat{};
   bool firstRun=stat(LAUNCHER_INI,&configStat)!=0;
   storeLoad(g_global,LAUNCHER_INI);
   const bool settingsNormalized=normalizeLsfgStore(g_global) |
-                                removeLegacySmcSettings(g_global);
+                                removeLegacySmcSettings(g_global) |
+                                normalizeRetroAchievementsStore(g_global);
   storeLoad(g_titles,TITLES_INI);
   storeLoad(g_recent,RECENT_INI);
   int sortMode=atoi(storeGet(g_global,"Wrapper/SortMode","0"));
@@ -4126,15 +4876,24 @@ int main(int argc, char **argv){
 
   int sel=0,top=0,rows=1;
   bool running=true,launch=false;
+  bool launchBios=false;
   std::string launchKey,launchLegacyKey,launchPath;
   bool launchLegacyUnique=false;
   auto selectGame=[&](Game &game){
-    recordPlayed(game);
-    storeSet(g_global,"EmuCore/DiscPath",toEmu(game.path).c_str());
-    launchKey=game.key;
-    launchLegacyKey=game.legacyKey;
-    launchLegacyUnique=game.legacyUnique;
-    launchPath=game.path;
+    launchBios=game.biosBoot;
+    if(launchBios){
+      launchKey.clear();
+      launchLegacyKey.clear();
+      launchLegacyUnique=false;
+      launchPath.clear();
+    } else {
+      recordPlayed(game);
+      storeSet(g_global,"EmuCore/DiscPath",toEmu(game.path).c_str());
+      launchKey=game.key;
+      launchLegacyKey=game.legacyKey;
+      launchLegacyUnique=game.legacyUnique;
+      launchPath=game.path;
+    }
     launch=true;
     running=false;
   };
@@ -4265,7 +5024,6 @@ int main(int argc, char **argv){
     renderGrid(sel,top,location.c_str());
     SDL_Delay(8);
   }
-
   g_active=&g_global;
   if(launch) commitAll();
   storeSave(g_global,LAUNCHER_INI);
@@ -4286,6 +5044,7 @@ int main(int argc, char **argv){
     }
     normalizeLsfgStore(effective);
     removeLegacySmcSettings(effective);
+    applyGlobalRetroAchievementsSettings(effective);
     std::string build=storeGet(effective,"Wrapper/CoreBuild","4248");
     if(build!="4248"&&build!="3668") build="4248";
     std::string renderer=strcmp(storeGet(effective,"EmuCore/GS/Renderer","14"),"12")==0?"gl":"vk";
@@ -4304,8 +5063,8 @@ int main(int argc, char **argv){
     std::string coreSource="romfs:/cores/emucore_"+build+".so";
     std::string coreDestination=std::string(CORES_DIR)+"/libemucore_"+build+".so";
     std::string emulatorSource="romfs:/emu/NetherSX2_nx_"+renderer+".nro";
-    std::string emulatorDestination=std::string(DATA_DIR)+"/NetherSX2_nx_"+renderer+".nro";
-    emulatorNro="sdmc:/switch/nethersx2/NetherSX2_nx_"+renderer+".nro";
+    std::string emulatorDestination=std::string(EMU_HOST_DIR)+"/NetherSX2_nx_"+renderer+".nro";
+    emulatorNro=std::string(EMU_HOST_DIR)+"/NetherSX2_nx_"+renderer+".nro";
     bool haveCore=ensureCore(coreSource.c_str(),coreDestination.c_str(),build);
     bool haveEmulator=ensureEmu(emulatorSource.c_str(),emulatorDestination.c_str());
     bool haveResources=ensureResources(build);
@@ -4315,7 +5074,8 @@ int main(int argc, char **argv){
       storeSet(g_global,"Wrapper/CoreSo",corePath.c_str());
       storeSet(effective,"Wrapper/CoreSo",corePath.c_str());
     }
-    storeSet(effective,"EmuCore/DiscPath",toEmu(launchPath).c_str());
+    storeSet(effective,"Wrapper/BootBIOS",launchBios?"true":"false");
+    storeSet(effective,"EmuCore/DiscPath",launchBios?"":toEmu(launchPath).c_str());
     storeRemove(effective,"Wrapper/LauncherPath");
     storeRemove(effective,"Wrapper/GameConfigPath");
     storeRemove(effective,"Wrapper/GameCRCPath");

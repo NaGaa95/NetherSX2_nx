@@ -188,6 +188,20 @@ static void prefs_seed_defaults(void) {
   prefs_seed("Wrapper/FastmemMode", "hybrid");
   // core
   prefs_seed("EmuCore/EnableCheats", "0");
+
+  // The launcher persists the RetroAchievements token; this frontend is Casual-only.
+  prefs_seed("Achievements/Enabled", "false");
+  prefs_seed("Achievements/Username", "");
+  prefs_seed("Achievements/Token", "");
+  prefs_seed("Achievements/TestMode", "false");
+  prefs_seed("Achievements/UnofficialTestMode", "false");
+  prefs_seed("Achievements/RichPresence", "true");
+  prefs_seed("Achievements/ChallengeMode", "false");
+  prefs_seed("Achievements/Leaderboards", "false");
+  prefs_seed("Achievements/Notifications", "true");
+  prefs_seed("Achievements/SoundEffects", "true");
+  prefs_seed("Achievements/PrimedIndicators", "true");
+  prefs_seed("Achievements/NotificationsDuration", "5");
   // Fast boot: read the disc's SYSTEM.CNF and boot the game's ELF directly,
   // skipping the BIOS animation. Without it the core full-boots the BIOS, which
   // in our headless (no-UI) setup never hands off to the disc -- it boots to the

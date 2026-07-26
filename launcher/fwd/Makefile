@@ -6,7 +6,7 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    := ../romfs/fwd
 
 # cfg dir is hardcoded in main.c; don't pass it via -D (MSYS2 mangles leading-slash args).
-VERSION := 1.2.0
+VERSION := 1.2.1
 LTOFLAGS := -flto=auto -fuse-linker-plugin
 
 CFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs \

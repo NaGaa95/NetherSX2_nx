@@ -19,7 +19,8 @@ settings, then chainloads the emulator.
 The launcher supports multiple library folders across SD, USB mass storage, and SMB shares.
 
 **L + R + Plus** to open the quick menu for save states, controller rebinding,
-selectable per-game PNACH cheat codes, frame-limiter control, reset, and exit.
+selectable per-game PNACH cheat codes, RetroAchievements progress,
+frame-limiter control, reset, and exit.
 The cheat browser reads `/switch/nethersx2/cheats/<CRC>.pnach`, recognizes PNACH
 `[sections]` and legacy `// code name` blocks.
 
@@ -35,6 +36,7 @@ The launcher creates the rest of the folder tree on first run:
 ```
 /switch/NetherSX2.nro
 /switch/nethersx2/
+  .emu/         <- extracted when selected
   bios/         <- your PS2 BIOS dump           (you supply)
   resources/    <- shaders / GameIndex / fonts  (auto-extracted per core)
   covers/       <- cover art (<game-key>.png)
@@ -52,6 +54,12 @@ forwarder.
 
 A PS2 BIOS dump is required and must come from your own console; the launcher
 warns at startup when `bios/` is empty.
+
+Casual RetroAchievements are available from **Settings > RetroAchievements**.
+Sign in once in the launcher, then enable achievements before starting a game.
+Successful sign-in stores the returned account token in `launcher.ini`.
+Achievement progress and descriptions can be viewed during play from
+**L + R + Plus > Achievements**.
 
 LSFG 2x Frame Generation is available for the Vulkan renderer in
 **Settings > Frame Generation**.

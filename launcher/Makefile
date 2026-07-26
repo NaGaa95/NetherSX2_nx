@@ -24,7 +24,7 @@ ROMFS		:=	romfs		# bundles the emulator cores (cores/emucore_*.so)
 
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.2.0
+APP_VERSION	:=	1.2.1
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
