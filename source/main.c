@@ -545,7 +545,7 @@ static const struct { const char *tok; u64 hid; } hid_tokens[] = {
   { "Left", HidNpadButton_Left }, { "Right", HidNpadButton_Right },
 };
 
-// 16 PS2 digital targets in ini order: { ini key, PB_* bind, default Switch token }.
+// Bindable PS2 pad targets: { ini key, PB_* bind, default Switch token }.
 static const struct { const char *key; int bind; const char *def; } ps2_buttons[] = {
   { "Up", PB_UP, "Up" },         { "Down", PB_DOWN, "Down" },
   { "Left", PB_LEFT, "Left" },   { "Right", PB_RIGHT, "Right" },
@@ -555,8 +555,12 @@ static const struct { const char *key; int bind; const char *def; } ps2_buttons[
   { "L2", PB_L2, "ZL" },         { "R2", PB_R2, "ZR" },
   { "Select", PB_SELECT, "Minus" }, { "Start", PB_START, "Plus" },
   { "L3", PB_L3, "StickL" },     { "R3", PB_R3, "StickR" },
+  { "Analog", PB_ANALOG, "None" },
 };
 #define NUM_PS2_BUTTONS (sizeof(ps2_buttons) / sizeof(*ps2_buttons))
+#define QUICK_MAP_ANALOG_ACTION ((int)NUM_PS2_BUTTONS + 1)
+#define QUICK_MAP_BACK          (QUICK_MAP_ANALOG_ACTION + 1)
+#define QUICK_MAP_ITEM_COUNT    (QUICK_MAP_BACK + 1)
 
 typedef struct { int src; int invX, invY; } PadStick; // src: 0=LStick 1=RStick -1=none
 typedef struct {
@@ -824,6 +828,17 @@ static void quick_menu_release_inputs(void) {
   }
 }
 
+static bool quick_menu_toggle_analog(void) {
+  if (!nl.setPadValue || g_quick_menu_map_player < 0 ||
+      g_quick_menu_map_player >= g_controller_count)
+    return false;
+  // PadDualshock2 toggles only on the rising edge. Complete the release now so
+  // each menu activation produces exactly one virtual Analog-button press.
+  nl.setPadValue(fake_env, NATIVE_CLASS, g_quick_menu_map_player, PB_ANALOG, 1.0f);
+  nl.setPadValue(fake_env, NATIVE_CLASS, g_quick_menu_map_player, PB_ANALOG, 0.0f);
+  return true;
+}
+
 static bool quick_menu_item_available(int item) {
   if (item == QUICK_ITEM_ACHIEVEMENTS)
     return nl.isCheevosActive && nl.getCheevoList;
@@ -1010,7 +1025,7 @@ static void quick_menu_refresh_cheats(void) {
     return;
   }
   snprintf(g_quick_cheat_path, sizeof(g_quick_cheat_path),
-           DATA_ROOT "/cheats/%08X.pnach", crc);
+           CHEATS_DIR "/%08X.pnach", crc);
   g_quick_cheat_load_ok = nx_cheat_load(g_quick_cheat_path, &g_quick_cheats);
   if (g_quick_menu_cheat_selection > (int)g_quick_cheats.count)
     g_quick_menu_cheat_selection = (int)g_quick_cheats.count;
@@ -1153,7 +1168,7 @@ static void quick_menu_draw_achievements(void) {
 }
 
 static void quick_menu_draw_mapping(void) {
-  const int item_count = (int)NUM_PS2_BUTTONS + 2;
+  const int item_count = QUICK_MAP_ITEM_COUNT;
   const int first = g_quick_menu_map_selection > 3 ? g_quick_menu_map_selection - 3 : 0;
   int last = first + 7;
   if (last > item_count) last = item_count;
@@ -1167,11 +1182,13 @@ static void quick_menu_draw_mapping(void) {
       text_append(text, sizeof(text), "%s%s: %s\n", marker, ps2_buttons[bind].key,
                   pad_pref_string(g_quick_menu_map_player, ps2_buttons[bind].key,
                                   ps2_buttons[bind].def));
+    } else if (item == QUICK_MAP_ANALOG_ACTION) {
+      text_append(text, sizeof(text), "%sToggle analog mode\n", marker);
     } else {
       text_append(text, sizeof(text), "%sBack\n", marker);
     }
   }
-  text_append(text, sizeof(text), "\nA  Rebind     Y  Clear     B  Back");
+  text_append(text, sizeof(text), "\nA  Select/Rebind     Y  Clear     B  Back");
   quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
 }
 
@@ -1291,14 +1308,6 @@ static bool quick_menu_persist_launcher_setting(const char *key, const char *val
   return quick_menu_persist_setting(DATA_ROOT "/launcher.ini", key, value);
 }
 
-static bool quick_menu_persist_game_setting(const char *key, const char *value) {
-  const char *path = prefs_get_string("Wrapper/GameConfigPath", "");
-  static const char prefix[] = DATA_ROOT "/gamecfg/";
-  if (strncmp(path, prefix, sizeof(prefix) - 1) || strstr(path, "/../"))
-    return false;
-  return quick_menu_persist_setting(path, key, value);
-}
-
 static void quick_menu_persist_game_crc(void) {
   if (!__atomic_exchange_n(&g_game_crc_changed, 0, __ATOMIC_ACQ_REL)) return;
   const uint32_t crc = __atomic_load_n(&g_game_crc, __ATOMIC_ACQUIRE);
@@ -1327,29 +1336,12 @@ static void quick_menu_set_lsfg_enabled(bool enabled) {
 }
 #endif
 
-typedef enum {
-  QUICK_CHEAT_UPDATE_FAILED,
-  QUICK_CHEAT_UPDATE_OK,
-  QUICK_CHEAT_UPDATE_PROFILE_UNSAVED
-} QuickCheatUpdateResult;
-
-static QuickCheatUpdateResult quick_menu_set_cheat_enabled(unsigned index, bool enabled) {
+static bool quick_menu_set_cheat_enabled(unsigned index, bool enabled) {
   if (!g_quick_cheat_load_ok || index >= g_quick_cheats.count ||
       !nx_cheat_set_enabled(g_quick_cheat_path, index, enabled))
-    return QUICK_CHEAT_UPDATE_FAILED;
-
-  bool profile_saved = true;
-  if (enabled) {
-    // This is the core's master gate for cheats/<CRC>.pnach. Enabling an
-    // individual code also enables that gate for this game; disabling a code
-    // leaves the user's existing master setting untouched.
-    prefs_set_bool("EmuCore/EnableCheats", true);
-    quick_menu_save_prefs_preserving_messages();
-    nl.applySettings(fake_env, NATIVE_CLASS);
-    profile_saved = quick_menu_persist_game_setting("EmuCore/EnableCheats", "true");
-  }
+    return false;
   if (nl.reloadPatches) nl.reloadPatches(fake_env, NATIVE_CLASS);
-  return profile_saved ? QUICK_CHEAT_UPDATE_OK : QUICK_CHEAT_UPDATE_PROFILE_UNSAVED;
+  return true;
 }
 
 static bool quick_menu_store_binding(const char *token) {
@@ -1600,12 +1592,9 @@ static bool quick_menu_update(u64 down, u64 pressed) {
       bool enable = entry->enabled_count != entry->patch_count;
       if (pressed & HidNpadButton_Left) enable = false;
       if (pressed & HidNpadButton_Right) enable = true;
-      const QuickCheatUpdateResult result = quick_menu_set_cheat_enabled(
-          (unsigned)g_quick_menu_cheat_selection, enable);
-      if (result == QUICK_CHEAT_UPDATE_FAILED) {
+      if (!quick_menu_set_cheat_enabled(
+              (unsigned)g_quick_menu_cheat_selection, enable)) {
         quick_menu_status("Could not update the PNACH cheat file");
-      } else if (result == QUICK_CHEAT_UPDATE_PROFILE_UNSAVED) {
-        quick_menu_status("Code changed; per-game cheat gate could not be saved");
       } else {
         quick_menu_status(enable ? "Cheat code enabled" :
                                    "Cheat code disabled (reset may be required)");
@@ -1637,7 +1626,7 @@ static bool quick_menu_update(u64 down, u64 pressed) {
     return true;
   }
 
-  const int item_count = (int)NUM_PS2_BUTTONS + 2;
+  const int item_count = QUICK_MAP_ITEM_COUNT;
   if (pressed & HidNpadButton_Up)
     g_quick_menu_map_selection = (g_quick_menu_map_selection + item_count - 1) % item_count;
   if (pressed & HidNpadButton_Down)
@@ -1664,7 +1653,17 @@ static bool quick_menu_update(u64 down, u64 pressed) {
       quick_menu_draw_capture();
       return true;
     }
-    if (g_quick_menu_map_selection == item_count - 1) {
+    if (g_quick_menu_map_selection == QUICK_MAP_ANALOG_ACTION) {
+      if (quick_menu_toggle_analog()) {
+        char message[64];
+        snprintf(message, sizeof(message), "Analog mode toggled for player %d",
+                 g_quick_menu_map_player + 1);
+        quick_menu_status(message);
+      } else {
+        quick_menu_status("Analog toggle is unavailable");
+      }
+    }
+    if (g_quick_menu_map_selection == QUICK_MAP_BACK) {
       g_quick_menu_mode = QUICK_MENU_MAIN;
       quick_menu_draw_main();
       return true;
@@ -1797,6 +1796,10 @@ int main(void) {
 
   // settings store: load nethersx2.ini + seed OpenGL/folder defaults
   prefs_init(PREFS_PATH);
+  // The launcher and overlay both manage this fixed directory. Override stale
+  // 1.2.1 configs which incorrectly pointed the core at resources/.
+  prefs_set_string("Folders/Cheats", CHEATS_DIR);
+  prefs_set_bool("EmuCore/EnableCheats", true);
   // Enforce Casual mode and require complete credentials before startup.
   prefs_set_bool("Achievements/ChallengeMode", false);
   prefs_set_bool("Achievements/Leaderboards", false);

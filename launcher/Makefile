@@ -24,7 +24,8 @@ ROMFS		:=	romfs		# bundles the emulator cores (cores/emucore_*.so)
 
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.2.1
+APP_VERSION	:=	1.2.2
+RELEASE_VERSION	?=	$(APP_VERSION)
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
@@ -37,7 +38,8 @@ CFLAGS	:=	`$(PREFIX)pkg-config --cflags $(PKGS)` -Wall -Wextra -O3 -DNDEBUG $(LT
 			-ffile-prefix-map=$(CURDIR)=. -fmacro-prefix-map=$(CURDIR)=. \
 			$(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 \
-			-DNETHERSX2_VERSION='"$(APP_VERSION)"'
+			-DNETHERSX2_VERSION='"$(APP_VERSION)"' \
+			-DNETHERSX2_RELEASE_VERSION='"$(RELEASE_VERSION)"'
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -std=gnu++17
 

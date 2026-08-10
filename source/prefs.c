@@ -155,8 +155,8 @@ static void prefs_seed_defaults(void) {
   prefs_seed("Folders/Covers",        DATA_ROOT "/covers");
   prefs_seed("Folders/GameSettings",  DATA_ROOT "/gamesettings");
   prefs_seed("Folders/InputProfiles", DATA_ROOT "/inputprofiles");
-  // Cheats live alongside the resources (cheats_ni/ws.zip ship in assets/).
-  prefs_seed("Folders/Cheats",        RESOURCES_DIR);
+  // User PNACH cheats are separate from the built-in widescreen/NI archives.
+  prefs_seed("Folders/Cheats",        CHEATS_DIR);
   prefs_seed("Folders/Logs",          DATA_ROOT "/logs");
   prefs_seed("Folders/Resources",     RESOURCES_DIR);
 
@@ -187,7 +187,9 @@ static void prefs_seed_defaults(void) {
   prefs_seed("Wrapper/LSFGPerformance", "true");
   prefs_seed("Wrapper/FastmemMode", "hybrid");
   // core
-  prefs_seed("EmuCore/EnableCheats", "0");
+  // Individual codes are controlled by commenting their patch lines. Keep the
+  // core gate open so an enabled code is never hidden behind a second switch.
+  prefs_seed("EmuCore/EnableCheats", "true");
 
   // The launcher persists the RetroAchievements token; this frontend is Casual-only.
   prefs_seed("Achievements/Enabled", "false");

@@ -43,6 +43,7 @@ The launcher creates the rest of the folder tree on first run:
   gamecfg/      <- per-game launcher settings
   lsfg/         <- optional user-supplied Lossless.dll
   forwarders/   <- HOME shortcut launch records
+  hidden.ini    <- hidden library entries
   launcher.ini  <- the launcher's saved config
 ```
 

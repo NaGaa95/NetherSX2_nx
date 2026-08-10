@@ -29,6 +29,7 @@
 // root, keeping the core off its Java FileHelper (SAF) bridge.
 #define DATA_ROOT      "/switch/nethersx2"
 #define RESOURCES_DIR  DATA_ROOT "/resources"
+#define CHEATS_DIR     DATA_ROOT "/cheats"
 #define BIOS_DIR       DATA_ROOT "/bios"
 #define CACHE_DIR      DATA_ROOT "/cache"
 #define PREFS_NAME     "nethersx2.ini"

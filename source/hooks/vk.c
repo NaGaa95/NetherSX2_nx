@@ -109,23 +109,6 @@ static int file_readable(const char *path) {
   return 1;
 }
 
-/* LSFG's extracted compute shaders require NVK's mapped descriptor/UBO
- * constant-buffer path to be disabled. This must be set before instance
- * creation because NVK snapshots its debug flags there. */
-static int enable_nvk_no_cbuf(void) {
-  const char *current = getenv("NVK_DEBUG");
-  if (current && strstr(current, "no_cbuf")) return 1;
-  if (!current || !current[0]) return setenv("NVK_DEBUG", "no_cbuf", 1) == 0;
-
-  const size_t length = strlen(current);
-  char *combined = malloc(length + sizeof(",no_cbuf"));
-  if (!combined) return 0;
-  snprintf(combined, length + sizeof(",no_cbuf"), "%s,no_cbuf", current);
-  const int result = setenv("NVK_DEBUG", combined, 1) == 0;
-  free(combined);
-  return result;
-}
-
 static void lsfg_destroy_runtime(void) {
   if (lsfg_runtime) {
     lsfg_nx_destroy(lsfg_runtime);
@@ -779,8 +762,6 @@ vkCreateInstance_hook(const VkInstanceCreateInfo *ci,
   int lsfg_launch_prepared =
       prefs_get_bool("Wrapper/LSFGEnabled", false) &&
       file_readable(lsfg_dll_path());
-  if (lsfg_launch_prepared && !enable_nvk_no_cbuf())
-    lsfg_launch_prepared = 0;
 
   uint32_t n = ci->enabledExtensionCount;
   const char **ext = malloc(sizeof(char *) * (n ? n : 1));
