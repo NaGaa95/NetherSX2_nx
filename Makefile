@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.2.2
+APP_VERSION	:=	1.2.3
 BUILD		:=	build
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
@@ -37,6 +37,10 @@ DEFINES	:=	-D__SWITCH__ -DNETHERSX2 -DCURL_STATICLIB \
 #   make             -> OpenGL (switch-mesa GLES, unchanged)
 #   make RENDERER=VK -> Vulkan (Mesa NVK, vendored flat under vulkan/)
 RENDERER ?= GL
+MESA_SDK_ROOT ?=
+ifneq ($(strip $(MESA_SDK_ROOT)),)
+DEFINES += -DUSE_UNIFIED_MESA
+endif
 ifeq ($(RENDERER),VK)
 DEFINES	+=	-DUSE_VULKAN -DGS_RENDERER=14 -DVK_USE_PLATFORM_VI_NN
 SOURCES	+=	source/lsfg \
@@ -57,10 +61,7 @@ endif
 CFLAGS	:=	-g -Wall -O3 -ffunction-sections -fno-omit-frame-pointer $(LTOFLAGS) \
 			$(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
-CXXFLAGS	:= $(CFLAGS)
-ifeq ($(RENDERER),VK)
-CXXFLAGS	+= -std=gnu++20
-endif
+CXXFLAGS	:= $(CFLAGS) -std=gnu++20
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) $(LTOFLAGS) -Wl,-Map,$(notdir $*.map)
@@ -71,6 +72,15 @@ STORAGE_LIBS := $(TOPDIR)/launcher/dependencies/build/_deps/libsmb2-build/lib/li
 # nx: libnx (audren for the AAudio shim, HID, applet, fs). m: libm. No SDL2/
 # OpenSL ES -- audio is the in-tree AAudio->audren shim (source/aaudio.c).
 ifeq ($(RENDERER),VK)
+ifneq ($(strip $(MESA_SDK_ROOT)),)
+# Unified Mesa SDK: the Vulkan driver and all private Mesa dependencies are
+# packaged in one archive. External dependencies stay in devkitPro portlibs.
+LIBDIRS	:= $(MESA_SDK_ROOT) $(PORTLIBS) $(LIBNX)
+LIBS	:= -Wl,--start-group -lvulkan -lEGL -lGLESv2 -lglapi \
+		-lmesa_util_c11 -lblake3 -lmesa_util -lmesa_util_simd -lxmlconfig \
+		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lelf -lexpat -lz -lzstd \
+		-lnx -lstdc++ -lm
+else
 # Mesa NVK: 23 vendored static archives (vulkan/lib) linked in one --start-group
 # (circular NVK<->runtime<->nir<->compiler deps). -l:libX.a links by exact file
 # name (avoids the -lvulkan GROUP-script + the double-prefixed liblibnil...a).
@@ -87,10 +97,21 @@ LIBS	:= -Wl,--start-group \
 		-l:libnir.a -l:libcompiler.a -l:libcompiler_c_helpers.a \
 		-l:libmesa_util.a -l:libmesa_util_simd.a -l:libblake3.a -l:libmesa_util_c11.a \
 		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lz -lzstd -lnx -lstdc++ -lm
+endif
+else
+ifneq ($(strip $(MESA_SDK_ROOT)),)
+# The unified EGL archive contains both native NVC0 and Zink. Keep Vulkan in
+# the same rescan group so the GL host can select either driver at runtime.
+LIBDIRS	:= $(MESA_SDK_ROOT) $(PORTLIBS) $(LIBNX)
+LIBS	:= -Wl,--start-group -lvulkan -lEGL -lGLESv2 -lglapi \
+		-lmesa_util_c11 -lblake3 -lmesa_util -lmesa_util_simd -lxmlconfig \
+		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lelf -lexpat -lz -lzstd \
+		-lnx -lstdc++ -lm
 else
 # EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
 LIBS	:= $(STORAGE_LIBS) -lcurl -lz -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
+endif
 endif
 
 #---------------------------------------------------------------------------------

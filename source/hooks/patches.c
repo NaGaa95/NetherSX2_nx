@@ -74,6 +74,66 @@ CoreVersion g_core_version = CORE_VER_UNKNOWN;
 
 int core_is_3668(void) { return g_core_version == CORE_VER_V22N_3668; }
 
+typedef struct {
+  uintptr_t object;
+  uintptr_t destructor;
+} MtgsOffsets;
+
+static const MtgsOffsets g_mtgs_4248 = {0xc6adff0, 0x4add70};
+static const MtgsOffsets g_mtgs_3668 = {0xc6a0e80, 0x49ed60};
+static void (*g_mtgs_destructor)(void *);
+static void *g_mtgs_argument;
+static int g_mtgs_destructor_registered;
+static int g_mtgs_destructor_called;
+
+static const MtgsOffsets *mtgs_offsets(void) {
+  return g_core_version == CORE_VER_V22N_4248 ? &g_mtgs_4248 :
+         g_core_version == CORE_VER_V22N_3668 ? &g_mtgs_3668 : NULL;
+}
+
+static void mtgs_destructor_once(void *unused) {
+  (void)unused;
+  core_shutdown_mtgs();
+}
+
+int core_wrap_destructor(void (**destructor)(void *), void **argument) {
+  const MtgsOffsets *offsets = mtgs_offsets();
+  if (!offsets || !destructor || !argument)
+    return 0;
+
+  const uintptr_t base = (uintptr_t)emu_mod.load_virtbase;
+  if ((uintptr_t)*destructor != base + offsets->destructor ||
+      (uintptr_t)*argument != base + offsets->object)
+    return 0;
+
+  g_mtgs_destructor = *destructor;
+  g_mtgs_argument = *argument;
+  g_mtgs_destructor_registered = 1;
+  *destructor = mtgs_destructor_once;
+  *argument = NULL;
+  return 1;
+}
+
+int core_shutdown_mtgs(void) {
+  const MtgsOffsets *offsets = mtgs_offsets();
+  if (!offsets || !g_mtgs_destructor_registered || !g_mtgs_destructor ||
+      !g_mtgs_argument || offsets->destructor + 8 > emu_mod.load_size)
+    return -1;
+
+  const uintptr_t base = (uintptr_t)emu_mod.load_virtbase;
+  const uint32_t *code = (const uint32_t *)(base + offsets->destructor);
+  if (code[0] != 0xa9bd7bfd || code[1] != 0xf9000bf5 ||
+      (uintptr_t)g_mtgs_destructor != base + offsets->destructor ||
+      (uintptr_t)g_mtgs_argument != base + offsets->object)
+    return -1;
+
+  if (__atomic_exchange_n(&g_mtgs_destructor_called, 1, __ATOMIC_ACQ_REL))
+    return 0;
+
+  g_mtgs_destructor(g_mtgs_argument);
+  return 1;
+}
+
 int core_shutdown_achievements(void) {
   typedef struct {
     uintptr_t shutdown;
@@ -107,33 +167,6 @@ int core_shutdown_achievements(void) {
     return -1;
 
   return ((int (*)(void))(base + offsets->shutdown))() ? 1 : 0;
-}
-
-int core_shutdown_mtgs(void) {
-  typedef struct {
-    uintptr_t object;
-    uintptr_t destructor;
-  } MtgsOffsets;
-  static const MtgsOffsets offsets_4248 = {0xc6adff0, 0x4add70};
-  static const MtgsOffsets offsets_3668 = {0xc6a0e80, 0x49ed60};
-
-  const MtgsOffsets *offsets = g_core_version == CORE_VER_V22N_4248 ? &offsets_4248 :
-                               g_core_version == CORE_VER_V22N_3668 ? &offsets_3668 : NULL;
-  if (!offsets || offsets->object + 0xb0 > emu_mod.load_size ||
-      offsets->destructor + 8 > emu_mod.load_size)
-    return -1;
-
-  const uintptr_t base = (uintptr_t)emu_mod.load_virtbase;
-  const uint32_t *code = (const uint32_t *)(base + offsets->destructor);
-  if (code[0] != 0xa9bd7bfd || code[1] != 0xf9000bf5)
-    return -1;
-
-  void *object = (void *)(base + offsets->object);
-  if (!*(void **)((uintptr_t)object + 0xa8))
-    return 0;
-
-  ((void (*)(void *))(base + offsets->destructor))(object);
-  return 1;
 }
 
 static int in_range(uint32_t off, uint32_t sz) {

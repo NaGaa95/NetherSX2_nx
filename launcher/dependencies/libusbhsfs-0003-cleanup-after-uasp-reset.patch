@@ -1,0 +1,67 @@
+diff --git a/source/usbhsfs_drive.c b/source/usbhsfs_drive.c
+--- a/source/usbhsfs_drive.c
++++ b/source/usbhsfs_drive.c
+@@ -669,23 +669,26 @@ static void usbHsFsDriveDestroyLogicalUnitContext(UsbHsFsDriveLogicalUnitContext
+ {
+-    if (!lun_ctx || !usbHsFsDriveIsValidContext((UsbHsFsDriveContext*)lun_ctx->drive_ctx) || lun_ctx->lun >= UMS_MAX_LUN) return;
++    if (!lun_ctx || lun_ctx->lun >= UMS_MAX_LUN) return;
++
++    const bool drive_valid =
++        usbHsFsDriveIsValidContext((UsbHsFsDriveContext*)lun_ctx->drive_ctx);
+ 
+     if (lun_ctx->fs_ctx)
+     {
+         /* Destroy filesystem contexts. */
+         for(u32 i = 0; i < lun_ctx->fs_count; i++)
+         {
+             UsbHsFsDriveLogicalUnitFileSystemContext *fs_ctx = lun_ctx->fs_ctx[i];
+             if (!fs_ctx) continue;
+ 
+             usbHsFsMountDestroyLogicalUnitFileSystemContext(fs_ctx);
+             free(fs_ctx);
+         }
+ 
+         /* Free filesystem context pointer array. */
+         free(lun_ctx->fs_ctx);
+         lun_ctx->fs_ctx = NULL;
+     }
+ 
+     /* Stop current LUN. */
+-    if (stop_lun) usbHsFsScsiStopDriveLogicalUnit(lun_ctx);
++    if (stop_lun && drive_valid) usbHsFsScsiStopDriveLogicalUnit(lun_ctx);
+ }
+diff --git a/source/usbhsfs_mount.c b/source/usbhsfs_mount.c
+--- a/source/usbhsfs_mount.c
++++ b/source/usbhsfs_mount.c
+@@ -294,5 +294,28 @@ void usbHsFsMountDestroyLogicalUnitFileSystemContext(UsbHsFsDriveLogicalUnitFile
+ {
+-    if (!usbHsFsDriveIsValidLogicalUnitFileSystemContext(fs_ctx)) return;
++    if (!fs_ctx || !fs_ctx->lun_ctx || !fs_ctx->name || !fs_ctx->cwd || !fs_ctx->device)
++        return;
++
++    /* Endpoint recovery can deliberately invalidate a drive before the
++     * manager tears it down. Local filesystem/devoptab objects must still be
++     * unregistered in that case, even though no more media I/O is possible. */
++    switch(fs_ctx->fs_type)
++    {
++        case UsbHsFsDriveLogicalUnitFileSystemType_FAT:
++            if (!fs_ctx->fatfs) return;
++            break;
++#ifdef USBHSFS_NTFS
++        case UsbHsFsDriveLogicalUnitFileSystemType_NTFS:
++            if (!fs_ctx->ntfs) return;
++            break;
++#endif
++#ifdef USBHSFS_EXT4
++        case UsbHsFsDriveLogicalUnitFileSystemType_EXT:
++            if (!fs_ctx->ext) return;
++            break;
++#endif
++        default:
++            return;
++    }
+ 
+     char name[MOUNT_NAME_LENGTH] = {0};
+     u32 *tmp_device_ids = NULL;
+
+

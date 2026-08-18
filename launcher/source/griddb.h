@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -8,6 +9,7 @@ enum {
   GRIDDB_NO_NET,
   GRIDDB_NOT_FOUND,
   GRIDDB_ERROR,
+  GRIDDB_CANCELLED,
 };
 
 struct GridDbGameResult {
@@ -23,15 +25,21 @@ struct GridDbArtwork {
 };
 
 int griddb_search_games(const std::string &apiKey, const std::string &title,
-                        std::vector<GridDbGameResult> &results);
+                        std::vector<GridDbGameResult> &results,
+                        const std::atomic_bool *cancel = nullptr);
 int griddb_fetch_artworks(const std::string &apiKey, long gameId,
-                          std::vector<GridDbArtwork> &artworks);
-int griddb_download_image(const std::string &url, const std::string &outPath);
+                          std::vector<GridDbArtwork> &artworks,
+                          const std::atomic_bool *cancel = nullptr);
+int griddb_download_image(const std::string &url, const std::string &outPath,
+                          const std::atomic_bool *cancel = nullptr);
 
 int griddb_fetch_cover(const std::string &apiKey, const std::string &title,
-                       const std::string &outPath);
+                       const std::string &outPath,
+                       const std::atomic_bool *cancel = nullptr);
 
-int griddb_fetch_icons(const std::string &key, const std::string &title, const std::string &outDir, int maxCount);
+int griddb_fetch_icons(const std::string &key, const std::string &title,
+                       const std::string &outDir, int maxCount,
+                       const std::atomic_bool *cancel = nullptr);
 
 bool griddb_global_init(void);
 void griddb_global_exit(void);

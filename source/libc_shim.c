@@ -33,6 +33,7 @@
 #include "util.h"
 #include "so_util.h"
 #include "libc_shim.h"
+#include "hooks.h"
 
 // ---------------------------------------------------------------------------
 // fortify (_chk) wrappers: ignore the object-size argument
@@ -156,6 +157,7 @@ static int core_finalized;
 
 int __cxa_atexit_fake(void (*destructor)(void *), void *argument, void *dso_handle) {
   (void)dso_handle;
+  core_wrap_destructor(&destructor, &argument);
   return __cxa_atexit(destructor, argument, &core_dso_handle);
 }
 

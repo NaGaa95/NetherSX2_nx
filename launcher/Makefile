@@ -24,7 +24,7 @@ ROMFS		:=	romfs		# bundles the emulator cores (cores/emucore_*.so)
 
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.2.2
+APP_VERSION	:=	1.2.3
 RELEASE_VERSION	?=	$(APP_VERSION)
 
 #---------------------------------------------------------------------------------
@@ -41,7 +41,7 @@ CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OF
 			-DNETHERSX2_VERSION='"$(APP_VERSION)"' \
 			-DNETHERSX2_RELEASE_VERSION='"$(RELEASE_VERSION)"'
 
-CXXFLAGS	:= $(CFLAGS) -fno-rtti -std=gnu++17
+CXXFLAGS	:= $(CFLAGS) -fno-rtti -std=gnu++20
 
 ASFLAGS	:=	$(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) $(LTOFLAGS) -Wl,-Map,$(notdir $*.map) \
@@ -118,12 +118,15 @@ ifneq ($(APP_TITLEID),)
 	export NACPFLAGS += --titleid=$(APP_TITLEID)
 endif
 
-.PHONY: $(BUILD) clean all
+.PHONY: $(BUILD) clean all forwarder-assets
 
 #---------------------------------------------------------------------------------
-all: $(BUILD)
+all: forwarder-assets $(BUILD)
 
-$(BUILD):
+forwarder-assets:
+	@$(MAKE) --no-print-directory -C $(TOPDIR)/fwd
+
+$(BUILD): forwarder-assets
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 

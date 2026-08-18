@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -21,7 +22,7 @@
 #include <unistd.h>
 
 #ifndef NETHERSX2_RELEASE_VERSION
-#define NETHERSX2_RELEASE_VERSION "1.2.2"
+#define NETHERSX2_RELEASE_VERSION "1.2.3"
 #endif
 
 #ifndef NETHERSX2_VERSION
@@ -46,6 +47,24 @@ namespace
 	std::atomic_bool s_cancel{false};
 	std::atomic_uint64_t s_downloaded{0};
 	std::atomic_uint64_t s_total{0};
+	std::mutex s_wakeMutex;
+	LauncherUpdateWakeCallback s_wakeCallback=nullptr;
+	void *s_wakeUserData=nullptr;
+	std::atomic_uint64_t s_lastProgressWakeMs{0};
+
+	void NotifyWake(bool throttle=false)
+	{
+		if(throttle)
+		{
+			const auto now=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count());
+			std::uint64_t previous=s_lastProgressWakeMs.load(std::memory_order_relaxed);
+			if(now-previous<100||!s_lastProgressWakeMs.compare_exchange_strong(
+				previous,now,std::memory_order_relaxed))return;
+		}
+		std::scoped_lock lock(s_wakeMutex);
+		if(s_wakeCallback)s_wakeCallback(s_wakeUserData);
+	}
 
 	bool StartsWith(std::string_view value, std::string_view prefix)
 	{
@@ -467,6 +486,7 @@ namespace
 			s_total.store(static_cast<std::uint64_t>(total), std::memory_order_relaxed);
 		if (current >= 0)
 			s_downloaded.store(static_cast<std::uint64_t>(current), std::memory_order_relaxed);
+		NotifyWake(true);
 		return s_cancel.load(std::memory_order_relaxed) ? 1 : 0;
 	}
 
@@ -687,31 +707,35 @@ bool LauncherUpdate_StartCheck(const std::string& installedTag)
 		s_release = {};
 		s_error.clear();
 	}
+	NotifyWake();
 	s_worker = std::thread([installedTag] {
 		LauncherReleaseInfo release;
 		std::string error;
 		const bool success = FetchLatestRelease(release, error);
-		std::scoped_lock lock(s_mutex);
-		if (!success)
 		{
-			s_error = std::move(error);
-			s_state = s_cancel.load(std::memory_order_relaxed)
-				? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
-			return;
-		}
-		s_release = std::move(release);
-		if (LauncherUpdate_IsNewer(s_release.tag, installedTag))
-		{
-			if (s_release.assetUrl.empty())
+			std::scoped_lock lock(s_mutex);
+			if (!success)
 			{
-				s_error = "The latest release does not contain a downloadable NRO asset.";
-				s_state = LauncherUpdateState::Error;
+				s_error = std::move(error);
+				s_state = s_cancel.load(std::memory_order_relaxed)
+					? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
 			}
 			else
-				s_state = LauncherUpdateState::UpdateAvailable;
+			{
+				s_release = std::move(release);
+				if (LauncherUpdate_IsNewer(s_release.tag, installedTag))
+				{
+					if (s_release.assetUrl.empty())
+					{
+						s_error = "The latest release does not contain a downloadable NRO asset.";
+						s_state = LauncherUpdateState::Error;
+					}
+					else s_state = LauncherUpdateState::UpdateAvailable;
+				}
+				else s_state = LauncherUpdateState::UpToDate;
+			}
 		}
-		else
-			s_state = LauncherUpdateState::UpToDate;
+		NotifyWake();
 	});
 	return true;
 }
@@ -734,18 +758,21 @@ bool LauncherUpdate_StartDownload(const std::string& launcherPath)
 		s_error.clear();
 		s_state = LauncherUpdateState::Downloading;
 	}
+	NotifyWake();
 	s_worker = std::thread([release = std::move(release), launcherPath] {
 		std::string error;
 		const bool success = DownloadRelease(release, launcherPath, error);
-		std::scoped_lock lock(s_mutex);
-		if (success)
-			s_state = LauncherUpdateState::ReadyToInstall;
-		else
 		{
-			s_error = std::move(error);
-			s_state = s_cancel.load(std::memory_order_relaxed)
-				? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
+			std::scoped_lock lock(s_mutex);
+			if (success)s_state = LauncherUpdateState::ReadyToInstall;
+			else
+			{
+				s_error = std::move(error);
+				s_state = s_cancel.load(std::memory_order_relaxed)
+					? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
+			}
 		}
+		NotifyWake();
 	});
 	return true;
 }
@@ -758,6 +785,7 @@ bool LauncherUpdate_InstallDownloaded(const std::string& launcherPath)
 			return false;
 		s_state = LauncherUpdateState::Installing;
 	}
+	NotifyWake();
 	JoinWorker();
 	std::string error;
 	const bool success = ReplaceLauncher(launcherPath, launcherPath + ".update.tmp", error);
@@ -771,12 +799,14 @@ bool LauncherUpdate_InstallDownloaded(const std::string& launcherPath)
 			s_state = LauncherUpdateState::Error;
 		}
 	}
+	NotifyWake();
 	return success;
 }
 
 void LauncherUpdate_Cancel()
 {
 	s_cancel.store(true, std::memory_order_relaxed);
+	NotifyWake();
 }
 
 LauncherUpdateSnapshot LauncherUpdate_GetSnapshot()
@@ -797,6 +827,14 @@ void LauncherUpdate_Shutdown()
 {
 	s_cancel.store(true, std::memory_order_relaxed);
 	JoinWorker();
+	LauncherUpdate_SetWakeCallback(nullptr);
+}
+
+void LauncherUpdate_SetWakeCallback(LauncherUpdateWakeCallback callback,void *user_data)
+{
+	std::scoped_lock lock(s_wakeMutex);
+	s_wakeCallback=callback;
+	s_wakeUserData=callback?user_data:nullptr;
 }
 
 bool LauncherUpdate_RecoverInstallation(const std::string& launcherPath, std::string& error)

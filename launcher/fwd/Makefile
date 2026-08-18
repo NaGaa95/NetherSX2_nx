@@ -6,7 +6,8 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    := ../romfs/fwd
 
 # cfg dir is hardcoded in main.c; don't pass it via -D (MSYS2 mangles leading-slash args).
-VERSION := 1.2.2
+VERSION := 1.2.3
+AUTHOR := naga
 LTOFLAGS := -flto=auto -fuse-linker-plugin
 
 CFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs \
@@ -28,8 +29,8 @@ $(OUT)/hbl.nso: hbl.elf | $(OUT)
 $(OUT)/hbl.npdm: hbl.json | $(OUT)
 	$(TOOLS)/npdmtool $< $@
 
-$(OUT)/default.nacp: | $(OUT)
-	$(TOOLS)/nacptool --create NetherSX2 NetherSX2 $(VERSION) $@
+$(OUT)/default.nacp: Makefile | $(OUT)
+	$(TOOLS)/nacptool --create NetherSX2 $(AUTHOR) $(VERSION) $@
 
 $(OUT):
 	@mkdir -p $(OUT)

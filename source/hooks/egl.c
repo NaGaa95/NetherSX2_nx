@@ -66,6 +66,32 @@ int egl_gl_thread_holds_context(void) {
   return tls_holds_context;
 }
 
+void egl_gl_shutdown(void) {
+  // The core owns its surfaces and contexts, so its registered destructors must
+  // run first. Once every core thread has stopped, terminate the display itself
+  // so Mesa does not retain EGL/GL state while hbloader chain-loads the launcher.
+  release_gl_ownership();
+
+  pthread_mutex_lock(&gl_owner_mutex);
+  const EGLDisplay dpy = last_dpy;
+  pthread_mutex_unlock(&gl_owner_mutex);
+
+  if (dpy == EGL_NO_DISPLAY)
+    return;
+
+  eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglTerminate(dpy);
+  eglReleaseThread();
+
+  pthread_mutex_lock(&gl_owner_mutex);
+  gl_owner_valid = 0;
+  pthread_mutex_unlock(&gl_owner_mutex);
+  tls_holds_context = 0;
+  main_real_context = EGL_NO_CONTEXT;
+  main_window_surface = EGL_NO_SURFACE;
+  last_dpy = EGL_NO_DISPLAY;
+}
+
 static EGLint attrib_value(const EGLint *attribs, EGLint key, EGLint fallback) {
   if (!attribs)
     return fallback;
@@ -206,14 +232,12 @@ EGLSurface eglCreatePbufferSurfaceHook(EGLDisplay dpy, EGLConfig config,
 EGLBoolean eglDestroySurfaceHook(EGLDisplay dpy, EGLSurface surface) {
   FakePbuffer *fake = fake_pbuffer_from_surface(surface);
   if (fake) {
-
     free(fake);
     return EGL_TRUE;
   }
   if (surface == main_window_surface)
     main_window_surface = EGL_NO_SURFACE;
   EGLBoolean r = eglDestroySurface(dpy, surface);
-
   return r;
 }
 
@@ -221,7 +245,6 @@ EGLBoolean eglDestroyContextHook(EGLDisplay dpy, EGLContext ctx) {
   if (ctx == main_real_context)
     main_real_context = EGL_NO_CONTEXT;
   EGLBoolean r = eglDestroyContext(dpy, ctx);
-
   return r;
 }
 

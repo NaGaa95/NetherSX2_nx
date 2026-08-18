@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -488,10 +489,11 @@ NcaEntry create_control_nca(u64 tid, const u8 *key, const FileEntries &romfs)
 
 struct MetaResult {
     std::vector<u8> nca;
-    u8 hash[SHA256_HASH_SIZE];
+    u8 hash[SHA256_HASH_SIZE]{};
     NcmContentMetaKey key{};
     FwdContentStorageRecord record{};
-    NcmContentMetaData data{};
+    std::vector<u8> data;
+    std::vector<NcmContentId> contentIds;
 };
 
 MetaResult create_meta_nca(u64 tid, const u8 *key, NcmStorageId storage_id, const std::vector<NcaEntry> &ncas)
@@ -557,15 +559,20 @@ MetaResult create_meta_nca(u64 tid, const u8 *key, NcmStorageId storage_id, cons
     r.record.key = r.key;
     r.record.storage_id = storage_id;
 
-    r.data.header = out_header;
-    r.data.extended = cnmt_extended;
-    std::memcpy(&r.data.infos[0].content_id, nca_entry.hash, sizeof(r.data.infos[0].content_id));
-    r.data.infos[0].content_type = nca_entry.type;
-    r.data.infos[0].attr = 0;
-    ncmU64ToContentInfoSize(cnmt_buf.buf.size(), &r.data.infos[0]);
-    r.data.infos[0].id_offset = 0;
-    r.data.infos[1] = packaged_content_info[0].info;
-    r.data.infos[2] = packaged_content_info[1].info;
+    std::vector<NcmContentInfo> infos(contentCount+1);
+    std::memcpy(&infos[0].content_id, nca_entry.hash, sizeof(infos[0].content_id));
+    infos[0].content_type = nca_entry.type;
+    infos[0].attr = 0;
+    ncmU64ToContentInfoSize(nca_entry.data.size(), &infos[0]);
+    infos[0].id_offset = 0;
+    infos[1] = packaged_content_info[0].info;
+    infos[2] = packaged_content_info[1].info;
+    BufHelper metadata;
+    metadata.write(&out_header,sizeof(out_header));
+    metadata.write(&cnmt_extended,sizeof(cnmt_extended));
+    metadata.write(infos.data(),infos.size()*sizeof(infos[0]));
+    r.data=std::move(metadata.buf);
+    for(const auto &info:infos) r.contentIds.push_back(info.content_id);
     return r;
 }
 
@@ -629,20 +636,17 @@ bool patch_npdm(std::vector<u8> &npdm, u64 tid)
     return true;
 }
 
-void patch_nacp(NacpStruct &nacp, const std::string &name, const std::string &author, u64 tid)
+void patch_nacp(NacpStruct &nacp, const std::string &name, u64 tid)
 {
     for (auto &lang : nacp.lang) {
         if (!name.empty()) {
             std::memset(lang.name, 0, sizeof(lang.name));
             std::strncpy(lang.name, name.c_str(), sizeof(lang.name) - 1);
         }
-        if (!author.empty()) {
-            std::memset(lang.author, 0, sizeof(lang.author));
-            std::strncpy(lang.author, author.c_str(), sizeof(lang.author) - 1);
-        }
     }
-    std::memset(nacp.display_version, 0, sizeof(nacp.display_version));
-    std::strncpy(nacp.display_version, NETHERSX2_VERSION, sizeof(nacp.display_version) - 1);
+    // The bundled default.nacp is the single source of truth for launcher and
+    // shortcut author/version metadata. Per-game creation patches only the
+    // display name and identity/policy fields below.
     nacp.startup_user_account = 0x00;
     nacp.user_account_switch_lock = 0x00;
     nacp.add_on_content_registration_type = 0x01;
@@ -998,7 +1002,116 @@ struct ContentMetaBackup
 {
     bool existed{};
     std::vector<u8> data;
+    std::vector<NcmContentId> contentIds;
 };
+
+bool contentIdsEqual(const NcmContentId &left,const NcmContentId &right)
+{
+    return std::memcmp(&left,&right,sizeof(left))==0;
+}
+
+bool readForwarderConfig(const std::string &path,std::string &nroPath,std::string &args)
+{
+    if(!validateForwarderConfig(path))return false;
+    struct stat st{};
+    if(stat(path.c_str(),&st)!=0)return false;
+    std::vector<char> data(static_cast<size_t>(st.st_size));
+    FILE *file=fopen(path.c_str(),"rb");
+    if(!file)return false;
+    const bool ok=fread(data.data(),1,data.size(),file)==data.size()&&!ferror(file);
+    if(fclose(file)!=0||!ok)return false;
+    const auto first=std::find(data.begin(),data.end(),'\0');
+    nroPath.assign(data.begin(),first);
+    args.assign(first+1,data.end()-1);
+    return true;
+}
+
+struct LegacyForwarderConfig { u64 tid{}; std::string path; };
+
+std::vector<LegacyForwarderConfig> findLegacyForwarders(const std::string &gameKey,u64 stableTid)
+{
+    constexpr const char *directoryPath="sdmc:/switch/nethersx2/forwarders";
+    std::vector<LegacyForwarderConfig> found;
+    DIR *directory=opendir(directoryPath);
+    if(!directory)return found;
+    const std::string suffix=" -g \""+gameKey+"\"";
+    struct dirent *entry=nullptr;
+    while(found.size()<32&&(entry=readdir(directory))){
+        const std::string filename=entry->d_name;
+        if(filename.size()!=20||filename.compare(16,4,".cfg")!=0)continue;
+        char *end=nullptr;
+        const std::string stem=filename.substr(0,16);
+        const unsigned long long parsed=strtoull(stem.c_str(),&end,16);
+        if(!end||*end)continue;
+        const u64 tid=static_cast<u64>(parsed);
+        if(tid==stableTid||(tid&UINT64_C(0xff00000000000fff))!=UINT64_C(0x0500000000000000))continue;
+        const std::string path=std::string(directoryPath)+"/"+filename;
+        std::string oldNro,oldArgs;
+        if(!readForwarderConfig(path,oldNro,oldArgs)||oldNro.empty()||oldArgs!=oldNro+suffix)continue;
+        found.push_back({tid,path});
+    }
+    closedir(directory);
+    return found;
+}
+
+void removeLegacyForwarders(const std::vector<LegacyForwarderConfig> &legacy)
+{
+    for(const auto &item:legacy){
+        if(R_SUCCEEDED(nsDeleteApplicationCompletely(item.tid))){
+            remove(item.path.c_str());
+            remove((item.path+".old").c_str());
+            remove((item.path+".tmp").c_str());
+        }
+    }
+    if(!legacy.empty())fsdevCommitDevice("sdmc");
+}
+
+bool containsContentId(const std::vector<NcmContentId> &contentIds,const NcmContentId &contentId)
+{
+    return std::any_of(contentIds.begin(),contentIds.end(),[&](const auto &candidate){
+        return contentIdsEqual(candidate,contentId);
+    });
+}
+
+Result snapshotContentIds(NcmContentMetaDatabase &database,const NcmContentMetaKey &key,
+                          const std::vector<u8> &metadata,std::vector<NcmContentId> &contentIds)
+{
+    if(metadata.size()<sizeof(NcmContentMetaHeader)) return kForwarderIoError;
+    NcmContentMetaHeader header{};
+    std::memcpy(&header,metadata.data(),sizeof(header));
+    const size_t prefix=sizeof(header)+header.extended_header_size;
+    if(prefix<sizeof(header)||prefix>metadata.size()||
+       header.content_count>(metadata.size()-prefix)/sizeof(NcmContentInfo))
+        return kForwarderIoError;
+    contentIds.clear();
+    if(!header.content_count) return 0;
+    std::vector<NcmContentInfo> infos(header.content_count);
+    s32 written=0;
+    Result rc=ncmContentMetaDatabaseListContentInfo(&database,&written,infos.data(),
+        static_cast<s32>(infos.size()),&key,0);
+    if(R_FAILED(rc)) return rc;
+    if(written!=static_cast<s32>(infos.size())) return kForwarderIoError;
+    for(const auto &info:infos) contentIds.push_back(info.content_id);
+    return 0;
+}
+
+Result snapshotContentMeta(NcmContentMetaDatabase &database,const NcmContentMetaKey &key,
+                           ContentMetaBackup &backup)
+{
+    backup={};
+    Result rc=ncmContentMetaDatabaseHas(&database,&backup.existed,&key);
+    if(R_FAILED(rc)||!backup.existed) return rc;
+    u64 size=0;
+    rc=ncmContentMetaDatabaseGetSize(&database,&size,&key);
+    if(R_SUCCEEDED(rc)&&(size==0||size>1024*1024)) rc=kForwarderIoError;
+    if(R_FAILED(rc)) return rc;
+    backup.data.resize(static_cast<size_t>(size));
+    u64 received=0;
+    rc=ncmContentMetaDatabaseGet(&database,&key,&received,backup.data.data(),backup.data.size());
+    if(R_SUCCEEDED(rc)&&received!=backup.data.size()) rc=kForwarderIoError;
+    if(R_SUCCEEDED(rc)) rc=snapshotContentIds(database,key,backup.data,backup.contentIds);
+    return rc;
+}
 
 Result restoreContentMeta(NcmContentMetaDatabase &database, const NcmContentMetaKey &key,
                           const ContentMetaBackup &backup)
@@ -1014,6 +1127,7 @@ Result restoreContentMeta(NcmContentMetaDatabase &database, const NcmContentMeta
 Result installContentMeta(NcmStorageId storageId, const MetaResult &meta,
                           ContentMetaBackup &backup, bool &safeToRemoveContent)
 {
+    if(meta.data.empty()) return kForwarderIoError;
     safeToRemoveContent = true;
     NcmContentMetaDatabase database{};
     Result rc = ncmOpenContentMetaDatabase(&database, storageId);
@@ -1022,25 +1136,11 @@ Result installContentMeta(NcmStorageId storageId, const MetaResult &meta,
 
     bool snapshotReady = false;
     bool writeAttempted = false;
-    rc = ncmContentMetaDatabaseHas(&database, &backup.existed, &meta.key);
-    if (R_SUCCEEDED(rc) && backup.existed) {
-        u64 size = 0;
-        rc = ncmContentMetaDatabaseGetSize(&database, &size, &meta.key);
-        if (R_SUCCEEDED(rc) && (size == 0 || size > 1024 * 1024))
-            rc = kForwarderIoError;
-        if (R_SUCCEEDED(rc)) {
-            backup.data.resize(static_cast<size_t>(size));
-            u64 received = 0;
-            rc = ncmContentMetaDatabaseGet(&database, &meta.key, &received,
-                                           backup.data.data(), backup.data.size());
-            if (R_SUCCEEDED(rc) && received != backup.data.size())
-                rc = kForwarderIoError;
-        }
-    }
+    rc = snapshotContentMeta(database,meta.key,backup);
     if (R_SUCCEEDED(rc)) {
         snapshotReady = true;
         writeAttempted = true;
-        rc = ncmContentMetaDatabaseSet(&database, &meta.key, &meta.data, sizeof(meta.data));
+        rc = ncmContentMetaDatabaseSet(&database, &meta.key, meta.data.data(), meta.data.size());
     }
     if (R_SUCCEEDED(rc))
         rc = ncmContentMetaDatabaseCommit(&database);
@@ -1049,6 +1149,37 @@ Result installContentMeta(NcmStorageId storageId, const MetaResult &meta,
         safeToRemoveContent = false;
     ncmContentMetaDatabaseClose(&database);
     return rc;
+}
+
+std::vector<NcmContentId> findReplacedContent(const std::vector<NcmContentId> &previous,
+                                              const std::vector<NcmContentId> &current)
+{
+    std::vector<NcmContentId> replaced;
+    for(const auto &contentId:previous)
+        if(!containsContentId(current,contentId)&&!containsContentId(replaced,contentId))
+            replaced.push_back(contentId);
+    return replaced;
+}
+
+void removeOrphanedContent(NcmStorageId storageId,const std::vector<NcmContentId> &contentIds)
+{
+    if(contentIds.empty()) return;
+    NcmContentMetaDatabase database{};
+    if(R_FAILED(ncmOpenContentMetaDatabase(&database,storageId))) return;
+    NcmContentStorage storage{};
+    if(R_FAILED(ncmOpenContentStorage(&storage,storageId))){
+        ncmContentMetaDatabaseClose(&database); return;
+    }
+    for(const auto &contentId:contentIds){
+        bool orphaned=false;
+        if(R_FAILED(ncmContentMetaDatabaseLookupOrphanContent(&database,&orphaned,&contentId,1))) break;
+        if(!orphaned) continue;
+        bool present=false;
+        if(R_FAILED(ncmContentStorageHas(&storage,&present,&contentId))) break;
+        if(present&&R_FAILED(ncmContentStorageDelete(&storage,&contentId))) break;
+    }
+    ncmContentStorageClose(&storage);
+    ncmContentMetaDatabaseClose(&database);
 }
 
 bool rollbackContentMeta(NcmStorageId storageId, const NcmContentMetaKey &key,
@@ -1062,7 +1193,8 @@ bool rollbackContentMeta(NcmStorageId storageId, const NcmContentMetaKey &key,
     return R_SUCCEEDED(rc);
 }
 
-Result install_forwarder(const std::string &gameKey, const std::string &name, const std::string &author,
+Result install_forwarder(const std::string &gameKey, const std::string &name,
+                         bool launcherOnly,
                          const std::vector<u8> &nsoData, std::vector<u8> npdmData, NacpStruct nacp,
                          const std::vector<u8> &iconJpeg, ForwarderStage &stage)
 {
@@ -1076,16 +1208,20 @@ Result install_forwarder(const std::string &gameKey, const std::string &name, co
     if (nroPath.empty())
         return kForwarderIoError;
     const bool quotePath = nroPath.find_first_of(" \t") != std::string::npos;
-    const std::string args = (quotePath ? "\"" + nroPath + "\"" : nroPath) +
-                             " -g \"" + gameKey + "\"";
+    const std::string launcherArgument=quotePath ? "\""+nroPath+"\"" : nroPath;
+    const std::string args = launcherOnly ? launcherArgument :
+                             launcherArgument+" -g \""+gameKey+"\"";
     if (nroPath.empty() || nroPath.size() >= FS_MAX_PATH ||
         nroPath.size() + args.size() + 2 > 2046)
         return kForwarderIoError;
 
     u64 hashData[SHA256_HASH_SIZE / sizeof(u64)];
-    const std::string hashSource = nroPath + args;
+    const std::string hashSource = launcherOnly ? "nethersx2-launcher" :
+                                                  "nethersx2-forwarder:"+gameKey;
     sha256CalculateHash(hashData, hashSource.data(), hashSource.length());
     const u64 tid = 0x0500000000000000 | (hashData[0] & 0x00FFFFFFFFFFF000);
+    const std::vector<LegacyForwarderConfig> legacyForwarders=
+        launcherOnly?std::vector<LegacyForwarderConfig>{}:findLegacyForwarders(gameKey,tid);
 
     ForwarderConfigTransaction config;
     FWD_TRY(config.stage(tid, nroPath, args));
@@ -1104,7 +1240,7 @@ Result install_forwarder(const std::string &gameKey, const std::string &name, co
         ncaEntries.emplace_back(create_program_nca(tid, headerKey, exefs));
     }
     {
-        patch_nacp(nacp, name, author, tid);
+        patch_nacp(nacp, name, tid);
         FileEntries romfs;
         add_file_entry(romfs, "/control.nacp", &nacp, sizeof(nacp));
         add_file_entry(romfs, "/icon_AmericanEnglish.dat", iconJpeg.data(), iconJpeg.size());
@@ -1166,6 +1302,8 @@ Result install_forwarder(const std::string &gameKey, const std::string &name, co
 
     ns_invalidate_control_cache(tid);
     config.finish();
+    removeOrphanedContent(storageId,findReplacedContent(metaBackup.contentIds,meta.contentIds));
+    removeLegacyForwarders(legacyForwarders);
     return 0;
 }
 
@@ -1194,8 +1332,9 @@ std::string launcherNroPath()
     return resolveLauncherPath();
 }
 
-bool forwarder_create(const std::string &gameKey, const std::string &name, const std::string &author,
-                      const std::string &iconImgPath, char *err, std::size_t errSize)
+static bool forwarder_create_common(const std::string &gameKey, const std::string &name,
+                                    const std::string &iconImgPath,bool launcherOnly,
+                                    char *err, std::size_t errSize)
 {
     if (err && errSize) err[0] = '\0';
 
@@ -1238,8 +1377,7 @@ bool forwarder_create(const std::string &gameKey, const std::string &name, const
     }
     if (R_SUCCEEDED(rc)) {
         try {
-            rc = install_forwarder(gameKey, name.empty() ? "NetherSX2" : name,
-                                   author.empty() ? "NetherSX2" : author,
+            rc = install_forwarder(gameKey, name.empty() ? "NetherSX2" : name,launcherOnly,
                                    nso, npdm, nacp, iconJpeg, stage);
         } catch (...) {
             rc = kForwarderIoError;
@@ -1261,4 +1399,15 @@ bool forwarder_create(const std::string &gameKey, const std::string &name, const
         return false;
     }
     return true;
+}
+
+bool forwarder_create(const std::string &gameKey, const std::string &name, const std::string &,
+                      const std::string &iconImgPath, char *err, std::size_t errSize)
+{
+    return forwarder_create_common(gameKey,name,iconImgPath,false,err,errSize);
+}
+
+bool forwarder_create_launcher(char *err,std::size_t errSize)
+{
+    return forwarder_create_common("launcher","NetherSX2","romfs:/logo.png",true,err,errSize);
 }

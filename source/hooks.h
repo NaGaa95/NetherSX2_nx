@@ -20,11 +20,13 @@ typedef enum {
 extern CoreVersion g_core_version;
 int core_is_3668(void);
 int core_shutdown_achievements(void);
+int core_wrap_destructor(void (**destructor)(void *), void **argument);
 int core_shutdown_mtgs(void);
 
 void egl_gl_ownership_park(void);
 void egl_gl_ownership_release(void);
 int  egl_gl_thread_holds_context(void);
+void egl_gl_shutdown(void);
 
 // EGL hooks (hooks/egl.c) -- registered in imports.c in place of the real eglXxx
 EGLDisplay eglGetDisplayHook(EGLNativeDisplayType display_id);

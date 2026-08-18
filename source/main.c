@@ -1796,6 +1796,14 @@ int main(void) {
 
   // settings store: load nethersx2.ini + seed OpenGL/folder defaults
   prefs_init(PREFS_PATH);
+#if GS_RENDERER == GS_RENDERER_OGL
+  // The unified Mesa SDK contains both the native NVC0 Gallium driver and Zink. Select Zink before
+  // libemucore initializes EGL; leaving the override unset preserves Mesa's native default.
+  if (!strcmp(prefs_get_string("Wrapper/GLDriver", "nvc0"), "zink"))
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
+  else
+    unsetenv("MESA_LOADER_DRIVER_OVERRIDE");
+#endif
   // The launcher and overlay both manage this fixed directory. Override stale
   // 1.2.1 configs which incorrectly pointed the core at resources/.
   prefs_set_string("Folders/Cheats", CHEATS_DIR);
@@ -1955,9 +1963,17 @@ int main(void) {
   if (nl.JNI_OnUnload)
     nl.JNI_OnUnload(fake_vm, NULL);
   ra_http_shutdown();
+  // Stop the GS thread before the remaining global destructors run. The core
+  // registers this same destructor through __cxa_atexit; our registration shim
+  // replaces it with a one-shot wrapper so finalization cannot destroy MTGS a
+  // second time.
   core_shutdown_mtgs();
+  // This runs the core's registered C++ destructors (including MTGS) exactly
+  // once and in their compiler-defined reverse construction order. The MTGS
+  // slot is now a no-op because it was shut down above.
   libc_finalize_core();
   pthr_shutdown();
+  egl_gl_shutdown();
   libc_memory_shutdown();
   so_unload(&emu_mod);
   prefs_save();

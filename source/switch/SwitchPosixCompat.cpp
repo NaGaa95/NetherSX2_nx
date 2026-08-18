@@ -51,7 +51,7 @@ extern "C" ssize_t readv(int fd, const struct iovec* vectors, int count)
 	return total;
 }
 
-#ifndef USE_VULKAN
+#if !defined(USE_VULKAN) && !defined(USE_UNIFIED_MESA)
 extern "C" ssize_t writev(int fd, const struct iovec* vectors, int count)
 {
 	if (!validateVectors(vectors, count))

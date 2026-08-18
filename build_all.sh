@@ -15,9 +15,20 @@ required=(
   "$CORES_DIR/NetherSX2-v2.2n-4248/assets/GameIndex.yaml"
   "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so"
   "$CORES_DIR/NetherSX2-v2.2n-3668/assets/GameIndex.yaml"
-  "$APP/vulkan/include/vulkan/vulkan_core.h"
-  "$APP/vulkan/lib/libnvk.a"
 )
+if [[ -n "${MESA_SDK_ROOT:-}" ]]; then
+  required+=(
+    "$MESA_SDK_ROOT/include/vulkan/vulkan_core.h"
+    "$MESA_SDK_ROOT/include/EGL/egl.h"
+    "$MESA_SDK_ROOT/lib/libvulkan.a"
+    "$MESA_SDK_ROOT/lib/libEGL.a"
+  )
+else
+  required+=(
+    "$APP/vulkan/include/vulkan/vulkan_core.h"
+    "$APP/vulkan/lib/libnvk.a"
+  )
+fi
 for file in "${required[@]}"; do
   [[ -f "$file" ]] || { echo "Missing build input: $file" >&2; exit 1; }
 done

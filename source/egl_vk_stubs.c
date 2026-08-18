@@ -11,7 +11,7 @@
  * actually calls these -- they just need to exist and fail benignly. Compiled to
  * nothing in the OpenGL build (real switch-mesa symbols linked instead).
  */
-#ifdef USE_VULKAN
+#if defined(USE_VULKAN) && !defined(USE_UNIFIED_MESA)
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>

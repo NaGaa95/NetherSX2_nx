@@ -1,0 +1,79 @@
+diff --git a/source/usbhsfs_drive.c b/source/usbhsfs_drive.c
+--- a/source/usbhsfs_drive.c
++++ b/source/usbhsfs_drive.c
+@@ -275,17 +275,22 @@ static bool usbHsFsDriveSetupInterfaceAndEndpointDescriptors(UsbHsFsDriveContext
+ 
+     UsbHsClientIfSession *usb_if_session = &(drive_ctx->usb_if_session);
+ 
+-    struct usb_interface_descriptor orig_interface_desc = {0}, *new_interface_desc = NULL;
++    struct usb_interface_descriptor orig_interface_desc = {0}, bot_interface_desc = {0}, *new_interface_desc = NULL;
+ 
+     u32 config_desc_size = 0;
+     u8 *config_desc_start = NULL, *config_desc_end = NULL, *config_desc_ptr = NULL;
+ 
+-    bool success = false;
++    bool success = false, bot_interface_found = false;
+ 
+     /* Copy interface descriptor provided by UsbHsInterface. */
+     /* We'll use this to skip this descriptor when we find it within the full configuration descriptor. */
+     /* Furthermore, we'll use it as a fallback method if something goes wrong while setting up USB Attached SCSI interface and endpoint descriptors. */
+     memcpy(&orig_interface_desc, &(usb_if_session->inf.inf.interface_desc), sizeof(struct usb_interface_descriptor));
++    if (orig_interface_desc.bInterfaceProtocol == USB_PROTOCOL_BULK_ONLY_TRANSPORT)
++    {
++        memcpy(&bot_interface_desc, &orig_interface_desc, sizeof(bot_interface_desc));
++        bot_interface_found = true;
++    }
+ 
+     /* Get full configuration descriptor. The one provided by UsbHsInterface is truncated. */
+     /* To simplify things, we won't go beyond index #0. */
+@@ -333,6 +338,20 @@ static bool usbHsFsDriveSetupInterfaceAndEndpointDescriptors(UsbHsFsDriveContext
+             goto end;
+         }
+ 
++        if (cur_desc_type == USB_DT_INTERFACE && cur_desc_size == sizeof(struct usb_interface_descriptor))
++        {
++            struct usb_interface_descriptor *candidate = (struct usb_interface_descriptor*)config_desc_ptr;
++            if (candidate->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
++                candidate->bInterfaceSubClass == USB_SUBCLASS_SCSI_TRANSPARENT_CMD_SET &&
++                candidate->bInterfaceProtocol == USB_PROTOCOL_BULK_ONLY_TRANSPORT &&
++                candidate->bNumEndpoints >= 2 &&
++                (!bot_interface_found || candidate->bInterfaceNumber == orig_interface_desc.bInterfaceNumber))
++            {
++                memcpy(&bot_interface_desc, candidate, sizeof(bot_interface_desc));
++                bot_interface_found = true;
++            }
++        }
++
+         /* Check if we're dealing with a valid USB Attached SCSI interface descriptor. */
+         if (cur_desc_type != USB_DT_INTERFACE || cur_desc_size != sizeof(struct usb_interface_descriptor) || \
+             (orig_interface_desc.bInterfaceProtocol != USB_PROTOCOL_USB_ATTACHED_SCSI && !memcmp(config_desc_ptr, &orig_interface_desc, sizeof(struct usb_interface_descriptor))) || \
+@@ -360,14 +379,14 @@ static bool usbHsFsDriveSetupInterfaceAndEndpointDescriptors(UsbHsFsDriveContext
+     if (!success) USBHSFS_LOG_MSG("Unable to find and/or set a UASP interface descriptor (interface %d).", usb_if_session->ID);
+ 
+ end:
+-    if (config_desc_start) free(config_desc_start);
+-
+     /* Fallback to the Bulk-Only Transport interface if we must. */
+-    if (!success && orig_interface_desc.bInterfaceProtocol == USB_PROTOCOL_BULK_ONLY_TRANSPORT && usbHsFsDriveChangeInterfaceDescriptor(usb_if_session, &orig_interface_desc))
++    if (!success && bot_interface_found && usbHsFsDriveChangeInterfaceDescriptor(usb_if_session, &bot_interface_desc))
+     {
+         USBHSFS_LOG_MSG("Proceeding with BOT interface descriptor (interface %d).", usb_if_session->ID);
+         success = usbHsFsDriveSetupEndpointDescriptors(drive_ctx, NULL, NULL, NULL);
+     }
+ 
++    if (config_desc_start) free(config_desc_start);
++
+     return success;
+ }
+@@ -403,7 +422,9 @@ static bool usbHsFsDriveChangeInterfaceDescriptor(UsbHsClientIfSession *usb_if_s
+             USBHSFS_LOG_MSG("usbHsIfSetInterface failed! (0x%X) (interface %d).", rc, usb_if_session->ID);
+             return false;
+         }
++
++        cur_if_alt_setting = usb_if_session->inf.inf.interface_desc.bAlternateSetting;
+     }
+ 
+     /* Check if we must set an alternate interface setting. */
+     if (new_if_alt_setting != cur_if_alt_setting)
+
+

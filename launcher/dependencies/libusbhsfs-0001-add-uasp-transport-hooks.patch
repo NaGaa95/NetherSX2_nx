@@ -1,0 +1,155 @@
+diff --git a/source/usbhsfs_drive.c b/source/usbhsfs_drive.c
+index 980fac1..d3d05f7 100644
+--- a/source/usbhsfs_drive.c
++++ b/source/usbhsfs_drive.c
+@@ -11,6 +11,7 @@
+ #include "usbhsfs_request.h"
+ #include "usbhsfs_scsi.h"
+ #include "usbhsfs_mount.h"
++#include "usbhsfs_uasp.h"
+ 
+ /* Function prototypes. */
+ 
+@@ -68,8 +69,24 @@ bool usbHsFsDriveInitializeContext(UsbHsFsDriveContext *drive_ctx, UsbHsInterfac
+     usbHsFsDriveGetDeviceStrings(drive_ctx);
+ 
+     /* Retrieve max supported logical units from this storage device. */
+-    rc = usbHsFsRequestGetMaxLogicalUnits(usb_if_session, &(drive_ctx->max_lun));
+-    if (R_FAILED(rc))
++retry_transport:
++    if (drive_ctx->uasp && !usbHsFsUaspInitialize(drive_ctx))
++    {
++        USBHSFS_LOG_MSG("Failed to initialize UASP transport! (interface %d).", drive_ctx->usb_if_id);
++        if (usbHsFsUaspFallbackToBulkOnlyTransport(drive_ctx))
++            goto retry_transport;
++        goto end;
++    }
++
++    if (drive_ctx->uasp)
++    {
++        drive_ctx->max_lun = usbHsFsUaspGetMaxLogicalUnits(drive_ctx);
++        rc = 0;
++    } else {
++        rc = usbHsFsRequestGetMaxLogicalUnits(usb_if_session, &(drive_ctx->max_lun));
++    }
++
++    if (R_FAILED(rc) || !drive_ctx->max_lun)
+     {
+         /* Fallback to a single logical unit. */
+         drive_ctx->max_lun = 1;
+@@ -80,9 +97,6 @@ bool usbHsFsDriveInitializeContext(UsbHsFsDriveContext *drive_ctx, UsbHsInterfac
+ 
+     USBHSFS_LOG_MSG("Max LUN count (interface %d): %u.", drive_ctx->usb_if_id, drive_ctx->max_lun);
+ 
+-    /* Bail out if we're dealing with a UASP interface (for now). */
+-    if (drive_ctx->uasp) goto end;
+-
+     /* Allocate memory for LUN context pointer array. */
+     drive_ctx->lun_ctx = calloc(drive_ctx->max_lun, sizeof(UsbHsFsDriveLogicalUnitContext*));
+     if (!drive_ctx->lun_ctx)
+@@ -139,6 +153,16 @@ bool usbHsFsDriveInitializeContext(UsbHsFsDriveContext *drive_ctx, UsbHsInterfac
+     if (!drive_ctx->lun_count)
+     {
+         if (drive_ctx->lun_ctx[0]) free(drive_ctx->lun_ctx[0]);
++        free(drive_ctx->lun_ctx);
++        drive_ctx->lun_ctx = NULL;
++
++        /* Some enclosures expose both transports but have broken UASP firmware. */
++        if (drive_ctx->uasp && usbHsFsUaspFallbackToBulkOnlyTransport(drive_ctx))
++        {
++            drive_ctx->max_lun = 0;
++            goto retry_transport;
++        }
++
+         USBHSFS_LOG_MSG("Failed to initialize any LUN/filesystem contexts! (interface %d).", drive_ctx->usb_if_id);
+         goto end;
+     }
+@@ -191,6 +215,8 @@ void usbHsFsDriveDestroyContext(UsbHsFsDriveContext *drive_ctx, bool stop_lun)
+         drive_ctx->lun_ctx = NULL;
+     }
+ 
++    usbHsFsUaspCleanup(drive_ctx);
++
+     /* Free device strings. */
+     if (drive_ctx->manufacturer)
+     {
+diff --git a/source/usbhsfs_scsi.c b/source/usbhsfs_scsi.c
+index 35aacbb..91d8c4a 100644
+--- a/source/usbhsfs_scsi.c
++++ b/source/usbhsfs_scsi.c
+@@ -10,6 +10,7 @@
+ #include "usbhsfs_utils.h"
+ #include "usbhsfs_request.h"
+ #include "usbhsfs_scsi.h"
++#include "usbhsfs_uasp.h"
+ 
+ #define SCSI_CBW_SIGNATURE                      0x55534243      /* "USBC". */
+ #define SCSI_CSW_SIGNATURE                      0x55534253      /* "USBS". */
+@@ -1020,6 +1021,65 @@ static bool usbHsFsScsiTransferCommand(UsbHsFsDriveContext *drive_ctx, ScsiComma
+         return false;
+     }
+ 
++    if (drive_ctx->uasp)
++    {
++        for (u8 attempt = 0; attempt < 2; attempt++)
++        {
++            UsbHsFsUaspCommandResult result = {0};
++            if (!usbHsFsUaspTransferCommand(drive_ctx, cbw->dCBWDataTransferLength,
++                                             cbw->bmCBWFlags == USB_ENDPOINT_IN,
++                                             cbw->bCBWLUN, cbw->CBWCB,
++                                             cbw->bCBWCBLength, buf, &result))
++                return false;
++
++            const u8 opcode = cbw->CBWCB[0];
++            const bool fixed_block_transfer =
++                (opcode == ScsiCommandOperationCode_Read10 ||
++                 opcode == ScsiCommandOperationCode_Write10 ||
++                 opcode == ScsiCommandOperationCode_Read16 ||
++                 opcode == ScsiCommandOperationCode_Write16);
++            if (fixed_block_transfer &&
++                result.data_transferred != cbw->dCBWDataTransferLength)
++            {
++                USBHSFS_LOG_MSG("Short UASP block transfer: received 0x%X of 0x%X byte(s) (interface %d, LUN %u).",
++                                result.data_transferred,
++                                cbw->dCBWDataTransferLength,
++                                drive_ctx->usb_if_id, cbw->bCBWLUN);
++                return false;
++            }
++            if (result.scsi_status == ScsiCommandStatus_Passed) return true;
++            if (!result.sense_valid) continue;
++
++            USBHSFS_LOG_MSG("UASP autosense: key 0x%02X, ASC 0x%02X, ASCQ 0x%02X (interface %d, LUN %u).",
++                            result.sense_key, result.additional_sense_code,
++                            result.additional_sense_code_qualifier,
++                            drive_ctx->usb_if_id, cbw->bCBWLUN);
++
++            switch(result.sense_key)
++            {
++                case ScsiSenseKey_NoSense:
++                case ScsiSenseKey_RecoveredError:
++                case ScsiSenseKey_Completed:
++                    return true;
++                case ScsiSenseKey_UnitAttention:
++                case ScsiSenseKey_AbortedCommand:
++                    break;
++                case ScsiSenseKey_NotReady:
++                    if (result.additional_sense_code == SCSI_ASC_MEDIUM_NOT_PRESENT)
++                    {
++                        g_mediumPresent = false;
++                        return false;
++                    }
++                    usbHsFsUtilsSleep(1);
++                    break;
++                default:
++                    return false;
++            }
++        }
++
++        return false;
++    }
++
+     Result rc = 0;
+     u8 *data_buf = (u8*)buf;
+     u32 blksize = USB_XFER_BUF_SIZE;
+
+
