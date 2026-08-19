@@ -59,6 +59,7 @@ struct UsbSnapshot
 using UsbStatusCallback = void (*)(void* user_data);
 
 bool InitializeUsb(std::string* error = nullptr);
+bool IsUsbInitialized();
 std::uint64_t UsbStatusGeneration();
 // Registers a lightweight wake callback for USB topology changes. The callback
 // runs on the libusbhsfs notification thread and must not block. Passing null

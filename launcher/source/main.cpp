@@ -2262,7 +2262,8 @@ static void storageWakeEvent(int code) {
 static void usbStatusWake(void *) { storageWakeEvent(0x55534248); } // USBH
 
 static void startUsbInitialization() {
-  if(g_usbInitialization||g_usbInitializationThread.joinable()) return;
+  if(SwitchStorage::IsUsbInitialized()||g_usbInitialization||
+     g_usbInitializationThread.joinable()) return;
   auto state=std::make_shared<UsbInitializationState>();
   g_usbInitialization=state;
   g_usbInitializationThread=std::thread([state]{
@@ -3792,7 +3793,6 @@ static void ensureSavedPathMountedAtStartup(const std::string &path) {
 static std::vector<BrowserItem> browserItems(const std::string &current,BrowserMode mode,bool &opened) {
   std::vector<BrowserItem> items; opened=true;
   if(current.empty()){
-    startUsbInitialization();
     items.push_back({"SD card","sdmc:/",BrowserItemKind::Location,true,"Internal SD storage"});
     for(const auto &usb:SwitchStorage::ListUsbLocations())
       items.push_back({usb.label,usb.path,BrowserItemKind::Location,true,"USB mass storage",usb.id});
@@ -3843,6 +3843,23 @@ static std::vector<BrowserItem> browserItems(const std::string &current,BrowserM
     return strcasecmp(left.label.c_str(),right.label.c_str())<0;
   });
   items.insert(items.end(),std::make_move_iterator(entries.begin()),std::make_move_iterator(entries.end()));
+  return items;
+}
+
+static bool browserPathMayBlock(const std::string &path) {
+  if(isUsbStoragePath(path)) return true;
+  for(const auto &share:loadSmbSharesFromStore())
+    if(pathAtOrBelow(path,SwitchStorage::SmbRootPath(share.id))) return true;
+  return false;
+}
+
+static std::vector<BrowserItem> browserItemsResponsive(const std::string &current,
+                                                       BrowserMode mode,bool &opened) {
+  if(current.empty()||!browserPathMayBlock(current)) return browserItems(current,mode,opened);
+  std::vector<BrowserItem> items;
+  const bool usb=isUsbStoragePath(current);
+  runBusyTask(usb?"Reading USB storage":"Reading network folder",current,
+              [&]{ items=browserItems(current,mode,opened); });
   return items;
 }
 
@@ -3913,7 +3930,7 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
   int sel=0,top=0;
   uint64_t locationsGeneration=SwitchStorage::UsbStatusGeneration();
   for(;;){
-    bool opened=false; auto items=browserItems(current,mode,opened);
+    bool opened=false; auto items=browserItemsResponsive(current,mode,opened);
     locationsGeneration=SwitchStorage::UsbStatusGeneration();
     if(!opened){ modalMessage(uiText("Folder unavailable").c_str(),{current,"",uiText("The device may be disconnected.")}); current.clear(); sel=top=0; continue; }
     int n=(int)items.size(),vis=std::max(1,(SH-178)/46); if(n==0){ current.clear(); continue; }
@@ -3953,7 +3970,7 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
           else if(item.kind==BrowserItemKind::ManageSmb){ networkSharesScreen(); sel=top=0; rebuild=true; }
           else if(item.kind==BrowserItemKind::Directory){ current=item.path; sel=top=0; rebuild=true; }
           else if(item.kind==BrowserItemKind::Location||item.kind==BrowserItemKind::Smb){
-            if(ensurePathMounted(item.path)){ DIR *test=opendir(item.path.c_str()); if(test){ closedir(test); current=item.path; sel=top=0; rebuild=true; } else modalMessage(uiText("Location unavailable").c_str(),{item.path}); }
+            if(ensurePathMounted(item.path)){ current=item.path; sel=top=0; rebuild=true; }
           }
         }
         if(sel<top) top=sel;

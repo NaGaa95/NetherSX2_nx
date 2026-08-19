@@ -17,7 +17,6 @@
 #include <sys/statvfs.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -137,7 +136,8 @@ struct SmbDevice
 std::mutex s_mount_mutex;
 std::vector<std::shared_ptr<SmbMount>> s_smb_mounts;
 std::vector<std::unique_ptr<SmbDevice>> s_smb_devices;
-bool s_usb_initialized = false;
+std::mutex s_usb_init_mutex;
+std::atomic_bool s_usb_initialized{false};
 std::atomic<std::uint64_t> s_usb_generation{0};
 std::mutex s_usb_mutex;
 std::vector<UsbHsFsDevice> s_usb_devices;
@@ -1541,31 +1541,36 @@ std::string SmbBrowsePath(const SmbShare& share)
 
 bool InitializeUsb(std::string* error)
 {
+  std::lock_guard init_lock(s_usb_init_mutex);
+  if (s_usb_initialized.load(std::memory_order_acquire))
+    return true;
+
+  // Register before starting the libusbhsfs manager. Registering afterwards
+  // can wait behind device enumeration while a caller holds launcher locks.
+  usbHsFsSetFileSystemMountFlags(UsbHsFsMountFlags_None);
+  usbHsFsSetPopulateCallback(UsbStatusChanged, nullptr);
+  const Result result = usbHsFsInitialize(0);
+  if (R_FAILED(result))
   {
-    std::lock_guard lock(s_mount_mutex);
-    if (s_usb_initialized)
-      return true;
-    usbHsFsSetFileSystemMountFlags(UsbHsFsMountFlags_None);
-    const Result result = usbHsFsInitialize(0);
-    if (R_FAILED(result))
+    usbHsFsSetPopulateCallback(nullptr, nullptr);
+    if (error)
     {
-      if (error)
-      {
-        char message[80];
-        std::snprintf(message, sizeof(message), "USB initialization failed (0x%08x)", result);
-        *error = message;
-      }
-      return false;
+      char message[80];
+      std::snprintf(message, sizeof(message), "USB initialization failed (0x%08x)", result);
+      *error = message;
     }
-    s_usb_initialized = true;
-    usbHsFsSetPopulateCallback(UsbStatusChanged, nullptr);
+    return false;
   }
-  // The status callback can wake application code, so perform the initial
-  // snapshot after releasing the storage registry mutex as well.
-  std::array<UsbHsFsDevice, 32> devices{};
-  const u32 count = usbHsFsListMountedDevices(devices.data(), devices.size());
-  UsbStatusChanged(devices.data(), count, nullptr);
+
+  // Device discovery continues on libusbhsfs' manager thread. The callback
+  // publishes the first and all subsequent snapshots without blocking UI.
+  s_usb_initialized.store(true, std::memory_order_release);
   return true;
+}
+
+bool IsUsbInitialized()
+{
+  return s_usb_initialized.load(std::memory_order_acquire);
 }
 
 std::uint64_t UsbStatusGeneration()
@@ -1576,11 +1581,6 @@ std::uint64_t UsbStatusGeneration()
 UsbSnapshot GetUsbSnapshot()
 {
   UsbSnapshot snapshot;
-  {
-    std::lock_guard lock(s_mount_mutex);
-    if (!s_usb_initialized)
-      return snapshot;
-  }
   std::lock_guard lock(s_usb_mutex);
   snapshot.generation = s_usb_generation.load(std::memory_order_acquire);
   snapshot.locations.reserve(s_usb_devices.size());
@@ -1606,14 +1606,11 @@ std::string ResolveUsbPath(const std::string& id)
 
 bool SafelyEjectUsb(const std::string& id, std::string* error)
 {
+  if (!s_usb_initialized.load(std::memory_order_acquire))
   {
-    std::lock_guard lock(s_mount_mutex);
-    if (!s_usb_initialized)
-    {
-      if (error)
-        *error = "USB storage is not initialized";
-      return false;
-    }
+    if (error)
+      *error = "USB storage is not initialized";
+    return false;
   }
 
   UsbHsFsDevice target{};
@@ -1882,7 +1879,6 @@ void Shutdown()
 {
   SetUsbStatusCallback(nullptr);
   std::vector<std::shared_ptr<SmbMount>> mounts;
-  bool shutdown_usb = false;
   {
     std::lock_guard lock(s_mount_mutex);
     for (auto& mount : s_smb_mounts)
@@ -1896,8 +1892,6 @@ void Shutdown()
       }
     }
     mounts.swap(s_smb_mounts);
-    shutdown_usb = s_usb_initialized;
-    s_usb_initialized = false;
   }
   for (const auto& mount : mounts)
   {
@@ -1905,13 +1899,15 @@ void Shutdown()
     DisconnectSmbUnlocked(mount.get());
   }
   mounts.clear();  // Open descriptors can still retain retired mount objects.
-  if (shutdown_usb)
+
+  std::lock_guard init_lock(s_usb_init_mutex);
+  if (s_usb_initialized.exchange(false, std::memory_order_acq_rel))
   {
     usbHsFsSetPopulateCallback(nullptr, nullptr);
     usbHsFsExit();
-    std::lock_guard lock(s_usb_mutex);
-    s_usb_devices.clear();
-    s_usb_generation.fetch_add(1, std::memory_order_release);
   }
+  std::lock_guard snapshot_lock(s_usb_mutex);
+  s_usb_devices.clear();
+  s_usb_generation.fetch_add(1, std::memory_order_release);
 }
 }  // namespace SwitchStorage
