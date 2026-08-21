@@ -6735,18 +6735,30 @@ int main(int argc, char **argv){
   g_localization.SetLanguage(storeGet(g_global,"Wrapper/Language","system"));
   applyLauncherAppearance();
   uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
+
+  // Standard NSP forwarders pass the selected disc path as argv[1]. Detect
+  // that mode before starting the normal library/storage UI pipeline so a
+  // direct launch cannot flash the grid or a storage-wait screen.
+  std::string positionalForwarderPath;
+  if(argc>=2&&argv[1]&&argv[1][0]){
+    const std::string candidate=normalizeLocationPath(argv[1]);
+    if(!candidate.empty()&&hasDiscExt(candidate.c_str())) positionalForwarderPath=candidate;
+  }
+  const bool silentDirectForwarder=!positionalForwarderPath.empty();
+
   startCoverDecodeWorker();
   std::vector<std::string> gamePaths=loadGameSources();
   bool hasUsbSource=hasConfiguredUsbSource(gamePaths);
   SwitchStorage::SetUsbStatusCallback(usbStatusWake);
   LauncherUpdate_SetWakeCallback(usbStatusWake,nullptr);
-  startUsbInitialization();
-  startAutoMountShares();
+  const bool directForwarderUsesUsb=silentDirectForwarder&&isUsbStoragePath(positionalForwarderPath);
+  if(!silentDirectForwarder||directForwarderUsesUsb) startUsbInitialization();
+  if(!silentDirectForwarder) startAutoMountShares();
   auto usbSnapshot=SwitchStorage::GetUsbSnapshot();
   uint64_t usbGeneration=usbSnapshot.generation;
   auto usbLocations=usbSnapshot.locations;
   refreshConfiguredUsbSources(gamePaths);
-  scanGames(gamePaths);
+  if(!silentDirectForwarder) scanGames(gamePaths);
   Uint32 usbRefreshAt=0,smbRefreshAt=0;
   std::vector<std::string> smbPendingSources;
   const uint64_t startupUsbGeneration=SwitchStorage::UsbStatusGeneration();
@@ -6780,12 +6792,54 @@ int main(int argc, char **argv){
     running=false;
   };
 
-  bool forwarderRequested=false,forwarderMatched=false;
-  std::string forwarderKey;
-  for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
+  auto prepareDirectForwarderGame=[&](const std::string &directPath) -> bool {
+    struct stat info{};
+    if(stat(directPath.c_str(),&info)!=0||!S_ISREG(info.st_mode)) return false;
+
+    Game game;
+    game.path=directPath;
+    const size_t slash=directPath.find_last_of("/\\");
+    game.file=slash==std::string::npos?directPath:directPath.substr(slash+1);
+    game.sourceRoot=slash==std::string::npos?std::string{}:directPath.substr(0,slash);
+    game.storageId=storageIdForSource(game.sourceRoot.empty()?directPath:game.sourceRoot);
+    game.legacyKey=sanitize(game.file);
+    game.pathKey=makeLegacyPathKey(game.file,game.path);
+    game.fileSize=static_cast<uint64_t>(info.st_size);
+    game.modified=static_cast<long long>(info.st_mtime);
+    game.added=game.modified;
+
+    // Reuse the persisted fingerprint when the same file is unchanged;
+    // otherwise sample the disc exactly like the normal library scanner.
+    for(const auto &record:g_libraryIdentities){
+      if(pathIdentity(record.canonicalPath)==pathIdentity(game.path)&&
+         record.fileSize==game.fileSize&&record.modified==game.modified){
+        game.fingerprint=record.fingerprint;
+        break;
+      }
+    }
+    if(game.fingerprint.empty()) game.fingerprint=fingerprintGameFile(game.path,game.fileSize);
+    if(game.fingerprint.empty()) return false;
+    assignStableIdentity(game);
+    game.legacyUnique=false;
+    game.played=atoll(gameStoreGet(g_recent,game,"0"));
+    game.hasCfg=gameFileExists(GAMECFG_DIR,game,".ini");
+    selectGame(game);
+    return true;
+  };
+
+  bool forwarderRequested=silentDirectForwarder;
+  bool forwarderMatched=false;
+  bool forwarderDirectPath=silentDirectForwarder;
+  std::string forwarderKey=positionalForwarderPath;
+  auto findForwarderGame=[&]() -> Game* { return findGameByKey(forwarderKey); };
+
+  if(forwarderDirectPath) forwarderMatched=prepareDirectForwarderGame(forwarderKey);
+
+  // Preserve NaGaa's built-in -g <gameKey> behavior unchanged.
+  if(!forwarderRequested) for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
     forwarderRequested=true;
     forwarderKey=argv[argument+1];
-    if(Game *game=findGameByKey(forwarderKey)){ selectGame(*game); forwarderMatched=true; }
+    if(Game *game=findForwarderGame()){ selectGame(*game); forwarderMatched=true; }
     break;
   }
   if(!forwarderRequested&&g_griddbReady&&
@@ -6813,9 +6867,13 @@ int main(int argc, char **argv){
       scanAdditionalGames(smbPendingSources);
       smbPendingSources.clear();
     }
-    if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
-      selectGame(*game);
-      forwarderPending=false;
+    if(forwarderPending){
+      if(forwarderDirectPath){
+        if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
+      } else if(Game *game=findForwarderGame()){
+        selectGame(*game);
+        forwarderPending=false;
+      }
     }
     if(hasUsbSource){
       const Uint32 now=SDL_GetTicks();
@@ -6858,9 +6916,13 @@ int main(int argc, char **argv){
         sel=0; top=0;
         if(!selected.empty()) for(int index=0;index<(int)g_visibleGames.size();index++)
           if(visibleGame(index)&&visibleGame(index)->key==selected){ sel=index; break; }
-        if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
-          selectGame(*game);
-          forwarderPending=false;
+        if(forwarderPending){
+          if(forwarderDirectPath){
+            if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
+          } else if(Game *game=findForwarderGame()){
+            selectGame(*game);
+            forwarderPending=false;
+          }
         }
       }
       if(!running) break;
@@ -6885,8 +6947,10 @@ int main(int argc, char **argv){
         }
       }
       if(!running) break;
-      renderUsbForwarderWait();
-    waitForNextFrame();
+      // Raw positional forwarders remain visually silent while waiting for
+      // their storage path. Built-in -g shortcuts keep NaGaa's wait screen.
+      if(!forwarderDirectPath) renderUsbForwarderWait();
+      waitForNextFrame();
       continue;
     }
     GLay layout=gridLayout(); int cols=layout.cols; rows=layout.rows;
