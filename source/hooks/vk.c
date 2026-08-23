@@ -26,14 +26,97 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <switch.h>
 #include "../util.h"
 #include "../config.h"
 #include "../prefs.h"
 #include "../lsfg/lsfg_bridge.h"
 
 volatile int vk_present_count = 0;
+
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+static Mutex vk_diag_mutex;
+static FILE *vk_diag_file;
+
+static FILE *
+vk_diag_open_locked(void) {
+  if (!vk_diag_file) {
+    mkdir(DATA_ROOT, 0777);
+    vk_diag_file = fopen(DATA_ROOT "/nethersx2-vulkan.log", "a");
+    if (vk_diag_file)
+      setvbuf(vk_diag_file, NULL, _IOLBF, 0);
+  }
+  return vk_diag_file;
+}
+
+void
+vk_diag_reset(void) {
+  mutexLock(&vk_diag_mutex);
+  if (vk_diag_file) {
+    fclose(vk_diag_file);
+    vk_diag_file = NULL;
+  }
+  mkdir(DATA_ROOT, 0777);
+  vk_diag_file = fopen(DATA_ROOT "/nethersx2-vulkan.log", "w");
+  if (vk_diag_file) {
+    setvbuf(vk_diag_file, NULL, _IOLBF, 0);
+    fprintf(vk_diag_file, "NetherSX2 Vulkan diagnostic %s\n", NETHERSX2_VERSION);
+    fflush(vk_diag_file);
+    fsync(fileno(vk_diag_file));
+  }
+  mutexUnlock(&vk_diag_mutex);
+}
+
+void
+vk_diag_note(const char *format, ...) {
+  struct timespec time;
+  clock_gettime(CLOCK_MONOTONIC, &time);
+
+  mutexLock(&vk_diag_mutex);
+  FILE *file = vk_diag_open_locked();
+  if (file) {
+    fprintf(file, "[%lld.%03lld] ", (long long)time.tv_sec,
+            (long long)(time.tv_nsec / 1000000));
+    va_list args;
+    va_start(args, format);
+    vfprintf(file, format, args);
+    va_end(args);
+    fputc('\n', file);
+    fflush(file);
+    fsync(fileno(file));
+  }
+  mutexUnlock(&vk_diag_mutex);
+}
+
+void
+vk_diag_exception(uint64_t pc, uint64_t far, uint32_t esr,
+                  uint64_t sp, uint64_t frame_pointer, uint64_t link_register) {
+  char report[512];
+  const int length = snprintf(
+      report, sizeof(report),
+      "NetherSX2 fatal CPU exception\n"
+      "pc=0x%016llx far=0x%016llx esr=0x%08x\n"
+      "sp=0x%016llx fp=0x%016llx lr=0x%016llx\n",
+      (unsigned long long)pc, (unsigned long long)far, esr,
+      (unsigned long long)sp, (unsigned long long)frame_pointer,
+      (unsigned long long)link_register);
+  const int fd = open(DATA_ROOT "/nethersx2-exception.log",
+                      O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd >= 0) {
+    if (length > 0)
+      (void)write(fd, report, (size_t)length < sizeof(report) ?
+                             (size_t)length : sizeof(report));
+    fsync(fd);
+    close(fd);
+  }
+}
+#endif
 
 typedef struct {
   VkQueue queue;
@@ -76,6 +159,15 @@ static PFN_vkCreateSwapchainKHR real_create_swapchain;
 static PFN_vkGetSwapchainImagesKHR real_get_swapchain_images;
 static PFN_vkDestroySwapchainKHR real_destroy_swapchain;
 static PFN_vkDestroyDevice real_destroy_device;
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+static PFN_vkQueueSubmit real_queue_submit;
+static PFN_vkQueueSubmit2 real_queue_submit2;
+static PFN_vkAcquireNextImageKHR real_acquire_next_image;
+static unsigned vk_diag_submit_calls;
+static unsigned vk_diag_submit2_calls;
+static unsigned vk_diag_acquire_calls;
+static unsigned vk_diag_swapchain_image_calls;
+#endif
 
 static int lsfg_requested(void) {
   return __atomic_load_n(&lsfg_enabled_requested, __ATOMIC_ACQUIRE);
@@ -268,6 +360,11 @@ vkCreateAndroidSurfaceKHR_shim(VkInstance inst,
   };
   VkResult r = vkCreateViSurfaceNN(inst, &vi, alloc, out);
 
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkCreateViSurfaceNN window=%p result=%d surface=%p",
+               vi.window, r, out && r == VK_SUCCESS ? (void *)*out : NULL);
+#endif
+
   return r;
 }
 
@@ -279,6 +376,11 @@ vkCreateDevice_shim(VkPhysicalDevice physical_device,
                     const VkDeviceCreateInfo *create_info,
                     const VkAllocationCallbacks *alloc,
                     VkDevice *out) {
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkCreateDevice begin physical=%p queues=%u extensions=%u lsfg_pref=%d",
+               (void *)physical_device, create_info->queueCreateInfoCount,
+               create_info->enabledExtensionCount, lsfg_session_prepared);
+#endif
   PFN_vkCreateDevice create_fn = real_create_device ? real_create_device : vkCreateDevice;
   int prepare_lsfg = lsfg_session_prepared;
   if (prepare_lsfg && !file_readable(lsfg_dll_path())) {
@@ -393,6 +495,11 @@ vkCreateDevice_shim(VkPhysicalDevice physical_device,
       lsfg_device_capable = 1;
     }
   }
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkCreateDevice end result=%d device=%p lsfg_capable=%d family=%u",
+               result, out && result == VK_SUCCESS ? (void *)*out : NULL,
+               lsfg_device_capable, lsfg_main_queue_family);
+#endif
   return result;
 }
 
@@ -403,6 +510,10 @@ vkGetDeviceQueue_shim(VkDevice device, uint32_t queue_family_index,
       real_get_device_queue : vkGetDeviceQueue;
   get_fn(device, queue_family_index, queue_index, out);
   if (out) remember_queue(*out, queue_family_index);
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkGetDeviceQueue family=%u index=%u queue=%p",
+               queue_family_index, queue_index, out ? (void *)*out : NULL);
+#endif
 }
 
 static void VKAPI_CALL
@@ -412,13 +523,83 @@ vkGetDeviceQueue2_shim(VkDevice device, const VkDeviceQueueInfo2 *queue_info,
       real_get_device_queue2 : vkGetDeviceQueue2;
   get_fn(device, queue_info, out);
   if (queue_info && out) remember_queue(*out, queue_info->queueFamilyIndex);
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkGetDeviceQueue2 family=%u index=%u queue=%p",
+               queue_info ? queue_info->queueFamilyIndex : UINT32_MAX,
+               queue_info ? queue_info->queueIndex : UINT32_MAX,
+               out ? (void *)*out : NULL);
+#endif
 }
+
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+static VkResult VKAPI_CALL
+vkQueueSubmit_shim(VkQueue queue, uint32_t submit_count,
+                   const VkSubmitInfo *submits, VkFence fence) {
+  PFN_vkQueueSubmit submit = real_queue_submit ? real_queue_submit : vkQueueSubmit;
+  VkResult result = submit(queue, submit_count, submits, fence);
+  const unsigned call = ++vk_diag_submit_calls;
+  if (call <= 3 || result != VK_SUCCESS)
+    vk_diag_note("vkQueueSubmit call=%u count=%u fence=%p result=%d",
+                 call, submit_count, (void *)fence, result);
+  return result;
+}
+
+static VkResult VKAPI_CALL
+vkQueueSubmit2_shim(VkQueue queue, uint32_t submit_count,
+                    const VkSubmitInfo2 *submits, VkFence fence) {
+  PFN_vkQueueSubmit2 submit = real_queue_submit2 ? real_queue_submit2 : vkQueueSubmit2;
+  VkResult result = submit(queue, submit_count, submits, fence);
+  const unsigned call = ++vk_diag_submit2_calls;
+  if (call <= 3 || result != VK_SUCCESS)
+    vk_diag_note("vkQueueSubmit2 call=%u count=%u fence=%p result=%d",
+                 call, submit_count, (void *)fence, result);
+  return result;
+}
+
+static VkResult VKAPI_CALL
+vkAcquireNextImageKHR_shim(VkDevice device, VkSwapchainKHR swapchain,
+                           uint64_t timeout, VkSemaphore semaphore,
+                           VkFence fence, uint32_t *image_index) {
+  PFN_vkAcquireNextImageKHR acquire = real_acquire_next_image ?
+      real_acquire_next_image : vkAcquireNextImageKHR;
+  VkResult result = acquire(device, swapchain, timeout, semaphore, fence,
+                            image_index);
+  const unsigned call = ++vk_diag_acquire_calls;
+  if (call <= 4 || (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR))
+    vk_diag_note("vkAcquireNextImageKHR call=%u result=%d image=%u semaphore=%p fence=%p",
+                 call, result,
+                 image_index && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) ?
+                     *image_index : UINT32_MAX,
+                 (void *)semaphore, (void *)fence);
+  return result;
+}
+
+static VkResult VKAPI_CALL
+vkGetSwapchainImagesKHR_shim(VkDevice device, VkSwapchainKHR swapchain,
+                             uint32_t *count, VkImage *images) {
+  PFN_vkGetSwapchainImagesKHR get_images = real_get_swapchain_images ?
+      real_get_swapchain_images : vkGetSwapchainImagesKHR;
+  VkResult result = get_images(device, swapchain, count, images);
+  const unsigned call = ++vk_diag_swapchain_image_calls;
+  if (call <= 4 || (result != VK_SUCCESS && result != VK_INCOMPLETE))
+    vk_diag_note("vkGetSwapchainImagesKHR call=%u fill=%d result=%d count=%u",
+                 call, images != NULL, result, count ? *count : 0);
+  return result;
+}
+#endif
 
 static VkResult VKAPI_CALL
 vkCreateSwapchainKHR_shim(VkDevice device,
                           const VkSwapchainCreateInfoKHR *create_info,
                           const VkAllocationCallbacks *alloc,
                           VkSwapchainKHR *out) {
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkCreateSwapchainKHR begin old=%p extent=%ux%u format=%u usage=0x%x images=%u mode=%u",
+               (void *)create_info->oldSwapchain,
+               create_info->imageExtent.width, create_info->imageExtent.height,
+               create_info->imageFormat, create_info->imageUsage,
+               create_info->minImageCount, create_info->presentMode);
+#endif
   PFN_vkCreateSwapchainKHR create_fn = real_create_swapchain ?
       real_create_swapchain : vkCreateSwapchainKHR;
 
@@ -477,12 +658,22 @@ vkCreateSwapchainKHR_shim(VkDevice device,
     tracked_swapchain_lsfg_compatible = compatible;
     __atomic_store_n(&lsfg_runtime_available, compatible, __ATOMIC_RELEASE);
   }
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkCreateSwapchainKHR end result=%d swapchain=%p compatible=%d actual_usage=0x%x actual_images=%u actual_mode=%u",
+               result, out && result == VK_SUCCESS ? (void *)*out : NULL,
+               compatible, compatible ? modified.imageUsage : create_info->imageUsage,
+               compatible ? modified.minImageCount : create_info->minImageCount,
+               compatible ? modified.presentMode : create_info->presentMode);
+#endif
   return result;
 }
 
 static void VKAPI_CALL
 vkDestroySwapchainKHR_shim(VkDevice device, VkSwapchainKHR swapchain,
                            const VkAllocationCallbacks *alloc) {
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkDestroySwapchainKHR swapchain=%p", (void *)swapchain);
+#endif
   if (swapchain == tracked_swapchain) reset_tracked_swapchain();
   PFN_vkDestroySwapchainKHR destroy_fn = real_destroy_swapchain ?
       real_destroy_swapchain : vkDestroySwapchainKHR;
@@ -491,6 +682,9 @@ vkDestroySwapchainKHR_shim(VkDevice device, VkSwapchainKHR swapchain,
 
 static void VKAPI_CALL
 vkDestroyDevice_shim(VkDevice device, const VkAllocationCallbacks *alloc) {
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkDestroyDevice device=%p", (void *)device);
+#endif
   if (device == tracked_device) {
     reset_tracked_swapchain();
     tracked_device = VK_NULL_HANDLE;
@@ -506,6 +700,19 @@ vkDestroyDevice_shim(VkDevice device, const VkAllocationCallbacks *alloc) {
 
 // present counter (main.c reads vk_present_count).
 static PFN_vkQueuePresentKHR real_qpresent = NULL;
+
+static VkResult
+vkQueuePresentKHR_native(VkQueue queue, const VkPresentInfoKHR *present_info) {
+  PFN_vkQueuePresentKHR present = real_qpresent ? real_qpresent : vkQueuePresentKHR;
+  VkResult result = present(queue, present_info);
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  if (vk_present_count <= 4 || result != VK_SUCCESS)
+    vk_diag_note("vkQueuePresentKHR call=%d swaps=%u result=%d",
+                 vk_present_count,
+                 present_info ? present_info->swapchainCount : 0, result);
+#endif
+  return result;
+}
 
 static int lsfg_try_create(VkQueue queue) {
   if (lsfg_runtime) return 1;
@@ -561,6 +768,12 @@ static int lsfg_try_create(VkQueue queue) {
 static VkResult VKAPI_CALL
 vkQueuePresentKHR_shim(VkQueue q, const VkPresentInfoKHR *pi) {
   ++vk_present_count;
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  if (vk_present_count <= 4)
+    vk_diag_note("vkQueuePresentKHR enter call=%d waits=%u swaps=%u lsfg=%d",
+                 vk_present_count, pi ? pi->waitSemaphoreCount : 0,
+                 pi ? pi->swapchainCount : 0, lsfg_requested());
+#endif
   const int requested = lsfg_requested();
   uint64_t source_interval = 0;
 
@@ -598,14 +811,14 @@ vkQueuePresentKHR_shim(VkQueue q, const VkPresentInfoKHR *pi) {
     else if (source_interval)
       lsfg_high_fps_slow_samples = 0;
     if (lsfg_high_fps_slow_samples < 16)
-      return real_qpresent ? real_qpresent(q, pi) : vkQueuePresentKHR(q, pi);
+      return vkQueuePresentKHR_native(q, pi);
     lsfg_rate_decision = 0;
     lsfg_high_fps_slow_samples = 0;
   }
 
   /* Keep native presentation active until source-rate classification completes. */
   if (requested && lsfg_rate_decision < 0)
-    return real_qpresent ? real_qpresent(q, pi) : vkQueuePresentKHR(q, pi);
+    return vkQueuePresentKHR_native(q, pi);
 
   if (pi && pi->swapchainCount == 1 && pi->pSwapchains &&
       pi->pSwapchains[0] == tracked_swapchain &&
@@ -614,11 +827,18 @@ vkQueuePresentKHR_shim(VkQueue q, const VkPresentInfoKHR *pi) {
       return VK_ERROR_INITIALIZATION_FAILED;
     VkResult result = VK_ERROR_INITIALIZATION_FAILED;
     if (lsfg_nx_present(lsfg_runtime, q, pi, &result)) {
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+      if (vk_present_count <= 4 || result != VK_SUCCESS)
+        vk_diag_note("lsfg present call=%d result=%d", vk_present_count, result);
+#endif
       return result;
     }
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+    vk_diag_note("lsfg present call=%d failed before queue", vk_present_count);
+#endif
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  return real_qpresent ? real_qpresent(q, pi) : vkQueuePresentKHR(q, pi);
+  return vkQueuePresentKHR_native(q, pi);
 }
 
 // memory-budget override (the black-screen fix -- see file header).
@@ -646,6 +866,20 @@ static PFN_vkVoidFunction VKAPI_CALL
 vk_gdpa_hook(VkDevice dev, const char *name) {
   PFN_vkVoidFunction fn = vkGetDeviceProcAddr(dev, name);
   if (!name) return fn;
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  if (!strcmp(name, "vkQueueSubmit")) {
+    real_queue_submit = (PFN_vkQueueSubmit)fn;
+    return (PFN_vkVoidFunction)vkQueueSubmit_shim;
+  }
+  if (!strcmp(name, "vkQueueSubmit2") || !strcmp(name, "vkQueueSubmit2KHR")) {
+    real_queue_submit2 = (PFN_vkQueueSubmit2)fn;
+    return fn ? (PFN_vkVoidFunction)vkQueueSubmit2_shim : NULL;
+  }
+  if (!strcmp(name, "vkAcquireNextImageKHR")) {
+    real_acquire_next_image = (PFN_vkAcquireNextImageKHR)fn;
+    return (PFN_vkVoidFunction)vkAcquireNextImageKHR_shim;
+  }
+#endif
   if (!strcmp(name, "vkGetDeviceQueue")) {
     real_get_device_queue = (PFN_vkGetDeviceQueue)fn;
     return (PFN_vkVoidFunction)vkGetDeviceQueue_shim;
@@ -660,7 +894,11 @@ vk_gdpa_hook(VkDevice dev, const char *name) {
   }
   if (!strcmp(name, "vkGetSwapchainImagesKHR")) {
     real_get_swapchain_images = (PFN_vkGetSwapchainImagesKHR)fn;
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+    return (PFN_vkVoidFunction)vkGetSwapchainImagesKHR_shim;
+#else
     return fn;
+#endif
   }
   if (!strcmp(name, "vkDestroySwapchainKHR")) {
     real_destroy_swapchain = (PFN_vkDestroySwapchainKHR)fn;
@@ -691,6 +929,21 @@ vk_gipa_hook(VkInstance inst, const char *name) {
       return (PFN_vkVoidFunction)vkCreateAndroidSurfaceKHR_shim;
     if (!strcmp(name, "vkGetDeviceProcAddr"))
       return (PFN_vkVoidFunction)vk_gdpa_hook;
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+    if (!strcmp(name, "vkQueueSubmit")) {
+      real_queue_submit = (PFN_vkQueueSubmit)vkGetInstanceProcAddr(inst, name);
+      return (PFN_vkVoidFunction)vkQueueSubmit_shim;
+    }
+    if (!strcmp(name, "vkQueueSubmit2") || !strcmp(name, "vkQueueSubmit2KHR")) {
+      real_queue_submit2 = (PFN_vkQueueSubmit2)vkGetInstanceProcAddr(inst, name);
+      return real_queue_submit2 ? (PFN_vkVoidFunction)vkQueueSubmit2_shim : NULL;
+    }
+    if (!strcmp(name, "vkAcquireNextImageKHR")) {
+      real_acquire_next_image =
+          (PFN_vkAcquireNextImageKHR)vkGetInstanceProcAddr(inst, name);
+      return (PFN_vkVoidFunction)vkAcquireNextImageKHR_shim;
+    }
+#endif
     if (!strcmp(name, "vkCreateDevice")) {
       real_create_device = (PFN_vkCreateDevice)vkGetInstanceProcAddr(inst, name);
       return (PFN_vkVoidFunction)vkCreateDevice_shim;
@@ -709,7 +962,11 @@ vk_gipa_hook(VkInstance inst, const char *name) {
     }
     if (!strcmp(name, "vkGetSwapchainImagesKHR")) {
       real_get_swapchain_images = (PFN_vkGetSwapchainImagesKHR)vkGetInstanceProcAddr(inst, name);
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+      return (PFN_vkVoidFunction)vkGetSwapchainImagesKHR_shim;
+#else
       return (PFN_vkVoidFunction)real_get_swapchain_images;
+#endif
     }
     if (!strcmp(name, "vkDestroySwapchainKHR")) {
       real_destroy_swapchain = (PFN_vkDestroySwapchainKHR)vkGetInstanceProcAddr(inst, name);
@@ -759,6 +1016,18 @@ vkEnumerateInstanceExtensionProperties_hook(const char *layer, uint32_t *pCount,
 VkResult VKAPI_CALL
 vkCreateInstance_hook(const VkInstanceCreateInfo *ci,
                       const VkAllocationCallbacks *alloc, VkInstance *out) {
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkCreateInstance begin api=%u app=%s engine=%s extensions=%u",
+               ci->pApplicationInfo ? ci->pApplicationInfo->apiVersion : 0,
+               ci->pApplicationInfo && ci->pApplicationInfo->pApplicationName ?
+                   ci->pApplicationInfo->pApplicationName : "(null)",
+               ci->pApplicationInfo && ci->pApplicationInfo->pEngineName ?
+                   ci->pApplicationInfo->pEngineName : "(null)",
+               ci->enabledExtensionCount);
+  for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i)
+    vk_diag_note("instance extension[%u]=%s", i,
+                 ci->ppEnabledExtensionNames[i]);
+#endif
   int lsfg_launch_prepared =
       prefs_get_bool("Wrapper/LSFGEnabled", false) &&
       file_readable(lsfg_dll_path());
@@ -785,12 +1054,24 @@ vkCreateInstance_hook(const VkInstanceCreateInfo *ci,
     lsfg_main_queue_family = VK_QUEUE_FAMILY_IGNORED;
     lsfg_device_capable = 0;
     lsfg_session_prepared = lsfg_launch_prepared;
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+    vk_diag_submit_calls = 0;
+    vk_diag_submit2_calls = 0;
+    vk_diag_acquire_calls = 0;
+    vk_diag_swapchain_image_calls = 0;
+#endif
     // The launcher switch is an availability gate, not the initial runtime
     // state. Every game starts with frame generation disabled until the user
     // explicitly enables it from the in-game overlay.
     vk_lsfg_request_enabled(0);
     reset_tracked_swapchain();
   }
+
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  vk_diag_note("vkCreateInstance end result=%d instance=%p lsfg_prepared=%d",
+               r, out && r == VK_SUCCESS ? (void *)*out : NULL,
+               lsfg_launch_prepared);
+#endif
 
   return r;
 }

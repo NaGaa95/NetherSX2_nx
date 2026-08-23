@@ -16,6 +16,7 @@
 #include <array>
 #include <climits>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <algorithm>
 #include <functional>
@@ -398,7 +399,8 @@ static const Choice C_stick[]    = { {"Left Stick","LStick"}, {"Right Stick","RS
 static const Choice C_players[]  = { {"1","1"}, {"2","2"} };
 static const Choice C_launcherLanguage[] = {
   {"System", "system"}, {"English", "en"}, {"Français", "fr"},
-  {"Deutsch", "de"}, {"Español", "es"}, {"Italiano", "it"}, {"Português", "pt"}
+  {"Deutsch", "de"}, {"Español", "es"}, {"Italiano", "it"}, {"Português", "pt"},
+  {"简体中文", "zh-Hans"}, {"繁體中文", "zh-Hant"}
 };
 static const Choice C_launcherTheme[] = { {"XMB (PS3)","xmb"}, {"Glow","animated"}, {"Bubbles","homebrew"},
                                           {"Classic","classic"}, {"OLED black","oled"} };
@@ -529,7 +531,7 @@ static const Opt S_controller[] = {
   O_CHOICE("R2",          "Wrapper/Pad1/R2",       C_btn, "ZR"),
   O_CHOICE("L3",          "Wrapper/Pad1/L3",       C_btn, "StickL"),
   O_CHOICE("R3",          "Wrapper/Pad1/R3",       C_btn, "StickR"),
-  O_CHOICE("Analog toggle","Wrapper/Pad1/Analog",   C_btn, "None"),
+  O_HOTKEY("Analog toggle","Wrapper/Pad1/Analog",  "None"),
   O_CHOICE("Select",      "Wrapper/Pad1/Select",   C_btn, "Minus"),
   O_CHOICE("Start",       "Wrapper/Pad1/Start",    C_btn, "Plus"),
   O_CHOICE("D-Pad Up",    "Wrapper/Pad1/Up",       C_btn, "Up"),
@@ -780,7 +782,7 @@ static const SettingHelpEntry SETTING_HELP[] = {
   {"Wrapper/TurboCombo", "Hotkey binding",
    "Assigns a unique Switch button or multi-button combination to PS2 turbo speed. Press A, hold every button in the combination, then release them. None leaves turbo unmapped."},
   {"Wrapper/Pad1/Analog", "Controller mode",
-   "Maps the physical DualShock 2 Analog button, which toggles the emulated controller between digital and analog modes when a game has not locked it. Leave it on None to use the in-game Controller Mapping action without sacrificing a Switch button."},
+   "Assigns a Switch button combination to the physical DualShock 2 Analog button, which toggles the emulated controller between digital and analog modes when a game has not locked it. Press A, hold every button in the combination, then release them. None leaves it unmapped."},
   {"Wrapper/Pad1/LeftStick", "Analog mapping",
    "Chooses which Switch analog stick controls the PS2 left stick. Set it to None to leave that emulated stick unmapped."},
   {"Wrapper/Pad1/RightStick", "Analog mapping",
@@ -873,6 +875,7 @@ static void commitAll() {
 static SDL_Window   *g_win = nullptr;
 static SDL_Renderer *g_ren = nullptr;
 static TTF_Font     *g_font = nullptr, *g_font_sm = nullptr, *g_font_big = nullptr;
+static PlSharedFontType g_loadedFontType = PlSharedFontType_Total;
 static SDL_Texture  *g_logo = nullptr;
 static int SW = 1280, SH = 720;
 static bool g_romfsReady = false;
@@ -1022,6 +1025,66 @@ static void clearTextCaches() {
   g_ellipsisCache.clear();
   g_textCacheBytes = 0;
   g_textUseSerial = 0;
+}
+
+static PlSharedFontType launcherFontType()
+{
+  const std::string_view code = g_localization.ResolvedCode();
+  if (code == "zh-Hans") return PlSharedFontType_ChineseSimplified;
+  if (code == "zh-Hant") return PlSharedFontType_ChineseTraditional;
+  return PlSharedFontType_Standard;
+}
+
+static bool reloadLauncherFonts()
+{
+  if (!g_plReady || !g_ttfReady) return false;
+  const PlSharedFontType requestedType = launcherFontType();
+  if (g_loadedFontType == requestedType && g_font_sm && g_font && g_font_big)
+    return true;
+
+  PlFontData fontData{};
+  if (R_FAILED(plGetSharedFontByType(&fontData, requestedType)) ||
+      !fontData.address || !fontData.size || fontData.size > INT_MAX)
+    return false;
+
+  const int scale = SH >= 1080 ? 1 : 0;
+  const auto openFont = [&](int size) -> TTF_Font* {
+    SDL_RWops* rw = SDL_RWFromConstMem(fontData.address, static_cast<int>(fontData.size));
+    return rw ? TTF_OpenFontRW(rw, 1, size) : nullptr;
+  };
+  TTF_Font* small = openFont(scale ? 26 : 20);
+  TTF_Font* normal = openFont(scale ? 32 : 26);
+  TTF_Font* large = openFont(scale ? 52 : 40);
+  if (!small || !normal || !large)
+  {
+    if (small) TTF_CloseFont(small);
+    if (normal) TTF_CloseFont(normal);
+    if (large) TTF_CloseFont(large);
+    return false;
+  }
+
+  clearTextCaches();
+  if (g_font_sm) TTF_CloseFont(g_font_sm);
+  if (g_font) TTF_CloseFont(g_font);
+  if (g_font_big) TTF_CloseFont(g_font_big);
+  g_font_sm = small;
+  g_font = normal;
+  g_font_big = large;
+  g_loadedFontType = requestedType;
+  return true;
+}
+
+static bool setLauncherLanguage(std::string_view preference)
+{
+  const std::string previous(g_localization.Preference());
+  g_localization.SetLanguage(preference);
+  if (g_plReady && !reloadLauncherFonts())
+  {
+    g_localization.SetLanguage(previous);
+    return false;
+  }
+  clearTextCaches();
+  return true;
 }
 
 static void applyLauncherAppearance() {
@@ -2247,6 +2310,7 @@ struct SmbAutoMountState {
   std::mutex mutex;
   std::vector<std::string> mountedRoots;
 };
+static bool pathAtOrBelow(const std::string &path,const std::string &root);
 static std::shared_ptr<UsbInitializationState> g_usbInitialization;
 static std::thread g_usbInitializationThread;
 static std::shared_ptr<SmbAutoMountState> g_smbAutoMount;
@@ -2292,10 +2356,13 @@ static void stopAutoMountShares() {
   g_smbAutoMount.reset();
 }
 
-static void startAutoMountShares() {
+static void startAutoMountShares(const std::string &requiredPath={}) {
   stopAutoMountShares();
   std::vector<SwitchStorage::SmbShare> shares;
-  for(const auto &share:loadSmbSharesFromStore()) if(share.autoMount) shares.push_back(share);
+  for(const auto &share:loadSmbSharesFromStore())
+    if(share.autoMount||(!requiredPath.empty()&&
+       pathAtOrBelow(requiredPath,SwitchStorage::SmbRootPath(share.id))))
+      shares.push_back(share);
   if(shares.empty()) return;
   auto state=std::make_shared<SmbAutoMountState>();
   g_smbAutoMount=state;
@@ -3765,16 +3832,10 @@ static bool refreshConfiguredUsbSources(std::vector<std::string> &paths) {
   return changed;
 }
 
-static void renderUsbForwarderWait() {
-  clearUiBackground();
-  const int panelWidth=720,panelHeight=220;
-  const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
-  glassPanel(panelX,panelY,panelWidth,panelHeight);
-  border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
-  drawTextC(g_font_big,SW/2,panelY+42,"Connecting USB storage",COL_SEL);
-  drawTextC(g_font,SW/2,panelY+108,"Waiting for the game drive...",COL_TXT);
-  drawTextC(g_font_sm,SW/2,panelY+142,"The game will start automatically",COL_DIM);
-  drawSettingsFooter("B  Cancel",panelY+184);
+static void renderForwarderBootWait() {
+  SDL_RenderSetClipRect(g_ren,nullptr);
+  SDL_SetRenderDrawColor(g_ren,0,0,0,255);
+  SDL_RenderClear(g_ren);
   SDL_RenderPresent(g_ren);
 }
 
@@ -4049,8 +4110,8 @@ static void optValue(const Opt &o, char *out, int n) {
 static void optSetChoice(const Opt &o,const char *value) {
   iniSet(o.key,value);
   if(o.key && !strcmp(o.key,"Wrapper/Language")){
-    g_localization.SetLanguage(value);
-    clearTextCaches();
+    const std::string previous(g_localization.Preference());
+    if(!setLauncherLanguage(value)) iniSet(o.key,previous.c_str());
   }
   if(o.key && !strcmp(o.key,"Wrapper/LSFGEnabled") && !strcmp(value,"true"))
     iniSet("EmuCore/GS/SkipDuplicateFrames","true");
@@ -4077,7 +4138,7 @@ static bool resetOption(const Opt &option)
   else
     storeRemove(*g_active,option.key); // Per-game Reset means inherit the global value.
   if (!strcmp(option.key,"Wrapper/Language"))
-    g_localization.SetLanguage(storeGet(g_global,"Wrapper/Language","system"));
+    setLauncherLanguage(storeGet(g_global,"Wrapper/Language","system"));
   return true;
 }
 
@@ -4126,7 +4187,7 @@ static const char *captureButton(SDL_GameController *pad) {
   }
 }
 
-static std::string captureButtonCombo(SDL_GameController *pad) {
+static std::string captureButtonCombo(SDL_GameController *pad,const char *action) {
   struct M { SDL_GameControllerButton button; const char *token; };
   static const M buttons[] = {
     {SDL_CONTROLLER_BUTTON_B,"A"},{SDL_CONTROLLER_BUTTON_A,"B"},
@@ -4180,7 +4241,10 @@ static std::string captureButtonCombo(SDL_GameController *pad) {
     int pw=840,ph=250,px=(SW-pw)/2,py=(SH-ph)/2;
     glassPanel(px,py,pw,ph);
     border(px,py,pw,ph,3,COL_SEL);
-    drawTextC(g_font_big,SW/2,py+42,"Hold the Turbo button combo",COL_HI);
+    std::string title="Hold the ";
+    title+=tr(action&&*action?action:"button");
+    title+=" combo";
+    drawTextC(g_font_big,SW/2,py+42,title.c_str(),COL_HI);
     drawTextC(g_font,SW/2,py+104,armed?"Hold every button, then release them":"Release the button used to open this screen",COL_TXT);
     std::string current=maskText(captured|held);
     drawTextC(g_font,SW/2,py+148,current.empty()?"Waiting...":current.c_str(),current.empty()?COL_DIM:COL_VAL);
@@ -4352,7 +4416,7 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
   int vis = (SH - 200) / rowH; if (vis < 1) vis = 1; if (vis > n) vis = n;
   beginScreenFx();
   for (;;) {
-    if(!beginUiFrame()) return cur;
+    if(!beginUiFrame()) return -1;
     SDL_Event e;
     navRepeat();
     while (pollUiEvent(e)) {
@@ -4367,7 +4431,7 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
         case SDL_CONTROLLER_BUTTON_DPAD_UP:   sel=(sel+n-1)%n; break;
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN: sel=(sel+1)%n;   break;
         case BTN_CONFIRM: return sel;
-        case BTN_CANCEL:  return cur;
+        case BTN_CANCEL:  return -1;
       }
       if(sel<top) top=sel;
       if(sel>=top+vis) top=sel-vis+1;
@@ -4461,7 +4525,7 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
           }
           else if(o.type==OT_HOTKEY){
             if(optEnabled(o)){
-              std::string combo=captureButtonCombo(pad);
+              std::string combo=captureButtonCombo(pad,o.label);
               if(!combo.empty()) iniSet(o.key,combo.c_str());
             }
             beginScreenFx();
@@ -4523,8 +4587,7 @@ static void launcherSettingsScreen() {
   int sel=std::max(0,std::min(savedSelection,selectionCount-1)),top=0;
   const bool originalShowBios=strcmp(storeGet(g_global,"Wrapper/ShowPS2BIOS","true"),"false")!=0;
   auto applyChange=[&](){
-    g_localization.SetLanguage(storeGet(g_global,"Wrapper/Language","system"));
-    clearTextCaches();
+    setLauncherLanguage(storeGet(g_global,"Wrapper/Language","system"));
     applyLauncherAppearance();
     uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
   };
@@ -5843,6 +5906,7 @@ static bool pickIcon(Game &g, char *outPath, size_t outSize) {
 
 static void forwarderWizard(Game &g) {
   char name[256]; snprintf(name,sizeof(name),"%s",g.title.c_str());
+  char author[128]; snprintf(author,sizeof(author),"%s","naga");
   char icon[300]={0};
   { struct stat st; std::string cp=existingCoverPath(g);
     if(stat(cp.c_str(),&st)==0) snprintf(icon,sizeof(icon),"%s",cp.c_str()); }
@@ -5850,7 +5914,7 @@ static void forwarderWizard(Game &g) {
 
   const int ix=110, iy=176, isz=280;
   const int rx=ix+isz+70; int rw=SW-rx-90;
-  const int nameY=196, createY=330, fieldH=64, createH=66;
+  const int nameY=196, authY=290, createY=406, fieldH=64, createH=58;
   int sel=0; bool done=false; beginScreenFx();
 
   auto edit=[&](const char *header,char *buffer,size_t size){
@@ -5863,7 +5927,7 @@ static void forwarderWizard(Game &g) {
     storeSave(g_global,LAUNCHER_INI);
     char err[256]={0}; bool ok=false;
     runBusyTask("Creating HOME shortcut",g.title,
-                [&]{ ok=forwarder_create(g.key,name,"naga",icon,err,sizeof(err)); });
+                [&]{ ok=forwarder_create(g.key,name,author,icon,err,sizeof(err)); });
     if(ok){ toastStatic("HOME shortcut installed"); done=true; }
   else modalMessage(uiText("Shortcut failed").c_str(), { err[0]?err:uiText("Unknown error") });
     beginScreenFx();
@@ -5871,6 +5935,7 @@ static void forwarderWizard(Game &g) {
   auto activate=[&](){
     if(sel==0){ char p[300]; if(pickIcon(g,p,sizeof(p))){ snprintf(icon,sizeof(icon),"%s",p); if(iconTex)SDL_DestroyTexture(iconTex); iconTex=loadScaledTexture(icon,isz,isz); } beginScreenFx(); }
     else if(sel==1) edit("Shortcut name", name, sizeof(name));
+    else if(sel==2) edit("Author", author, sizeof(author));
     else build();
   };
 
@@ -5883,7 +5948,8 @@ static void forwarderWizard(Game &g) {
         if(tk==TOUCH_TAP){
           if(tx>=ix&&tx<ix+isz&&ty>=iy&&ty<iy+isz){ sel=0; activate(); }
           else if(ty>=nameY-6&&ty<nameY+fieldH){ sel=1; activate(); }
-          else if(ty>=createY-6&&ty<createY+createH){ sel=2; activate(); }
+          else if(ty>=authY-6&&ty<authY+fieldH){ sel=2; activate(); }
+          else if(ty>=createY-6&&ty<createY+createH){ sel=3; activate(); }
           else if(ty>=SH-40) done=true;
           continue;
         }
@@ -5892,8 +5958,8 @@ static void forwarderWizard(Game &g) {
       switch(e.cbutton.button){
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  sel=0; break;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if(sel==0) sel=1; break;
-        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel==0)?2:(sel==1?2:sel-1); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel==0)?1:(sel==2?1:sel+1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel==0)?3:(sel==1?3:sel-1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel==0)?1:(sel==3?1:sel+1); break;
         case BTN_CONFIRM: activate(); break;
         case BTN_CANCEL:  done=true; break;
       }
@@ -5910,9 +5976,8 @@ static void forwarderWizard(Game &g) {
       drawText(g_font_sm, rx, y, label, cur?COL_VAL:COL_DIM);
       drawScrollTextL(g_font,rx,y+26,rw-8,val,cur?COL_VAL:COL_TXT); };
     field(1,nameY,"Name",name);
-    drawText(g_font_sm,rx,nameY+fieldH+18,tr("Author"),COL_DIM);
-    drawText(g_font,rx,nameY+fieldH+44,"naga",COL_TXT);
-    { bool cur=sel==2;
+    field(2,authY,tr("Author"),author);
+    { bool cur=sel==3;
       fillRect(rx-10,createY-6,rw+20,createH, cur?(SDL_Color){44,86,44,240}:(SDL_Color){30,46,32,200});
       if(cur) fillRect(rx-10,createY-6,5,createH,COL_SEL);
       drawTextC(g_font, rx+rw/2, createY+12, "Create shortcut", cur?COL_VAL:(SDL_Color){150,225,150,255}); }
@@ -6537,6 +6602,7 @@ static void cleanupLauncher() {
   if(g_font_sm) TTF_CloseFont(g_font_sm);
   if(g_font_big) TTF_CloseFont(g_font_big);
   g_font=g_font_sm=g_font_big=nullptr;
+  g_loadedFontType=PlSharedFontType_Total;
   if(g_plReady) plExit();
   g_plReady=false;
   uiAudioShutdown();
@@ -6572,7 +6638,7 @@ static void runAppletInstaller() {
   enum class State { Ready,Installed,Failed };
   State state=State::Ready;
   std::string error;
-  g_localization.SetLanguage("system");
+  setLauncherLanguage("system");
   beginScreenFx();
   while(beginUiFrame()){
     const int panelWidth=std::min(SW-120,980),panelHeight=std::min(SH-140,500);
@@ -6628,6 +6694,22 @@ static void runAppletInstaller() {
 }
 
 int main(int argc, char **argv){
+  bool forwarderRequested=false;
+  bool forwarderDirectPath=false;
+  std::string forwarderKey;
+  if(argc>=2&&argv[1]&&argv[1][0]&&argv[1][0]!='-'){
+    const std::string candidate=normalizeLocationPath(argv[1]);
+    if(!candidate.empty()&&hasDiscExt(candidate.c_str())){
+      forwarderRequested=true;
+      forwarderDirectPath=true;
+      forwarderKey=candidate;
+    }
+  }
+  if(!forwarderRequested) for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
+    forwarderRequested=true;
+    forwarderKey=argv[argument+1];
+    break;
+  }
   extern std::string g_forwarderSelfPath;
   if(argc>=1&&argv[0]&&argv[0][0]){
     g_forwarderSelfPath=argv[0];
@@ -6655,21 +6737,16 @@ int main(int argc, char **argv){
   if(!g_ren) return startupFailure("Could not create the launcher renderer.");
   SDL_SetRenderDrawBlendMode(g_ren,SDL_BLENDMODE_BLEND);
   if(SDL_GetRendererOutputSize(g_ren,&SW,&SH)!=0) return startupFailure("Could not query the display size.");
+  if(forwarderRequested) renderForwarderBootWait();
   if(SDL_Surface *logo=IMG_Load("romfs:/logo.png")){ g_logo=SDL_CreateTextureFromSurface(g_ren,logo); SDL_FreeSurface(logo); }
   makeFlags();
   for(int index=0;index<SDL_NumJoysticks();index++) if(SDL_IsGameController(index)){ openController(index); break; }
 
+  setLauncherLanguage("system");
   if(R_FAILED(plInitialize(PlServiceType_User))) return startupFailure("System font service initialization failed.");
   g_plReady=true;
-  PlFontData fontData{};
-  if(R_FAILED(plGetSharedFontByType(&fontData,PlSharedFontType_Standard))||!fontData.address||!fontData.size||fontData.size>INT_MAX)
+  if(!reloadLauncherFonts())
     return startupFailure("Could not load the system font.");
-  int scale=SH>=1080?1:0;
-  auto openFont=[&](int size)->TTF_Font*{ SDL_RWops *rw=SDL_RWFromConstMem(fontData.address,(int)fontData.size); return rw?TTF_OpenFontRW(rw,1,size):nullptr; };
-  g_font_sm=openFont(scale?26:20);
-  g_font=openFont(scale?32:26);
-  g_font_big=openFont(scale?52:40);
-  if(!g_font_sm||!g_font||!g_font_big) return startupFailure("Could not open the system font.");
   makeGlyphs();
 
   if(isAppletMode()){
@@ -6732,25 +6809,26 @@ int main(int argc, char **argv){
     if(rows<1||rows>3){ storeSet(g_global,"Wrapper/GridRows","2"); changed=true; }
     if(changed&&!storeSave(g_global,LAUNCHER_INI)) return startupFailure("Could not update launcher.ini.");
   }
-  g_localization.SetLanguage(storeGet(g_global,"Wrapper/Language","system"));
+  setLauncherLanguage(storeGet(g_global,"Wrapper/Language","system"));
   applyLauncherAppearance();
   uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
   startCoverDecodeWorker();
   std::vector<std::string> gamePaths=loadGameSources();
-  bool hasUsbSource=hasConfiguredUsbSource(gamePaths);
+  bool hasUsbSource=!forwarderDirectPath&&hasConfiguredUsbSource(gamePaths);
+  const bool directForwarderUsesUsb=forwarderDirectPath&&isUsbStoragePath(forwarderKey);
   SwitchStorage::SetUsbStatusCallback(usbStatusWake);
   LauncherUpdate_SetWakeCallback(usbStatusWake,nullptr);
-  startUsbInitialization();
-  startAutoMountShares();
+  if(!forwarderDirectPath||directForwarderUsesUsb) startUsbInitialization();
+  startAutoMountShares(forwarderDirectPath?forwarderKey:std::string{});
   auto usbSnapshot=SwitchStorage::GetUsbSnapshot();
   uint64_t usbGeneration=usbSnapshot.generation;
   auto usbLocations=usbSnapshot.locations;
   refreshConfiguredUsbSources(gamePaths);
-  scanGames(gamePaths);
+  if(!forwarderDirectPath) scanGames(gamePaths);
   Uint32 usbRefreshAt=0,smbRefreshAt=0;
   std::vector<std::string> smbPendingSources;
   const uint64_t startupUsbGeneration=SwitchStorage::UsbStatusGeneration();
-  if(startupUsbGeneration!=usbGeneration){ usbGeneration=startupUsbGeneration; usbRefreshAt=SDL_GetTicks()+300; }
+  if(!forwarderDirectPath&&startupUsbGeneration!=usbGeneration){ usbGeneration=startupUsbGeneration; usbRefreshAt=SDL_GetTicks()+300; }
 
   if(!biosPresent()) modalMessage(uiText("No PS2 BIOS found").c_str(),{uiText("Copy a PS2 BIOS dump into:"),toEmu(BIOS_DIR),"",uiText("Games will not boot until you add one.")});
 
@@ -6780,13 +6858,46 @@ int main(int argc, char **argv){
     running=false;
   };
 
-  bool forwarderRequested=false,forwarderMatched=false;
-  std::string forwarderKey;
-  for(int argument=1;argument+1<argc;argument++) if(!strcmp(argv[argument],"-g")){
-    forwarderRequested=true;
-    forwarderKey=argv[argument+1];
-    if(Game *game=findGameByKey(forwarderKey)){ selectGame(*game); forwarderMatched=true; }
-    break;
+  auto prepareDirectForwarderGame=[&](const std::string &directPath)->bool{
+    struct stat info{};
+    if(stat(directPath.c_str(),&info)!=0||!S_ISREG(info.st_mode)) return false;
+
+    Game game;
+    game.path=directPath;
+    const size_t slash=directPath.find_last_of("/\\");
+    game.file=slash==std::string::npos?directPath:directPath.substr(slash+1);
+    game.sourceRoot=slash==std::string::npos?std::string{}:directPath.substr(0,slash);
+    game.storageId=storageIdForSource(game.sourceRoot.empty()?directPath:game.sourceRoot);
+    game.legacyKey=sanitize(game.file);
+    game.pathKey=makeLegacyPathKey(game.file,game.path);
+    game.fileSize=static_cast<uint64_t>(info.st_size);
+    game.modified=static_cast<long long>(info.st_mtime);
+    game.added=game.modified;
+
+    for(const auto &record:g_libraryIdentities){
+      if(pathIdentity(record.canonicalPath)==pathIdentity(game.path)&&
+         record.fileSize==game.fileSize&&record.modified==game.modified){
+        game.fingerprint=record.fingerprint;
+        break;
+      }
+    }
+    if(game.fingerprint.empty()) game.fingerprint=fingerprintGameFile(game.path,game.fileSize);
+    if(game.fingerprint.empty()) return false;
+    assignStableIdentity(game);
+    game.legacyUnique=false;
+    game.played=atoll(gameStoreGet(g_recent,game,"0"));
+    game.hasCfg=gameFileExists(GAMECFG_DIR,game,".ini");
+    selectGame(game);
+    return true;
+  };
+
+  bool forwarderMatched=false;
+  if(forwarderRequested){
+    if(forwarderDirectPath) forwarderMatched=prepareDirectForwarderGame(forwarderKey);
+    else if(Game *game=findGameByKey(forwarderKey)){
+      selectGame(*game);
+      forwarderMatched=true;
+    }
   }
   if(!forwarderRequested&&g_griddbReady&&
      strcmp(storeGet(g_global,"Wrapper/CheckUpdatesAtBoot","true"),"false")!=0)
@@ -6798,11 +6909,12 @@ int main(int argc, char **argv){
     pumpGameScan();
     if(pumpUsbInitialization()){
       usbGeneration=SwitchStorage::UsbStatusGeneration();
-      hasUsbSource=hasConfiguredUsbSource(gamePaths);
-      if(refreshConfiguredUsbSources(gamePaths)||hasUsbSource) usbRefreshAt=SDL_GetTicks()+250;
+      hasUsbSource=!forwarderDirectPath&&hasConfiguredUsbSource(gamePaths);
+      if(!forwarderDirectPath&&(refreshConfiguredUsbSources(gamePaths)||hasUsbSource))
+        usbRefreshAt=SDL_GetTicks()+250;
     }
     const auto mountedRoots=pumpAutoMountShares();
-    if(!mountedRoots.empty()) for(const auto &root:mountedRoots)
+    if(!forwarderDirectPath&&!mountedRoots.empty()) for(const auto &root:mountedRoots)
       for(const auto &path:gamePaths) if(pathAtOrBelow(path,root)){
         if(std::none_of(smbPendingSources.begin(),smbPendingSources.end(),[&](const auto &item){ return pathIdentity(item)==pathIdentity(path); }))
           smbPendingSources.push_back(path);
@@ -6813,10 +6925,15 @@ int main(int argc, char **argv){
       scanAdditionalGames(smbPendingSources);
       smbPendingSources.clear();
     }
-    if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
-      selectGame(*game);
-      forwarderPending=false;
+    if(forwarderPending){
+      if(forwarderDirectPath){
+        if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
+      } else if(Game *game=findGameByKey(forwarderKey)){
+        selectGame(*game);
+        forwarderPending=false;
+      }
     }
+    if(!running) break;
     if(hasUsbSource){
       const Uint32 now=SDL_GetTicks();
       const uint64_t generation=SwitchStorage::UsbStatusGeneration();
@@ -6858,9 +6975,13 @@ int main(int argc, char **argv){
         sel=0; top=0;
         if(!selected.empty()) for(int index=0;index<(int)g_visibleGames.size();index++)
           if(visibleGame(index)&&visibleGame(index)->key==selected){ sel=index; break; }
-        if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
-          selectGame(*game);
-          forwarderPending=false;
+        if(forwarderPending){
+          if(forwarderDirectPath){
+            if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
+          } else if(Game *game=findGameByKey(forwarderKey)){
+            selectGame(*game);
+            forwarderPending=false;
+          }
         }
       }
       if(!running) break;
@@ -6885,8 +7006,8 @@ int main(int argc, char **argv){
         }
       }
       if(!running) break;
-      renderUsbForwarderWait();
-    waitForNextFrame();
+      if(!forwarderDirectPath) renderForwarderBootWait();
+      waitForNextFrame();
       continue;
     }
     GLay layout=gridLayout(); int cols=layout.cols; rows=layout.rows;

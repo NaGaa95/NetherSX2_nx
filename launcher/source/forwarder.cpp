@@ -636,17 +636,20 @@ bool patch_npdm(std::vector<u8> &npdm, u64 tid)
     return true;
 }
 
-void patch_nacp(NacpStruct &nacp, const std::string &name, u64 tid)
+void patch_nacp(NacpStruct &nacp, const std::string &name, const std::string &author, u64 tid)
 {
     for (auto &lang : nacp.lang) {
         if (!name.empty()) {
             std::memset(lang.name, 0, sizeof(lang.name));
             std::strncpy(lang.name, name.c_str(), sizeof(lang.name) - 1);
         }
+        if (!author.empty()) {
+            std::memset(lang.author, 0, sizeof(lang.author));
+            std::strncpy(lang.author, author.c_str(), sizeof(lang.author) - 1);
+        }
     }
-    // The bundled default.nacp is the single source of truth for launcher and
-    // shortcut author/version metadata. Per-game creation patches only the
-    // display name and identity/policy fields below.
+    // The bundled default.nacp remains the source of truth for the launcher and
+    // version metadata. Per-game shortcuts may override their displayed author.
     nacp.startup_user_account = 0x00;
     nacp.user_account_switch_lock = 0x00;
     nacp.add_on_content_registration_type = 0x01;
@@ -1194,6 +1197,7 @@ bool rollbackContentMeta(NcmStorageId storageId, const NcmContentMetaKey &key,
 }
 
 Result install_forwarder(const std::string &gameKey, const std::string &name,
+                         const std::string &author,
                          bool launcherOnly,
                          const std::vector<u8> &nsoData, std::vector<u8> npdmData, NacpStruct nacp,
                          const std::vector<u8> &iconJpeg, ForwarderStage &stage)
@@ -1240,7 +1244,7 @@ Result install_forwarder(const std::string &gameKey, const std::string &name,
         ncaEntries.emplace_back(create_program_nca(tid, headerKey, exefs));
     }
     {
-        patch_nacp(nacp, name, tid);
+        patch_nacp(nacp, name, author, tid);
         FileEntries romfs;
         add_file_entry(romfs, "/control.nacp", &nacp, sizeof(nacp));
         add_file_entry(romfs, "/icon_AmericanEnglish.dat", iconJpeg.data(), iconJpeg.size());
@@ -1333,7 +1337,8 @@ std::string launcherNroPath()
 }
 
 static bool forwarder_create_common(const std::string &gameKey, const std::string &name,
-                                    const std::string &iconImgPath,bool launcherOnly,
+                                    const std::string &author,const std::string &iconImgPath,
+                                    bool launcherOnly,
                                     char *err, std::size_t errSize)
 {
     if (err && errSize) err[0] = '\0';
@@ -1377,7 +1382,7 @@ static bool forwarder_create_common(const std::string &gameKey, const std::strin
     }
     if (R_SUCCEEDED(rc)) {
         try {
-            rc = install_forwarder(gameKey, name.empty() ? "NetherSX2" : name,launcherOnly,
+            rc = install_forwarder(gameKey, name.empty() ? "NetherSX2" : name,author,launcherOnly,
                                    nso, npdm, nacp, iconJpeg, stage);
         } catch (...) {
             rc = kForwarderIoError;
@@ -1401,13 +1406,14 @@ static bool forwarder_create_common(const std::string &gameKey, const std::strin
     return true;
 }
 
-bool forwarder_create(const std::string &gameKey, const std::string &name, const std::string &,
+bool forwarder_create(const std::string &gameKey, const std::string &name, const std::string &author,
                       const std::string &iconImgPath, char *err, std::size_t errSize)
 {
-    return forwarder_create_common(gameKey,name,iconImgPath,false,err,errSize);
+    return forwarder_create_common(gameKey,name,author.empty()?"NetherSX2":author,
+                                   iconImgPath,false,err,errSize);
 }
 
 bool forwarder_create_launcher(char *err,std::size_t errSize)
 {
-    return forwarder_create_common("launcher","NetherSX2","romfs:/logo.png",true,err,errSize);
+    return forwarder_create_common("launcher","NetherSX2","","romfs:/logo.png",true,err,errSize);
 }

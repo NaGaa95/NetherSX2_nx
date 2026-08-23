@@ -522,6 +522,7 @@ enum {
   PB_ANALOG, PB_PRESSURE,
   PB_LUP, PB_LRIGHT, PB_LDOWN, PB_LLEFT,
   PB_RUP, PB_RRIGHT, PB_RDOWN, PB_RLEFT,
+  PB_COUNT,
 };
 
 // ---------------------------------------------------------------------------
@@ -566,6 +567,7 @@ typedef struct { int src; int invX, invY; } PadStick; // src: 0=LStick 1=RStick 
 typedef struct {
   struct { u64 hid; int bind; } binds[NUM_PS2_BUTTONS];
   int bind_count;
+  u64 analog_combo;
   PadStick left_stick;
   PadStick right_stick;
   float deadzone;
@@ -575,8 +577,26 @@ static u64 g_turbo_combo;
 static int g_turbo_active;
 static int g_turbo_blocked;
 
+// Raw stick integers dither by an ADC LSB even at rest, so the analog path
+// re-sent all eight axis binds every poll. Forward only real value changes.
+static float   g_pad_value_last[MAX_CONTROLLERS][PB_COUNT];
+static uint8_t g_pad_value_known[MAX_CONTROLLERS][PB_COUNT];
+
+static void pad_set_value(int player, int bind, float value) {
+  if (!nl.setPadValue || player < 0 || player >= MAX_CONTROLLERS ||
+      bind < 0 || bind >= PB_COUNT)
+    return;
+  if (g_pad_value_known[player][bind] && g_pad_value_last[player][bind] == value)
+    return;
+  nl.setPadValue(fake_env, NATIVE_CLASS, player, bind, value);
+  g_pad_value_last[player][bind] = value;
+  g_pad_value_known[player][bind] = 1;
+}
+
 static void pad_invalidate_sticks(void) {
   memset(g_pad_sticks_valid, 0, sizeof(g_pad_sticks_valid));
+  // Mapping/deadzone changes reshape an unmoved stick's values; re-send them.
+  memset(g_pad_value_known, 0, sizeof(g_pad_value_known));
 }
 
 static bool pad_sticks_changed(int player, HidAnalogStickState left,
@@ -620,6 +640,30 @@ static u64 combo_to_hid(const char *combo) {
   return mask;
 }
 
+static u64 bindable_hid_mask(void) {
+  u64 mask = 0;
+  for (unsigned i = 0; i < sizeof(hid_tokens) / sizeof(*hid_tokens); i++)
+    mask |= hid_tokens[i].hid;
+  return mask;
+}
+
+static bool hid_combo_to_text(u64 combo, char *output, size_t size) {
+  if (!output || !size) return false;
+  output[0] = '\0';
+  size_t used = 0;
+  for (unsigned i = 0; i < sizeof(hid_tokens) / sizeof(*hid_tokens); i++) {
+    if (!(combo & hid_tokens[i].hid)) continue;
+    const int written = snprintf(output + used, size - used, "%s%s",
+                                 used ? "+" : "", hid_tokens[i].tok);
+    if (written < 0 || (size_t)written >= size - used) {
+      output[0] = '\0';
+      return false;
+    }
+    used += (size_t)written;
+  }
+  return used != 0;
+}
+
 static int stick_src_from_tok(const char *tok) {
   if (tok && !strcasecmp(tok, "LStick")) return 0;
   if (tok && !strcasecmp(tok, "RStick")) return 1;
@@ -661,8 +705,13 @@ static void pad_load_bindings(void) {
   for (int player = 0; player < MAX_CONTROLLERS; player++) {
     PadConfig *config = &g_pad_config[player];
     for (unsigned i = 0; i < NUM_PS2_BUTTONS; i++) {
-      const u64 hid = tok_to_hid(pad_pref_string(player, ps2_buttons[i].key,
-                                                  ps2_buttons[i].def));
+      const char *binding = pad_pref_string(player, ps2_buttons[i].key,
+                                            ps2_buttons[i].def);
+      if (ps2_buttons[i].bind == PB_ANALOG) {
+        config->analog_combo = combo_to_hid(binding);
+        continue;
+      }
+      const u64 hid = tok_to_hid(binding);
       if (hid) {
         config->binds[config->bind_count].hid = hid;
         config->binds[config->bind_count].bind = ps2_buttons[i].bind;
@@ -687,8 +736,8 @@ static void pad_load_bindings(void) {
 }
 
 static void pad_axis(int controller, int neg_bind, int pos_bind, float v) {
-  nl.setPadValue(fake_env, NATIVE_CLASS, controller, pos_bind, v > 0.f ? v : 0.f);
-  nl.setPadValue(fake_env, NATIVE_CLASS, controller, neg_bind, v < 0.f ? -v : 0.f);
+  pad_set_value(controller, pos_bind, v > 0.f ? v : 0.f);
+  pad_set_value(controller, neg_bind, v < 0.f ? -v : 0.f);
 }
 
 static void apply_ps2_stick(int controller, const PadConfig *config, const PadStick *c,
@@ -763,6 +812,7 @@ static void *g_quick_achievement_list;
 static int g_quick_menu_map_player;
 static int g_quick_menu_map_selection;
 static int g_quick_menu_capture_armed;
+static u64 g_quick_menu_capture_combo;
 static int g_quick_menu_exit_requested;
 static int g_quick_menu_limiter_unlimited;
 static float g_quick_menu_ntsc_rate;
@@ -820,7 +870,8 @@ static void quick_menu_release_inputs(void) {
   for (int player = 0; player < g_controller_count; player++) {
     PadConfig *config = &g_pad_config[player];
     for (int i = 0; i < config->bind_count; i++)
-      nl.setPadValue(fake_env, NATIVE_CLASS, player, config->binds[i].bind, 0.0f);
+      pad_set_value(player, config->binds[i].bind, 0.0f);
+    pad_set_value(player, PB_ANALOG, 0.0f);
     pad_axis(player, PB_LLEFT, PB_LRIGHT, 0.0f);
     pad_axis(player, PB_LDOWN, PB_LUP, 0.0f);
     pad_axis(player, PB_RLEFT, PB_RRIGHT, 0.0f);
@@ -834,8 +885,8 @@ static bool quick_menu_toggle_analog(void) {
     return false;
   // PadDualshock2 toggles only on the rising edge. Complete the release now so
   // each menu activation produces exactly one virtual Analog-button press.
-  nl.setPadValue(fake_env, NATIVE_CLASS, g_quick_menu_map_player, PB_ANALOG, 1.0f);
-  nl.setPadValue(fake_env, NATIVE_CLASS, g_quick_menu_map_player, PB_ANALOG, 0.0f);
+  pad_set_value(g_quick_menu_map_player, PB_ANALOG, 1.0f);
+  pad_set_value(g_quick_menu_map_player, PB_ANALOG, 0.0f);
   return true;
 }
 
@@ -1194,10 +1245,13 @@ static void quick_menu_draw_mapping(void) {
 
 static void quick_menu_draw_capture(void) {
   const unsigned bind = (unsigned)(g_quick_menu_map_selection - 1);
+  const bool combo = ps2_buttons[bind].bind == PB_ANALOG;
   char text[512];
   snprintf(text, sizeof(text),
-           "CONTROLLER MAPPING\n\nPlayer %d - %s\n\nRelease all buttons, then press the new button.\nL + R + Plus cancels.",
-           g_quick_menu_map_player + 1, ps2_buttons[bind].key);
+           "CONTROLLER MAPPING\n\nPlayer %d - %s\n\n%s\nL + R + Plus cancels.",
+           g_quick_menu_map_player + 1, ps2_buttons[bind].key,
+           combo ? "Release all buttons, then hold the combination and release it."
+                 : "Release all buttons, then press the new button.");
   quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
 }
 
@@ -1369,7 +1423,24 @@ static bool quick_menu_update(u64 down, u64 pressed) {
   }
 
   if (g_quick_menu_mode == QUICK_MENU_CAPTURE) {
-    if (!down) {
+    const unsigned bind = (unsigned)(g_quick_menu_map_selection - 1);
+    if (ps2_buttons[bind].bind == PB_ANALOG) {
+      const u64 held = down & bindable_hid_mask();
+      if (!g_quick_menu_capture_armed) {
+        if (!held) g_quick_menu_capture_armed = 1;
+      } else if (held) {
+        g_quick_menu_capture_combo |= held;
+      } else if (g_quick_menu_capture_combo) {
+        char combo[192];
+        if (hid_combo_to_text(g_quick_menu_capture_combo, combo, sizeof(combo))) {
+          const bool saved = quick_menu_store_binding(combo);
+          g_quick_menu_mode = QUICK_MENU_MAPPING;
+          quick_menu_draw_mapping();
+          quick_menu_status(saved ? "Controller binding updated" :
+                                      "Binding updated, but launcher.ini could not be saved");
+        }
+      }
+    } else if (!down) {
       g_quick_menu_capture_armed = 1;
     } else if (g_quick_menu_capture_armed && pressed) {
       const char *token = quick_menu_pressed_token(pressed);
@@ -1650,6 +1721,7 @@ static bool quick_menu_update(u64 down, u64 pressed) {
         g_quick_menu_map_selection <= (int)NUM_PS2_BUTTONS) {
       g_quick_menu_mode = QUICK_MENU_CAPTURE;
       g_quick_menu_capture_armed = 0;
+      g_quick_menu_capture_combo = 0;
       quick_menu_draw_capture();
       return true;
     }
@@ -1710,9 +1782,16 @@ static void update_gamepads(void) {
     if (nl.setPadValue) {
       for (int i = 0; i < config->bind_count; i++) {
         if (!(changed & config->binds[i].hid)) continue;
-        nl.setPadValue(fake_env, NATIVE_CLASS, player, config->binds[i].bind,
-                       (down & config->binds[i].hid) ? 1.0f : 0.0f);
+        pad_set_value(player, config->binds[i].bind,
+                      (down & config->binds[i].hid) ? 1.0f : 0.0f);
       }
+      const bool analog_down = config->analog_combo &&
+                               (down & config->analog_combo) == config->analog_combo;
+      const bool analog_previous = config->analog_combo &&
+                                   (g_pad_previous[player] & config->analog_combo) ==
+                                       config->analog_combo;
+      if (analog_down != analog_previous)
+        pad_set_value(player, PB_ANALOG, analog_down ? 1.0f : 0.0f);
       if (sticks_changed) {
         apply_ps2_stick(player, config, &config->left_stick, ls, rs,
                         PB_LLEFT, PB_LRIGHT, PB_LDOWN, PB_LUP);
@@ -1792,6 +1871,13 @@ static void update_touch(void) {
 
 int main(void) {
   extern int crash_in_progress(void);
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  unlink(DATA_ROOT "/nethersx2-exception.log");
+  unlink(DATA_ROOT "/nethersx2-mesa.log");
+  setenv("MESA_LOG_FILE", DATA_ROOT "/nethersx2-mesa.log", 1);
+  vk_diag_reset();
+  vk_diag_note("host main entered renderer=%d", GS_RENDERER);
+#endif
   cpu_boost(1);
 
   // settings store: load nethersx2.ini + seed OpenGL/folder defaults
@@ -1826,6 +1912,9 @@ int main(void) {
   if (!switchStorageInitializeForPath(DATA_ROOT "/launcher.ini", g_disc_path, sizeof(g_disc_path),
                                       storage_error, sizeof(storage_error)))
     fatal_error("Could not mount game storage:\n%s\n\n%s", g_disc_path, storage_error);
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("storage ready disc=%s", g_disc_path);
+#endif
   prefs_set_disc_path(g_disc_path);
   if (switchStorageSocketReady())
     g_net_ready = 1;
@@ -1838,11 +1927,21 @@ int main(void) {
   snprintf(g_core_so, sizeof(g_core_so), "%s",
            prefs_get_string("Wrapper/CoreSo", SO_NAME));
 
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("configuration core=%s bios_boot=%d fastmem=%s lsfg=%d",
+               g_core_so, g_bios_boot,
+               prefs_get_string("Wrapper/FastmemMode", "hybrid"),
+               prefs_get_bool("Wrapper/LSFGEnabled", false));
+#endif
+
   check_syscalls();
   check_data(g_core_so, g_disc_path);
   if (!memory_smc_initialize())
     fatal_error("Page-based SMC protection is unavailable.\n\n%s",
                 memory_smc_reason());
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("syscalls, input data, and SMC initialized");
+#endif
   set_screen_size(0, 0);
 
   extern char *fake_heap_start;
@@ -1855,12 +1954,27 @@ int main(void) {
                 "starting any installed title), then start\n"
                 "NetherSX2 from there.", heap_mb);
 
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("heap ready mb=%u so_base=%p so_limit=%zu screen=%dx%d",
+               heap_mb, heap_so_base, heap_so_limit,
+               screen_width, screen_height);
+#endif
+
   if (so_load(&emu_mod, g_core_so, heap_so_base, heap_so_limit) < 0)
     fatal_error("Could not load\n%s.", g_core_so);
+
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("core image loaded base=%p size=%zu",
+               emu_mod.load_base, emu_mod.load_size);
+#endif
 
   update_imports();
   so_relocate(&emu_mod);
   so_resolve(&emu_mod, dynlib_functions, dynlib_numfunctions, 1);
+
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("core imports relocated and resolved");
+#endif
 
   patch_game();
   resolve_entry_points();
@@ -1873,6 +1987,10 @@ int main(void) {
 
   so_execute_init_array(&emu_mod);
   so_free_temp(&emu_mod);
+
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("core constructors completed");
+#endif
 
   jni_init();
   if (prefs_get_bool("Achievements/Enabled", false))
@@ -1887,7 +2005,13 @@ int main(void) {
   padInitialize(&g_pads[0], HidNpadIdType_No1, HidNpadIdType_Handheld);
   padInitialize(&g_pads[1], HidNpadIdType_No2);
   hidInitializeTouchScreen();
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("starting core VM sequence");
+#endif
   run_startup_sequence();
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_note("core VM sequence returned vm_running=%d", g_vm_running);
+#endif
   rumble_init();
 
 #if GS_RENDERER == GS_RENDERER_VK
@@ -1902,10 +2026,12 @@ int main(void) {
   int quick_menu_hint_shown = 0;
   const int cpu_boost_present_limit = 60;
 
-  // Poll HID at 1 kHz; keep housekeeping at 125 Hz and forward only changes.
-  const uint64_t input_poll_interval_ns = UINT64_C(1000000);
-  const uint64_t housekeeping_divisor = 8;
-  const uint64_t vm_exit_grace_polls = 2000;
+  // Poll HID at 500 Hz; keep housekeeping at 125 Hz and forward only changes.
+  // The PS2 pad is read ~once per frame, so faster polling only adds wakeups.
+  const uint64_t input_poll_hz = 500;
+  const uint64_t input_poll_interval_ns = UINT64_C(1000000000) / input_poll_hz;
+  const uint64_t housekeeping_divisor = input_poll_hz / 125;  // 125 Hz
+  const uint64_t vm_exit_grace_polls = input_poll_hz * 2;     // 2 s
 
   pthr_pin_bg_core();
 

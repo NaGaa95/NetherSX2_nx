@@ -35,6 +35,14 @@ int vk_lsfg_is_enabled(void);
 int vk_lsfg_is_high_fps_passthrough(void);
 void vk_lsfg_request_enabled(int enabled);
 
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+void vk_diag_reset(void);
+void vk_diag_note(const char *format, ...)
+   __attribute__((format(printf, 1, 2)));
+void vk_diag_exception(uint64_t pc, uint64_t far, uint32_t esr,
+                       uint64_t sp, uint64_t frame_pointer, uint64_t link_register);
+#endif
+
 // Registered in the core's import table (imports.c). Everything else the core
 // discovers through vk_gipa_hook, which forwards to NVK's real vkGetInstanceProcAddr.
 PFN_vkVoidFunction VKAPI_CALL vk_gipa_hook(VkInstance instance, const char *name);

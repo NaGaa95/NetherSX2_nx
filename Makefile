@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.2.3
+APP_VERSION	:=	1.2.4
 BUILD		:=	build
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
@@ -30,6 +30,10 @@ LTOFLAGS := -flto=auto -fuse-linker-plugin
 # __SWITCH__ for libnx; NETHERSX2 gates the port-specific shim branches.
 DEFINES	:=	-D__SWITCH__ -DNETHERSX2 -DCURL_STATICLIB \
 			-DNETHERSX2_VERSION='"$(APP_VERSION)"'
+
+ifneq ($(strip $(NETHERSX2_VK_DIAGNOSTIC)),)
+DEFINES += -DNETHERSX2_VK_DIAGNOSTIC
+endif
 
 # --- renderer select: GL (default) or VK (Mesa NVK) ------------------------
 # GL and Vulkan are mutually exclusive (switch-mesa's libEGL/GLES and the NVK

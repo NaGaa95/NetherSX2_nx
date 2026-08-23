@@ -9,6 +9,9 @@
 #include <string.h>
 
 #include "libc_shim.h"
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+#include "hooks/vk.h"
+#endif
 
 #define EXCEPTION_SLOT_COUNT 8
 #define EXCEPTION_SLOT_SIZE  0x400
@@ -162,6 +165,10 @@ real_crash:
   if (__atomic_exchange_n(&g_crashing, 1, __ATOMIC_ACQ_REL)) {
     for (;;) svcSleepThread(1000000000ULL);
   }
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_exception(ctx->pc.x, ctx->far.x, ctx->esr, ctx->sp.x,
+                    ctx->fp.x, ctx->lr.x);
+#endif
   (void)ctx;
   svcExitProcess();
 }
