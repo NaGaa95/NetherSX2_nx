@@ -220,6 +220,13 @@ static void prefs_seed_defaults(void) {
   prefs_seed("EmuCore/Speedhacks/vuFlagHack", "true");
   prefs_seed("EmuCore/Speedhacks/vuThread", "true");
   prefs_seed("EmuCore/Speedhacks/vu1Instant", "true");
+  
+  // Massive performance boost for Nintendo Switch CPU (AArch64)
+  // Underclocks the Emotion Engine by 50% (Cycle Rate -2)
+  prefs_seed("EmuCore/Speedhacks/EECycleRate", "-2");
+  // Moderate cycle skipping (Cycle Skip 1)
+  prefs_seed("EmuCore/Speedhacks/EECycleSkip", "1");
+
   prefs_seed("EmuCore/GS/SaveDrawStats", "false");
   prefs_seed("EmuCore/GS/SaveFrameStats", "false");
   prefs_seed("EmuCore/GS/SaveHWConfig", "false");

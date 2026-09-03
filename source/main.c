@@ -2053,9 +2053,9 @@ int main(void) {
       if (frame_count > 0)
         g_quick_menu_ready = 1;
       if (boosting && frame_count >= cpu_boost_present_limit) {
-        // Cover startup without holding the CPU boost into gameplay.
-        cpu_boost(0);
-        boosting = 0;
+        // [PERFORMANCE] Hold CPU boost during gameplay to maximize fps
+        // cpu_boost(0);
+        // boosting = 0;
       }
       if (!quick_menu_hint_shown && frame_count >= 300) {
         quick_menu_status("Quick menu: L + R + Plus");
