@@ -214,8 +214,15 @@ static void prefs_seed_defaults(void) {
   // there -- the disc ELF is never loaded. Must stay "1". (Also forced in main.c.)
   prefs_seed("EmuCore/EnableFastBoot", "1");
   // fastCDVD DISABLED (also forced false in main.c): it breaks CDVD command timing
-  // and hangs games in sceCdInit's cdvdfsv RPC bind. Disc reads work without it.
   prefs_seed("EmuCore/Speedhacks/fastCDVD", "false");
+  prefs_seed("EmuCore/Speedhacks/WaitLoop", "true");
+  prefs_seed("EmuCore/Speedhacks/IntcStat", "true");
+  prefs_seed("EmuCore/Speedhacks/vuFlagHack", "true");
+  prefs_seed("EmuCore/Speedhacks/vuThread", "true");
+  prefs_seed("EmuCore/Speedhacks/vu1Instant", "true");
+  prefs_seed("EmuCore/GS/SaveDrawStats", "false");
+  prefs_seed("EmuCore/GS/SaveFrameStats", "false");
+  prefs_seed("EmuCore/GS/SaveHWConfig", "false");
 
   // Core's own logging, all off for release: the EE/IOP console + verbose paths
   // format many strings per frame and each line hits an SD-backed log, capping

@@ -167,18 +167,22 @@ static void core_init_once(void) {
   for (int i = 0; i < hot_count; i++)
     hot_mask |= (1u << core_list[i]);
 
-  ee_core = core_list[0];
-  // MTGS/VU/worker pool = the hot cores EXCEPT the EE's, so heavy workers never
-  // share -- nor migrate onto -- the EE core. If only one hot core exists (a 1-2
-  // core grant) everything unavoidably shares it.
-  work_count = 0;
-  for (int i = 1; i < hot_count; i++)
-    work_list[work_count++] = core_list[i];
-  if (work_count == 0)
-    work_list[work_count++] = ee_core;
-  work_mask = (hot_count >= 2) ? (hot_mask & ~(1u << ee_core)) : hot_mask;
-
-
+  if (core_count >= 3) {
+    ee_core = core_list[1];
+    bg_core = core_list[0];
+    work_count = 0;
+    work_list[work_count++] = core_list[2];
+    work_list[work_count++] = core_list[0];
+    work_mask = (1u << core_list[2]) | (1u << core_list[0]);
+  } else {
+    ee_core = core_list[0];
+    work_count = 0;
+    for (int i = 1; i < hot_count; i++)
+      work_list[work_count++] = core_list[i];
+    if (work_count == 0)
+      work_list[work_count++] = ee_core;
+    work_mask = (hot_count >= 2) ? (hot_mask & ~(1u << ee_core)) : hot_mask;
+  }
 }
 
 // EE/VM thread: hard-pinned to its own core (exclusive mask) -- it is the

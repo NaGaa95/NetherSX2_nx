@@ -426,6 +426,9 @@ static void run_startup_sequence(void) {
   prefs_set_int("EmuCore/GS/CropBottom", 0);
   prefs_set_int("EmuCore/GS/StretchY", 100);
   apply_network_settings();
+  prefs_set_bool("EmuCore/GS/SaveDrawStats", false);
+  prefs_set_bool("EmuCore/GS/SaveFrameStats", false);
+  prefs_set_bool("EmuCore/GS/SaveHWConfig", false);
   // Core logging off: the EE/IOP console formats a lot of strings per frame.
   prefs_set_string("Logging/EnableSystemConsole", "0");
   prefs_set_string("Logging/EnableFileLogging", "0");

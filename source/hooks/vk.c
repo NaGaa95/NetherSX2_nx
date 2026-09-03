@@ -159,6 +159,9 @@ static PFN_vkCreateSwapchainKHR real_create_swapchain;
 static PFN_vkGetSwapchainImagesKHR real_get_swapchain_images;
 static PFN_vkDestroySwapchainKHR real_destroy_swapchain;
 static PFN_vkDestroyDevice real_destroy_device;
+static PFN_vkCreatePipelineCache real_create_pipeline_cache;
+static PFN_vkDestroyPipelineCache real_destroy_pipeline_cache;
+static PFN_vkGetPipelineCacheData real_get_pipeline_cache_data;
 #ifdef NETHERSX2_VK_DIAGNOSTIC
 static PFN_vkQueueSubmit real_queue_submit;
 static PFN_vkQueueSubmit2 real_queue_submit2;
@@ -860,6 +863,70 @@ vkGetPhysicalDeviceMemoryProperties2_shim(VkPhysicalDevice pd,
   }
 }
 
+#define VK_PIPELINE_CACHE_FILE CACHE_DIR "/vk_pipeline.bin"
+
+static VkResult VKAPI_CALL
+vkCreatePipelineCache_shim(VkDevice dev, const VkPipelineCacheCreateInfo *pCreateInfo,
+                           const VkAllocationCallbacks *pAlloc, VkPipelineCache *pCache) {
+  if (!real_create_pipeline_cache)
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  VkPipelineCacheCreateInfo ci = *pCreateInfo;
+  void *cache_data = NULL;
+
+  if (ci.initialDataSize == 0 || !ci.pInitialData) {
+    FILE *f = fopen(VK_PIPELINE_CACHE_FILE, "rb");
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      long sz = ftell(f);
+      if (sz > 32) {
+        fseek(f, 0, SEEK_SET);
+        cache_data = malloc((size_t)sz);
+        if (cache_data && fread(cache_data, 1, (size_t)sz, f) == (size_t)sz) {
+          ci.initialDataSize = (size_t)sz;
+          ci.pInitialData = cache_data;
+        } else if (cache_data) {
+          free(cache_data);
+          cache_data = NULL;
+        }
+      }
+      fclose(f);
+    }
+  }
+
+  VkResult r = real_create_pipeline_cache(dev, &ci, pAlloc, pCache);
+  if (cache_data) free(cache_data);
+  return r;
+}
+
+static void VKAPI_CALL
+vkDestroyPipelineCache_shim(VkDevice dev, VkPipelineCache cache, const VkAllocationCallbacks *pAlloc) {
+  if (!real_destroy_pipeline_cache)
+    return;
+
+  if (cache != VK_NULL_HANDLE && real_get_pipeline_cache_data) {
+    size_t size = 0;
+    if (real_get_pipeline_cache_data(dev, cache, &size, NULL) == VK_SUCCESS && size > 32) {
+      void *buf = malloc(size);
+      if (buf) {
+        if (real_get_pipeline_cache_data(dev, cache, &size, buf) == VK_SUCCESS) {
+          mkdir(DATA_ROOT, 0777);
+          mkdir(CACHE_DIR, 0777);
+          FILE *f = fopen(VK_PIPELINE_CACHE_FILE ".tmp", "wb");
+          if (f) {
+            fwrite(buf, 1, size, f);
+            fclose(f);
+            rename(VK_PIPELINE_CACHE_FILE ".tmp", VK_PIPELINE_CACHE_FILE);
+          }
+        }
+        free(buf);
+      }
+    }
+  }
+
+  real_destroy_pipeline_cache(dev, cache, pAlloc);
+}
+
 // device proc addr wrapper: swap in our present shim; forward everything else to
 // NVK's real GDPA unchanged.
 static PFN_vkVoidFunction VKAPI_CALL
@@ -907,6 +974,18 @@ vk_gdpa_hook(VkDevice dev, const char *name) {
   if (!strcmp(name, "vkDestroyDevice")) {
     real_destroy_device = (PFN_vkDestroyDevice)fn;
     return (PFN_vkVoidFunction)vkDestroyDevice_shim;
+  }
+  if (!strcmp(name, "vkCreatePipelineCache")) {
+    real_create_pipeline_cache = (PFN_vkCreatePipelineCache)fn;
+    return (PFN_vkVoidFunction)vkCreatePipelineCache_shim;
+  }
+  if (!strcmp(name, "vkDestroyPipelineCache")) {
+    real_destroy_pipeline_cache = (PFN_vkDestroyPipelineCache)fn;
+    return (PFN_vkVoidFunction)vkDestroyPipelineCache_shim;
+  }
+  if (!strcmp(name, "vkGetPipelineCacheData")) {
+    real_get_pipeline_cache_data = (PFN_vkGetPipelineCacheData)fn;
+    return fn;
   }
   if (!strcmp(name, "vkQueuePresentKHR")) {
     real_qpresent = (PFN_vkQueuePresentKHR)fn;
@@ -975,6 +1054,18 @@ vk_gipa_hook(VkInstance inst, const char *name) {
     if (!strcmp(name, "vkDestroyDevice")) {
       real_destroy_device = (PFN_vkDestroyDevice)vkGetInstanceProcAddr(inst, name);
       return (PFN_vkVoidFunction)vkDestroyDevice_shim;
+    }
+    if (!strcmp(name, "vkCreatePipelineCache")) {
+      real_create_pipeline_cache = (PFN_vkCreatePipelineCache)vkGetInstanceProcAddr(inst, name);
+      return (PFN_vkVoidFunction)vkCreatePipelineCache_shim;
+    }
+    if (!strcmp(name, "vkDestroyPipelineCache")) {
+      real_destroy_pipeline_cache = (PFN_vkDestroyPipelineCache)vkGetInstanceProcAddr(inst, name);
+      return (PFN_vkVoidFunction)vkDestroyPipelineCache_shim;
+    }
+    if (!strcmp(name, "vkGetPipelineCacheData")) {
+      real_get_pipeline_cache_data = (PFN_vkGetPipelineCacheData)vkGetInstanceProcAddr(inst, name);
+      return (PFN_vkVoidFunction)real_get_pipeline_cache_data;
     }
     if (!strcmp(name, "vkQueuePresentKHR")) {
       real_qpresent = (PFN_vkQueuePresentKHR)vkGetInstanceProcAddr(inst, name);
