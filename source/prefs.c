@@ -178,7 +178,13 @@ static void prefs_seed_defaults(void) {
   prefs_seed("EmuCore/GS/DisableThreadedPresentation", "0");
   prefs_seed("EmuCore/GS/ThreadedPresentation", "1");
 #endif
-  prefs_seed("EmuCore/GS/SkipDuplicateFrames", "false");
+  prefs_seed("EmuCore/GS/SkipDuplicateFrames", "true");
+  prefs_seed("EmuCore/GS/accurate_blending_unit", "0");
+  prefs_seed("EmuCore/GS/HWDownloadMode", "2");
+  prefs_seed("EmuCore/GS/texture_preloading", "2");
+  prefs_seed("EmuCore/CdvdPrecache", "true");
+  prefs_seed("EmuCore/GS/UserHacks_DrawBuffering", "true");
+  prefs_seed("EmuCore/GS/DisableShaderCache", "false");
 
   // Experimental in-process LSFG-VK bridge. It is deliberately opt-in and the
   // proprietary shader DLL is never bundled; users provide their own file.
