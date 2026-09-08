@@ -131,6 +131,7 @@ constexpr Translation s_text[] = {
     {"Emulator core", "Cœur de l'émulateur", "Emulator-Kern", "Núcleo del emulador", "Core dell'emulatore", "Núcleo do emulador","模拟器核心","模擬器核心"},
     {"Emulator", "Émulateur", "Emulator", "Emulador", "Emulatore", "Emulador","模拟器","模擬器"},
     {"Game resources", "Ressources de jeu", "Spielressourcen", "Recursos del juego", "Risorse di gioco", "Recursos do jogo","游戏资源","遊戲資源"},
+    {"Allowed CPU cores", "Cœurs CPU autorisés", "Erlaubte CPU-Kerne", "Núcleos de CPU permitidos", "Core CPU consentiti", "Núcleos de CPU permitidos","可用 CPU 核心","可用 CPU 核心"},
     {"Loading game library...", "Chargement de la bibliothèque...", "Spielebibliothek wird geladen...", "Cargando la biblioteca...", "Caricamento della libreria...", "A carregar a biblioteca...","正在加载游戏库...","正在載入遊戲庫..."},
     {"The first page will appear as soon as it is ready.", "La première page s'affichera dès qu'elle sera prête.", "Die erste Seite erscheint, sobald sie bereit ist.", "La primera página aparecerá en cuanto esté lista.", "La prima pagina apparirà non appena sarà pronta.", "A primeira página aparecerá assim que estiver pronta.","第一页准备好后会立即显示。","第一頁準備好後會立即顯示。"},
     {"No games found", "Aucun jeu trouvé", "Keine Spiele gefunden", "No se encontraron juegos", "Nessun gioco trovato", "Nenhum jogo encontrado","未找到游戏","找不到遊戲"},

@@ -156,6 +156,18 @@ static bool regularFileExists(const std::string &path) {
   return queryRegularFile(path, exists) && exists;
 }
 
+// A HOME Menu shortcut grants all four cores; the album-applet path grants
+// three and leaves core 3 to the system.
+static int allowedCpuCores() {
+  u64 mask = 0;
+  if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)))
+    return 3;
+  int cores = 0;
+  for (int core = 0; core < 4; core++)
+    if (mask & (UINT64_C(1) << core)) cores++;
+  return cores ? cores : 3;
+}
+
 static bool lsfgDllInstalled() {
 
   return regularFileExists(LSFG_DLL_FILE);
@@ -358,6 +370,7 @@ struct Opt {
 #define O_TEXTG(l,k,d,gk,go)   { l, k, OT_TEXT, nullptr,0, 0,0,0, d, 0, gk, go, 1, nullptr }
 #define O_HOTKEY(l,k,d)        { l, k, OT_HOTKEY, nullptr,0, 0,0,0, d, 0, nullptr, nullptr, 1, nullptr }
 #define O_STATUS(l)            { l, nullptr, OT_STATUS, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr, 1, nullptr }
+#define O_STATUSK(l,k)         { l, k, OT_STATUS, nullptr,0, 0,0,0, nullptr, 0, nullptr, nullptr, 1, nullptr }
 
 static const Choice C_backend[]  = { {"Vulkan (NVK)","14"}, {"OpenGL (NVC0)","12"},
                                      {"OpenGL (Zink/NVK)","13"} };
@@ -463,6 +476,7 @@ static const Opt S_audio[] = {
   O_RANGE ("Output latency",   "SPU2/Output/OutputLatency", 20, 200, 10, "100"),
 };
 static const Opt S_emu[] = {
+  O_STATUSK("Allowed CPU cores", "cpu-cores"),
   O_CHOICE("Core version",     "Wrapper/CoreBuild", C_build, "4248"),
   O_CHOICE("Fastmem",          "Wrapper/FastmemMode", C_fastmem, "hybrid"),
   O_CHOICE("System language",  "Wrapper/SystemLanguage", C_syslang, "auto"),
@@ -590,6 +604,8 @@ struct SettingHelpEntry {
 
 /* Condensed Android/PCSX2 and Switch-specific setting help. */
 static const SettingHelpEntry SETTING_HELP[] = {
+  {"cpu-cores", "Allowed CPU cores",
+   "How many of the Switch's four CPU cores this process may use. Shortcuts created from the launcher run on all four and keep audio and input on core 3, away from the emulator; launching from the album applet leaves core 3 to the system."},
   {"Wrapper/Language", "Launcher language",
    "Selects the language used by the SDL launcher. System follows the language configured on the Switch. Game names, paths, server messages and user-entered text are never translated."},
   {"EmuCore/GS/Renderer", "Graphics backend",
@@ -4383,7 +4399,10 @@ static void optValue(const Opt &o, char *out, int n) {
   }
   else if (o.type==OT_TEXT){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:"(auto)"); }
   else if (o.type==OT_HOTKEY){ const char *v=iniGet(o.key,o.def); snprintf(out,n,"%s", (v&&*v)?v:tr("None")); }
-  else if (o.type==OT_STATUS) snprintf(out,n,"%s",lsfgDllInstalled()?tr("Installed"):tr("Not installed"));
+  else if (o.type==OT_STATUS) {
+    if(o.key && !strcmp(o.key,"cpu-cores")) snprintf(out,n,"%d / 4",allowedCpuCores());
+    else snprintf(out,n,"%s",lsfgDllInstalled()?tr("Installed"):tr("Not installed"));
+  }
   else if (o.type==OT_SUBMENU) snprintf(out,n,">");
 }
 static void optSetChoice(const Opt &o,const char *value) {
@@ -4411,6 +4430,13 @@ static void optAdjust(const Opt &o, int dir) {
 // The three questions a footer asks about the currently selected row. Splitting
 // them out of the handlers is what lets a hint appear only when its button will
 // really do something on this row.
+// Status rows report a measured fact, so they paint their own verdict colour.
+// Returns false for rows that follow the normal selection colours.
+static bool optValueVerdictColor(const Opt &o, SDL_Color *out) {
+  if(o.type!=OT_STATUS || !o.key || strcmp(o.key,"cpu-cores")) return false;
+  *out = allowedCpuCores()>=4 ? (SDL_Color){120,215,130,255} : (SDL_Color){235,125,125,255};
+  return true;
+}
 static bool canResetOption(const Opt &option) {
 
   return option.key && option.type!=OT_SUBMENU && option.type!=OT_STATUS && optEnabled(option);
@@ -4751,6 +4777,7 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     int i=top+r,slotY=LIST_Y0+r*ROW_H; bool cur=(i==sel); bool en=optEnabled(S.opts[i]);
     SDL_Color lc = !en?(SDL_Color){92,98,110,255}:(cur?COL_VAL:COL_TXT);
     SDL_Color vc = !en?(SDL_Color){92,98,110,255}:(cur?COL_VAL:COL_DIM);
+    if(en) optValueVerdictColor(S.opts[i],&vc);
     char v[96]; optValue(S.opts[i],v,sizeof(v));
     drawSettingsRowText(tr(S.opts[i].label),v,slotY,colW,labelX,valX,cur,lc,vc);
   }
@@ -5067,8 +5094,10 @@ static void launcherSettingsScreen() {
                             current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM);
       } else {
         char value[96]; optValue(S_launcher[index],value,sizeof(value));
+        SDL_Color valueColor=current?COL_VAL:COL_DIM;
+        optValueVerdictColor(S_launcher[index],&valueColor);
         drawSettingsRowText(tr(S_launcher[index].label),value,slotY,colW,labelX,valX,current,
-                            current?COL_VAL:COL_TXT,current?COL_VAL:COL_DIM);
+                            current?COL_VAL:COL_TXT,valueColor);
       }
     }
     const int buttonWidth=std::min(500,SW-80),buttonHeight=58;

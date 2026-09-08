@@ -341,6 +341,7 @@ static void *playback_thread(void *arg) {
   AAudioStream *s = (AAudioStream *)arg;
 
   pthr_pin_bg_core();
+  pthr_set_priority(43);  // shortest wakeups of the core-3 tenants
   pthr_ensure_fake_tls();
 
   set_state(s, AAUDIO_STREAM_STATE_STARTED);

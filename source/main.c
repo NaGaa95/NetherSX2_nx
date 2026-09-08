@@ -2034,6 +2034,7 @@ int main(void) {
   const uint64_t vm_exit_grace_polls = input_poll_hz * 2;     // 2 s
 
   pthr_pin_bg_core();
+  pthr_set_priority(45);  // below audio
 
   int applet_running = 1;
   while (applet_running && !g_quick_menu_exit_requested) {

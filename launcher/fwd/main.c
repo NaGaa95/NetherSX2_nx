@@ -38,6 +38,14 @@ Result g_lastRet = 0;
 
 void NX_NORETURN nroEntrypointTrampoline(const ConfigEntry* entries, u64 handle, u64 entrypoint);
 
+// hbloader starts the NRO on the main thread's inherited affinity, which can be
+// narrower than the NPDM grant. Widen it so the emulator can use core 3.
+static void restoreMainThreadAffinity(void) {
+    u64 core_mask = 0;
+    if (R_SUCCEEDED(svcGetInfo(&core_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)))
+        svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, core_mask);
+}
+
 static void fix_nro_path(char* path) {
     if (!strncmp(path, "sdmc:/", 6)) {
         memmove(path, path + 5, strlen(path + 5) + 1);
@@ -456,6 +464,7 @@ void NX_NORETURN loadNro(void) {
         diagAbortWithResult(rc);
 
     strcpy(g_nextArgv, EXIT_DETECTION_STR);
+    restoreMainThreadAffinity();
     nroEntrypointTrampoline(&entries[0], -1, g_nroAddr);
 }
 

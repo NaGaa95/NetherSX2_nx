@@ -217,6 +217,13 @@ void pthr_pin_bg_core(void) {
   svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, m);
 }
 
+// Horizon never preempts between equal priorities and libnx gives every thread
+// its creator's, so the core-3 tenants carry distinct ones. Failure is harmless:
+// the thread keeps the inherited priority.
+void pthr_set_priority(int priority) {
+  svcSetThreadPriority(CUR_THREAD_HANDLE, (u32)priority);
+}
+
 // ---------------------------------------------------------------------------
 // thread creation (installs the fake TLS before running game code)
 // ---------------------------------------------------------------------------

@@ -63,6 +63,8 @@ void pthr_install_fake_tls(void);
 
 void pthr_pin_bg_core(void);
 
+void pthr_set_priority(int priority);
+
 void pthr_pin_ee_core(void);
 
 void pthr_ensure_fake_tls(void);
