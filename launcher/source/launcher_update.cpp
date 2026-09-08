@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #ifndef NETHERSX2_RELEASE_VERSION
-#define NETHERSX2_RELEASE_VERSION "1.2.4"
+#define NETHERSX2_RELEASE_VERSION "1.2.5"
 #endif
 
 #ifndef NETHERSX2_VERSION
