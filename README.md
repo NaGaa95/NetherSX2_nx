@@ -82,7 +82,12 @@ pacman -S devkitA64 switch-tools libnx switch-sdl2 switch-sdl2_ttf \
           switch-ntfs-3g
 ```
 
-Provide a compatible Mesa NVK package under `vulkan/include` and `vulkan/lib`.
+Provide a compatible Mesa NVK package under `vulkan/include` and `vulkan/lib`,
+or set `MESA_SDK_ROOT` to a unified Horizon Mesa SDK's `portlibs/switch`
+folder (Mesa 26.2.4 from
+[danfromtico/mesa-switch](https://github.com/danfromtico/mesa-switch), which
+holds NVK, NVC0 and Zink in one build). The unified SDK needs no libelf; pass
+`ELF_LIB=-lelf` to `make` for an SDK that still does.
 Extract the 4248 and 3668 APKs into sibling folders named
 `NetherSX2-v2.2n-4248` and `NetherSX2-v2.2n-3668`, or set `CORES_DIR` to the
 folder containing them. CMake, Ninja, and Git are required; the build downloads pinned

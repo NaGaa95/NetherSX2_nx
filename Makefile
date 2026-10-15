@@ -42,6 +42,9 @@ endif
 #   make RENDERER=VK -> Vulkan (Mesa NVK, vendored flat under vulkan/)
 RENDERER ?= GL
 MESA_SDK_ROOT ?=
+# Nothing in the Mesa archives references libelf (devkitPro ships no
+# switch-libelf); pass ELF_LIB=-lelf for an SDK that still needs it.
+ELF_LIB ?=
 ifneq ($(strip $(MESA_SDK_ROOT)),)
 DEFINES += -DUSE_UNIFIED_MESA
 endif
@@ -83,7 +86,7 @@ ifneq ($(strip $(MESA_SDK_ROOT)),)
 LIBDIRS	:= $(MESA_SDK_ROOT) $(PORTLIBS) $(LIBNX)
 LIBS	:= -Wl,--start-group -lvulkan -lEGL -lGLESv2 -lglapi \
 		-lmesa_util_c11 -lblake3 -lmesa_util -lmesa_util_simd -lxmlconfig \
-		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lelf -lexpat -lz -lzstd \
+		-Wl,--end-group $(STORAGE_LIBS) -lcurl $(ELF_LIB) -lexpat -lz -lzstd \
 		-lnx -lstdc++ -lm
 else
 # Mesa NVK: 23 vendored static archives (vulkan/lib) linked in one --start-group
@@ -110,7 +113,7 @@ ifneq ($(strip $(MESA_SDK_ROOT)),)
 LIBDIRS	:= $(MESA_SDK_ROOT) $(PORTLIBS) $(LIBNX)
 LIBS	:= -Wl,--start-group -lvulkan -lEGL -lGLESv2 -lglapi \
 		-lmesa_util_c11 -lblake3 -lmesa_util -lmesa_util_simd -lxmlconfig \
-		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lelf -lexpat -lz -lzstd \
+		-Wl,--end-group $(STORAGE_LIBS) -lcurl $(ELF_LIB) -lexpat -lz -lzstd \
 		-lnx -lstdc++ -lm
 else
 # EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
