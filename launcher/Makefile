@@ -24,7 +24,7 @@ ROMFS		:=	romfs		# bundles the emulator cores (cores/emucore_*.so)
 
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.3.0
+APP_VERSION	:=	1.4.0
 RELEASE_VERSION	?=	$(APP_VERSION)
 
 #---------------------------------------------------------------------------------
@@ -163,7 +163,7 @@ $(OUTPUT).nro : $(TOPDIR)/Makefile
 # Relink when the prebuilt storage archives change, not only on source edits.
 $(OUTPUT).elf	:	$(OFILES) $(STORAGE_LIBS)
 
-$(OFILES_SRC)	: $(HFILES_BIN)
+$(OFILES_SRC)	: $(HFILES_BIN) $(TOPDIR)/Makefile
 
 %.bin.o	%_bin.h :	%.bin
 	@echo $(notdir $<)

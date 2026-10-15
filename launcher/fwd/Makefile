@@ -6,7 +6,7 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    := ../romfs/fwd
 
 # cfg dir is hardcoded in main.c; don't pass it via -D (MSYS2 mangles leading-slash args).
-VERSION := 1.3.0
+VERSION := 1.4.0
 AUTHOR := naga
 LTOFLAGS := -flto=auto -fuse-linker-plugin
 
@@ -20,7 +20,7 @@ LDFLAGS := -L$(DEVKITPRO)/libnx/lib -lnx $(LTOFLAGS) -Wl,--gc-sections -Wl,--bui
 
 all: $(OUT)/hbl.nso $(OUT)/hbl.npdm $(OUT)/default.nacp
 
-hbl.elf: main.c trampoline.s
+hbl.elf: main.c trampoline.s Makefile
 	$(CC) main.c trampoline.s -o $@ $(CFLAGS) $(LDFLAGS)
 
 $(OUT)/hbl.nso: hbl.elf | $(OUT)
