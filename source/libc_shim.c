@@ -33,6 +33,7 @@
 #include "util.h"
 #include "so_util.h"
 #include "libc_shim.h"
+#include "corelog.h"
 #include "hooks.h"
 
 // ---------------------------------------------------------------------------
@@ -137,8 +138,11 @@ int sched_get_priority_max_fake(int policy) {
   return 0;
 }
 
+// Bionic calls this immediately before abort() with the reason the core is
+// giving up (typically a failed assert or an uncaught C++ exception's what()).
+// abort_fake in imports.c replays it into the core console log.
 void android_set_abort_message_fake(const char *msg) {
-  (void)msg;
+  corelog_abort_message(msg);
 }
 
 size_t __ctype_get_mb_cur_max_fake(void) {

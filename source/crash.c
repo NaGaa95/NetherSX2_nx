@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "libc_shim.h"
+#include "corelog.h"
 #if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
 #include "hooks/vk.h"
 #endif
@@ -169,6 +170,10 @@ real_crash:
   vk_diag_exception(ctx->pc.x, ctx->far.x, ctx->esr, ctx->sp.x,
                     ctx->fp.x, ctx->lr.x);
 #endif
+  // svcExitProcess() below bypasses atexit, so the core console buffer never
+  // flushes on this path. This marker is raw write() and needs no flushing.
+  corelog_crash_marker((unsigned long long)ctx->pc.x,
+                       (unsigned long long)ctx->lr.x);
   (void)ctx;
   svcExitProcess();
 }

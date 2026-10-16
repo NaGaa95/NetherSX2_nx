@@ -932,6 +932,117 @@ vk_gdpa_hook(VkDevice dev, const char *name) {
   return fn;
 }
 
+// Loader parity for the bootstrap set.
+//
+// A real Vulkan loader answers vkEnumeratePhysicalDevices, vkDestroyInstance and
+// vkEnumeratePhysicalDeviceGroups from vkGetInstanceProcAddr(NULL, name): both
+// the Khronos loader and Android's libvulkan carry a trampoline for each in
+// their global command table, so an application that resolves its whole
+// bootstrap set against a NULL instance -- which is what the core does -- gets a
+// usable pointer and only later passes the real handle in.
+//
+// There is no loader here. vkGetInstanceProcAddr forwards straight to NVK's
+// vk_icdGetInstanceProcAddr, which is an ICD entry point and therefore answers
+// only the four genuinely global commands for a NULL instance; for everything
+// else it returns NULL. The core treats NULL as fatal, so GS initialisation
+// dies before vkCreateDevice is ever reached. That is the gap in the diagnostic
+// log: vkCreateInstance succeeds, and then nothing.
+//
+// These trampolines restore the loader's contract. They resolve lazily, at call
+// time, through the instance recorded by vkCreateInstance_hook -- by then it
+// exists, exactly as it does when a loader trampoline runs.
+
+static PFN_vkEnumeratePhysicalDevices real_enumerate_physical_devices = NULL;
+
+static VkResult VKAPI_CALL
+vkEnumeratePhysicalDevices_trampoline(VkInstance instance, uint32_t *count,
+                                      VkPhysicalDevice *gpus) {
+  VkInstance inst = instance ? instance : tracked_instance;
+  PFN_vkEnumeratePhysicalDevices fn = real_enumerate_physical_devices;
+  if (!fn) {
+    fn = inst ? (PFN_vkEnumeratePhysicalDevices)vkGetInstanceProcAddr(
+                    inst, "vkEnumeratePhysicalDevices")
+              : NULL;
+    if (!fn)
+      return VK_ERROR_INITIALIZATION_FAILED;
+    real_enumerate_physical_devices = fn;
+  }
+
+  const VkResult r = fn(inst, count, gpus);
+
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  // "Did we get any adapter at all, and what does NVK call it?" Zero devices is
+  // a silent GS init failure on the core side and nothing else in the log
+  // distinguishes it from a crash during device creation.
+  if (count) {
+    vk_diag_note("vkEnumeratePhysicalDevices inst=%p result=%d count=%u%s",
+                 (void *)inst, r, *count, gpus ? "" : " (count query)");
+    if (gpus && r == VK_SUCCESS) {
+      const PFN_vkGetPhysicalDeviceProperties gpp =
+          inst ? (PFN_vkGetPhysicalDeviceProperties)vkGetInstanceProcAddr(
+                     inst, "vkGetPhysicalDeviceProperties")
+               : NULL;
+      const uint32_t shown = *count < 8 ? *count : 8;
+      for (uint32_t i = 0; i < shown; i++) {
+        if (gpp) {
+          VkPhysicalDeviceProperties p;
+          memset(&p, 0, sizeof(p));
+          gpp(gpus[i], &p);
+          vk_diag_note("  gpu[%u]=%s api=%u driver=0x%x type=%d", i,
+                       p.deviceName, p.apiVersion, p.driverVersion,
+                       (int)p.deviceType);
+        } else {
+          vk_diag_note("  gpu[%u]=%p (no vkGetPhysicalDeviceProperties)", i,
+                       (void *)gpus[i]);
+        }
+      }
+      if (*count > shown)
+        vk_diag_note("  ... %u further gpu(s)", *count - shown);
+    }
+  }
+#endif
+  return r;
+}
+
+static void VKAPI_CALL
+vkDestroyInstance_trampoline(VkInstance instance,
+                             const VkAllocationCallbacks *alloc) {
+  VkInstance inst = instance ? instance : tracked_instance;
+  PFN_vkDestroyInstance fn = inst
+      ? (PFN_vkDestroyInstance)vkGetInstanceProcAddr(inst, "vkDestroyInstance")
+      : NULL;
+  if (fn)
+    fn(inst, alloc);
+}
+
+static VkResult VKAPI_CALL
+vkEnumeratePhysicalDeviceGroups_trampoline(VkInstance instance, uint32_t *count,
+                                           VkPhysicalDeviceGroupProperties *groups) {
+  VkInstance inst = instance ? instance : tracked_instance;
+  PFN_vkEnumeratePhysicalDeviceGroups fn = inst
+      ? (PFN_vkEnumeratePhysicalDeviceGroups)vkGetInstanceProcAddr(
+            inst, "vkEnumeratePhysicalDeviceGroups")
+      : NULL;
+  if (!fn)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  return fn(inst, count, groups);
+}
+
+// The names an ICD's GIPA declines for a NULL instance but a loader accepts.
+// vkEnumeratePhysicalDevices is not here: vk_gipa_hook installs its trampoline
+// directly so that it is wrapped whether the core passes NULL or the instance.
+static PFN_vkVoidFunction
+vk_loader_global_command(const char *name) {
+  if (!name)
+    return NULL;
+  if (!strcmp(name, "vkDestroyInstance"))
+    return (PFN_vkVoidFunction)vkDestroyInstance_trampoline;
+  if (!strcmp(name, "vkEnumeratePhysicalDeviceGroups") ||
+      !strcmp(name, "vkEnumeratePhysicalDeviceGroupsKHR"))
+    return (PFN_vkVoidFunction)vkEnumeratePhysicalDeviceGroups_trampoline;
+  return NULL;
+}
+
 // instance proc addr wrapper -- registered in the import table as
 // "vkGetInstanceProcAddr". Routes the Android surface, device-proc-addr, present
 // and the memory-budget override; everything else is NVK's real GIPA.
@@ -942,6 +1053,12 @@ vk_gipa_hook(VkInstance inst, const char *name) {
       return (PFN_vkVoidFunction)vkCreateInstance_hook;
     if (!strcmp(name, "vkEnumerateInstanceExtensionProperties"))
       return (PFN_vkVoidFunction)vkEnumerateInstanceExtensionProperties_hook;
+    if (!strcmp(name, "vkEnumeratePhysicalDevices")) {
+      // May be asked with a NULL instance; the trampoline resolves at call time.
+      real_enumerate_physical_devices =
+          (PFN_vkEnumeratePhysicalDevices)vkGetInstanceProcAddr(inst, name);
+      return (PFN_vkVoidFunction)vkEnumeratePhysicalDevices_trampoline;
+    }
     if (!strcmp(name, "vkCreateAndroidSurfaceKHR"))
       return (PFN_vkVoidFunction)vkCreateAndroidSurfaceKHR_shim;
     if (!strcmp(name, "vkGetDeviceProcAddr"))
@@ -1005,7 +1122,21 @@ vk_gipa_hook(VkInstance inst, const char *name) {
       return (PFN_vkVoidFunction)vkGetPhysicalDeviceMemoryProperties2_shim;
     }
   }
-  return vkGetInstanceProcAddr(inst, name);
+
+  PFN_vkVoidFunction fn = vkGetInstanceProcAddr(inst, name);
+  // Restore the loader contract for the bootstrap set NVK's ICD GIPA declines.
+  if (!fn)
+    fn = vk_loader_global_command(name);
+
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  // Every entry point the core asks for that is not already covered by its own
+  // note above, and whether it got one. A NULL here is the difference between
+  // "GS init failed" and "GS init failed because vkEnumeratePhysicalDevices
+  // could not be resolved".
+  vk_diag_note("gipa inst=%p name=%s -> %p", (void *)inst,
+               name ? name : "(null)", (void *)fn);
+#endif
+  return fn;
 }
 
 // enumerate instance extensions -- advertise VK_KHR_android_surface (which NVK

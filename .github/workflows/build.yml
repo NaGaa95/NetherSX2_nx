@@ -387,6 +387,8 @@ jobs:
           #   nethersx2-vulkan.log    zivotopis od main() po present, s casem
           #   nethersx2-mesa.log      MESA_LOG_FILE + NVK_DEBUG=wsi,vm
           #   nethersx2-exception.log pc/far/esr/sp/fp/lr pri CPU vyjimce
+          #   nethersx2-core.log      konzole jadra (Bionic logcat) + duvod
+          #                           abortu; pise se VZDY, i v produkci
           # Vsechno line-buffered a fsync, takze log prezije i spad procesu.
           # TARGET je jiny, aby se neprepsal produkci nro, ktery uz overila
           # Kontrola bundle a ktery jde do artefaktu.
@@ -412,9 +414,18 @@ jobs:
           hits=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "nethersx2-vulkan.log" || true)
           hits2=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "host main entered" || true)
           prod=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "nethersx2-vulkan.log" || true)
-          echo "::notice::diag kontrola: nethersx2-vulkan.log ${hits}x, host main entered ${hits2}x (diag); ${prod}x (produkce, ma byt 0)"
+          # corelog (konzole jadra) je zapnuty VZDY, nezavisle na prepinaci, takze
+          # nethersx2-core.log musi byt v OBOU binarkach. Kdyby chybel, znamena to
+          # ze se source/corelog.c neskompiloval a core by opet mlcel.
+          cored=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "nethersx2-core.log" || true)
+          corep=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "nethersx2-core.log" || true)
+          echo "::notice::diag kontrola: vulkan.log ${hits}x + host main entered ${hits2}x (diag), ${prod}x (produkce, ma byt 0); core.log ${cored}x (diag) / ${corep}x (produkce), oboji ma byt aspon 1"
           if [ "$hits" = "0" ] || [ "$hits2" = "0" ]; then
             echo "::error::NETHERSX2_VK_DIAGNOSTIC se v diag buildu neprojevilo -- binarka by nelogovala"
+            exit 1
+          fi
+          if [ "$cored" = "0" ] || [ "$corep" = "0" ]; then
+            echo "::error::source/corelog.c se nedostal do binarky -- konzole jadra by se zahazovala"
             exit 1
           fi
           if [ "$prod" != "0" ]; then

@@ -58,6 +58,7 @@ The launcher creates the rest of the folder tree on first run:
   forwarders/   <- HOME shortcut launch records
   hidden.ini    <- hidden library entries
   launcher.ini  <- the launcher's saved config
+  nethersx2-core.log <- the core's own console; see Diagnostics
 ```
 
 ### Notes
@@ -91,6 +92,33 @@ prepared. Frame Generation starts **Off** in every game and must be enabled
 manually from **L + R + Plus > Frame Generation**. Skip Duplicate Frames is
 automatically enabled for prepared LSFG sessions so only unique game frames
 are interpolated.
+
+### Diagnostics
+
+Logs go into `/switch/nethersx2/`.
+
+`nethersx2-core.log` is written by every build. It captures the core's own
+console: PCSX2 reports every initialisation failure through Bionic's logcat, and
+Horizon has nowhere to print it, so without this the emulator dies without ever
+saying why. It also records the reason and the calling address whenever the core
+calls `abort()` or trips the stack protector, rendering an address inside
+`libemucore.so` as `core+0xOFFSET`. The file is buffered and capped at 2 MiB;
+errors are flushed and `fsync`ed as they are written, so they survive a crash.
+
+CI additionally publishes `NetherSX2-diag.nro` — the same launcher and the same
+cores, with the emulator built with `NETHERSX2_VK_DIAGNOSTIC=1`. Install it as
+`/switch/NetherSX2.nro` (keeping your `nethersx2/` folder) to also get:
+
+```
+nethersx2-vulkan.log     host and Vulkan lifecycle, timestamped
+nethersx2-mesa.log       NVK's own log (MESA_LOG_FILE, NVK_DEBUG=wsi,vm)
+nethersx2-exception.log  pc/far/esr/sp/fp/lr, only if a CPU exception fires
+```
+
+The Vulkan log traces every `vkGetInstanceProcAddr` lookup the core makes and
+whether it resolved, and reports how many physical devices NVK returned and what
+they are called. A run whose log ends without `host exiting normally (atexit)`
+did not exit cleanly — the last line before the gap names the stage that died.
 
 ### How to build
 

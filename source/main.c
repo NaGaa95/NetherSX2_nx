@@ -27,6 +27,7 @@
 #include "jni_fake.h"
 #include "prefs.h"
 #include "libc_shim.h"
+#include "corelog.h"
 #include "pthr.h"
 #include "keycodes.h"
 #include "syslang.h"
@@ -1890,6 +1891,12 @@ static void vk_diag_exit_note(void) {
 
 int main(void) {
   extern int crash_in_progress(void);
+  // The core's console: Bionic logcat -> DATA_ROOT/nethersx2-core.log. Opened
+  // before anything that can fail so a failure always has somewhere to say what
+  // happened. A clean exit flushes through atexit; abort(), __stack_chk_fail and
+  // the CPU exception handler each make their own line durable first.
+  corelog_open();
+  atexit(corelog_flush);
 #if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
   unlink(DATA_ROOT "/nethersx2-exception.log");
   unlink(DATA_ROOT "/nethersx2-mesa.log");
