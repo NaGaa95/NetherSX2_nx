@@ -39,10 +39,25 @@ if [[ -n "${MESA_SDK_ROOT:-}" ]]; then
     "$MESA_SDK_ROOT/lib/libEGL.a"
   )
 else
-  required+=(
-    "$APP/vulkan/include/vulkan/vulkan_core.h"
-    "$APP/vulkan/lib/libnvk.a"
-  )
+  # Mesa NVK, same two layouts the Makefile detects: the nxvk portlib package
+  # (preferred) or the older vendored tree under $APP/vulkan.
+  NXVK_PKG_CONFIG="$DEVKITA64/bin/aarch64-none-elf-pkg-config"
+  if PKG_CONFIG_PATH= "$NXVK_PKG_CONFIG" --exists nxvk 2>/dev/null; then
+    NXVK_PREFIX=$(PKG_CONFIG_PATH= "$NXVK_PKG_CONFIG" --variable=prefix nxvk)
+    echo "NVK: portlib package $NXVK_PREFIX ($(PKG_CONFIG_PATH= "$NXVK_PKG_CONFIG" --modversion nxvk))"
+    required+=(
+      "$NXVK_PREFIX/lib/libnvk.a"
+      "$NXVK_PREFIX/lib/libnvk_support.a"
+      "$NXVK_PREFIX/lib/pkgconfig/nxvk.pc"
+      "$NXVK_PREFIX/include/vulkan/vulkan_core.h"
+    )
+  else
+    echo "NVK: vendored tree $APP/vulkan (nxvk.pc not found)"
+    required+=(
+      "$APP/vulkan/include/vulkan/vulkan_core.h"
+      "$APP/vulkan/lib/libnvk.a"
+    )
+  fi
 fi
 for file in "${required[@]}"; do
   [[ -f "$file" ]] || { echo "Missing build input: $file" >&2; exit 1; }

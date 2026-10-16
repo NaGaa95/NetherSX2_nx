@@ -31,6 +31,11 @@ def core_tables(path):
 
 def verify_profiles(workspace, cores):
     text = (workspace / "source/deko3d/dk_profiles.h").read_text()
+    # Strip comments before parsing. The address regexes below match any 0x...
+    # literal, so a hex value mentioned in a comment inside a CoreProfile or
+    # vtable body would be read as an address and silently shift every slot.
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
     for version in ("4248", "3668"):
         profile = re.search(rf"CoreProfile Profile{version}\{{(.*?)\}};", text, re.S)[1]
         expected_hash = re.findall(r'"([0-9a-f]{64})"', profile)[0]

@@ -171,48 +171,73 @@ jobs:
           done
           exit 0
 
-      - name: Vstupy z release (volitelne)
-        env:
-          INPUTS_URL: ${{ secrets.NETHERSX2_INPUTS_URL }}
-          INPUTS_TOKEN: ${{ secrets.NETHERSX2_INPUTS_TOKEN }}
+      - name: Vstupy z TEST3 (cores + NXVK)
         run: |
-          # Cores a Mesa NVK nelze distribuovat z repa. Kdyz je das na release
-          # (i privatni) jako archiv .tar.gz s vnitrnim usporadanim
-          #   NetherSX2-v2.2n-4248/{lib/arm64-v8a/libemucore.so,assets/...}
-          #   NetherSX2-v2.2n-3668/...
-          #   vulkan/{include/vulkan/vulkan_core.h,lib/libnvk.a,...}
-          # staci nastavit secrets NETHERSX2_INPUTS_URL (+ TOKEN pro privatni)
-          # a pustit run znovu. Bez nich se postavi DK + GL + launcher.
-          if [ -z "$INPUTS_URL" ]; then
-            echo "::notice::NETHERSX2_INPUTS_URL nenastaven -> stavim bez cores a NVK"
-            exit 0
+          # Cores ani Mesa NVK nemohou zit v tomhle repu. berlint-hub/TEST3 je
+          # drzi jako binarni bloby a git clone pres github.com funguje; raw
+          # contents API a Actions artefakty nejsou potřeba.
+          rm -rf /tmp/TEST3
+          git clone --depth 1 https://github.com/berlint-hub/TEST3.git /tmp/TEST3 \
+            || { echo "::error::clone TEST3 selhal"; exit 1; }
+          echo "::notice::TEST3 commit $(git -C /tmp/TEST3 rev-parse --short HEAD)"
+
+          # 1) NXVK jako portlib balicek. switch/docs/bringing-an-application.md:
+          #    tar -xzf ... -C "$DEVKITPRO/portlibs/switch". prefix v nxvk.pc je
+          #    napevno /opt/devkitpro/portlibs/switch, proto se rozbaluje primo
+          #    tam a pkg-config ho pak najde bez nastavovani PKG_CONFIG_PATH.
+          tb=/tmp/TEST3/nxvk-vulkan-tegra-x1.tar.gz
+          if [ -f "$tb" ]; then
+            echo "::notice::NXVK tarball $(stat -c%s "$tb") B, sha256 $(sha256sum "$tb" | cut -d' ' -f1)"
+            tar -xzf "$tb" -C "$DEVKITPRO/portlibs/switch" \
+              || { echo "::error::NXVK tarball nejde rozbalit"; exit 1; }
+            # BUILDINFO.txt = atributovatelnost (commit, ref, build run, Mesa,
+            # toolchain). Zaloguje se po radcich a jde i do artefaktu.
+            sed 's/%/%25/g; s/^/::notice::NXVK BUILDINFO | /' \
+              "$DEVKITPRO/portlibs/switch/BUILDINFO.txt" || true
+            cp "$DEVKITPRO/portlibs/switch/BUILDINFO.txt" nxvk-BUILDINFO.txt
+          else
+            echo "::warning::TEST3 neobsahuje nxvk-vulkan-tegra-x1.tar.gz -> RENDERER=VK se preskoci"
           fi
-          auth=()
-          [ -n "$INPUTS_TOKEN" ] && auth=(-H "Authorization: Bearer $INPUTS_TOKEN")
-          curl -sSL --retry 3 "${auth[@]}" -o /tmp/inputs.tar.gz "$INPUTS_URL" \
-            || { echo "::error::stazeni vstupu z release selhalo"; exit 1; }
-          echo "::notice::archiv vstupu: $(stat -c%s /tmp/inputs.tar.gz) B"
-          mkdir -p /tmp/inputs && tar xzf /tmp/inputs.tar.gz -C /tmp/inputs \
-            || { echo "::error::archiv vstupu nejde rozbalit"; exit 1; }
-          # cores patri vedle repa (build_all.sh: CORES_DIR="$(dirname "$APP")")
+
+          # 2) cores: TEST3 je drzi ploche (libemucore_<V>_baked.so + assets_<V>),
+          #    build_all.sh a check_deko3d_build.py cekaji rozbalene APK
+          #    usporadani. Premapuji se vedle repa (CORES_DIR="$(dirname $APP)").
+          root="$(dirname "$PWD")"
           for v in 4248 3668; do
-            if [ -d "/tmp/inputs/NetherSX2-v2.2n-$v" ]; then
-              cp -r "/tmp/inputs/NetherSX2-v2.2n-$v" "$(dirname "$PWD")/"
-            fi
+            so="/tmp/TEST3/libemucore_${v}_baked.so"
+            [ -f "$so" ] || { echo "::warning::TEST3 neobsahuje libemucore_${v}_baked.so"; continue; }
+            mkdir -p "$root/NetherSX2-v2.2n-$v/lib/arm64-v8a"
+            cp "$so" "$root/NetherSX2-v2.2n-$v/lib/arm64-v8a/libemucore.so"
+            cp -r "/tmp/TEST3/assets_$v" "$root/NetherSX2-v2.2n-$v/assets"
+            echo "::notice::core $v sha256 $(sha256sum "$so" | cut -d' ' -f1)"
           done
-          # vulkan/ patri do korene repa (Makefile: LIBDIRS := $(TOPDIR)/vulkan)
-          [ -d /tmp/inputs/vulkan ] && cp -r /tmp/inputs/vulkan "$PWD/"
-          echo "::notice::rozbaleno: $(ls /tmp/inputs | tr '\n' ' ')"
 
       - name: Vulkan (Mesa NVK) -- volitelne
         id: nvk
         run: |
-          if [ -f vulkan/lib/libnvk.a ] && [ -f vulkan/include/vulkan/vulkan_core.h ]; then
+          pc="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-pkg-config"
+          lib="$DEVKITPRO/portlibs/switch/lib"
+          if [ -f "$lib/libnvk.a" ] && PKG_CONFIG_PATH= "$pc" --exists nxvk; then
             echo "present=1" >> "$GITHUB_OUTPUT"
-            echo "::notice::NVK archivu: $(ls vulkan/lib/*.a | wc -l)"
+            echo "::notice::nxvk $(PKG_CONFIG_PATH= "$pc" --modversion nxvk): libnvk.a $(stat -c%s "$lib/libnvk.a") B, libnvk_support.a $(stat -c%s "$lib/libnvk_support.a") B"
+            # Makefile zapne -DNETHERSX2_NVK_ICD_ONLY prave proto, ze libnvk.a
+            # exportuje JEN vk_icdGetInstanceProcAddr (na Horizonu neni loader).
+            nm="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm"
+            defined=$("$nm" --defined-only "$lib/libnvk.a" 2>/dev/null || true)
+            icd=$(printf '%s\n' "$defined" | grep -c ' T vk_icdGetInstanceProcAddr$' || true)
+            plain=$(printf '%s\n' "$defined" | grep -c ' T vkGetInstanceProcAddr$' || true)
+            echo "::notice::libnvk.a: vk_icdGetInstanceProcAddr=${icd}x, vkGetInstanceProcAddr=${plain}x"
+            if [ "$plain" != "0" ]; then
+              echo "::warning::libnvk.a exportuje i vkGetInstanceProcAddr -> shim v source/hooks/vk.c by kolidoval"
+            fi
+            if [ "$icd" = "0" ]; then
+              echo "::error::libnvk.a nedefinuje vk_icdGetInstanceProcAddr"
+              exit 1
+            fi
+            PKG_CONFIG_PATH= "$pc" --libs nxvk | sed 's/^/::notice::nxvk.pc Libs: /'
           else
             echo "present=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::vulkan/lib/libnvk.a chybi -> RENDERER=VK se preskoci"
+            echo "::warning::portlib balicek nxvk chybi -> RENDERER=VK se preskoci"
           fi
 
       - name: Cores (NetherSX2 v2.2n-4248 / -3668) -- volitelne
@@ -319,5 +344,6 @@ jobs:
             NetherSX2_nx_dk.nro
             NetherSX2_nx_gl.nro
             NetherSX2_nx_vk.nro
+            nxvk-BUILDINFO.txt
             launcher/NetherSX2.nro
             build-dk/NetherSX2_nx_dk.map

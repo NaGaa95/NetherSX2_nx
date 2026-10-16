@@ -22,12 +22,27 @@ inline constexpr uint32_t Host3668[]{
   0x7daba0,0x7daca0,0x7dad00,0x7dad80,0x7db170,0x7dad90,0x7dae60,0x7daee0,
   0x7daef0,0x7daf00,0x7daf10,0x7db1d0,0x7da800,0x7da9e0,0x7db370,0x7db430,
   0x7daaa0,0x7db270,0x7db2d0,0x7db360,0x2f3e70,0x7db6e0,0x7db890};
+// Both profiles below pin the BAKED (pre-patched) cores: every site in
+// g_patches_4248[] / g_patches_3668[] already holds the patched instruction, so
+// patch_game() is a safe no-op on them. Only the image hash differs from the
+// pristine APK core -- both GSDevice and HostDisplay vtables verify
+// slot-for-slot against the arrays above (4248: 29/29 and 31/31; 3668: 32/32
+// and 31/31), so every offset in these profiles still applies.
+//
+// For 3668 the XGKickSkip sites at file offsets 3cfa98 and 3cfad8 are already
+// NOPs, which makes the EmuCore/Patches/XGKickSkip preference inert:
+// patch_xgkick_skip() finds neither pristine instruction and the skip stays
+// permanently enabled.
+//
+// Keep these comments OUTSIDE the CoreProfile{...} braces: verify_profiles() in
+// tools/check_deko3d_build.py reads the vtable addresses out of the brace body
+// and any hex literal in there would be parsed as an address.
 inline constexpr CoreProfile Profile4248{
-  "4248", "6f4473845483fa2e7be9d1e8aeac17cd12561d8153d51201037826b9c1b5ffde",
+  "4248", "cda05f6b9136f5535ae33bc71fd3624f95b5fde7706259cadbdd90cecb6b531e",
   0xb78a20,0xb7ed58,0x6156b0,0x64ff20,0xc6cb5c0,0xa39200,0xa43400,
   0x78,0x75,2,Device4248,29,Host4248,0x271ce80,0xa38080};
 inline constexpr CoreProfile Profile3668{
-  "3668", "4e378da548984dc0208ff2240aae003942ae9c5a6eec3a36c838c65ac6a37a63",
+  "3668", "c99c2fede1f3a539326d16f46185986489d2153ec2c621d89e3704baa31170cb",
   0xb686c0,0xb6e280,0x625d00,0x678090,0xc6be458,0xa28c90,0xa32e90,
   0x98,0x95,3,Device3668,32,Host3668,0x270ce50,0xa27b10};
 }
