@@ -1878,14 +1878,34 @@ static void update_touch(void) {
   }
 }
 
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+/* atexit does not run when crash.c calls svcExitProcess(), so the presence of
+ * this line in the log is what separates "the VM loop returned and the emulator
+ * exited cleanly" from "the process died". Without it the log just stops and the
+ * last preceding note is ambiguous. */
+static void vk_diag_exit_note(void) {
+  vk_diag_note("host exiting normally (atexit)");
+}
+#endif
+
 int main(void) {
   extern int crash_in_progress(void);
 #if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
   unlink(DATA_ROOT "/nethersx2-exception.log");
   unlink(DATA_ROOT "/nethersx2-mesa.log");
   setenv("MESA_LOG_FILE", DATA_ROOT "/nethersx2-mesa.log", 1);
+  // NVK's own tracing, into that same file, and it has to be set before the
+  // driver is first touched. wsi prints the presentation path and per-frame
+  // totals -- exactly the stage that fails when the screen flashes once and the
+  // process exits; vm prints memory mapping, which is how an OOM or a failed
+  // import shows up. Both are the flags nxvk's bringing-an-application.md names
+  // for an attributable report.
+  setenv("NVK_DEBUG", "wsi,vm", 1);
+  setenv("MESA_SHADER_CACHE_SHOW_STATS", "1", 1);
   vk_diag_reset();
-  vk_diag_note("host main entered renderer=%d", GS_RENDERER);
+  atexit(vk_diag_exit_note);
+  vk_diag_note("host main entered renderer=%d applet=%u", GS_RENDERER,
+               (unsigned)__nx_applet_type);
 #endif
 #if defined(USE_VULKAN)
   // Not optional, and it must precede vkCreateInstance: on a device NVK is not

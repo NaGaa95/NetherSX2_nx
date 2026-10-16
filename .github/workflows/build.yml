@@ -380,6 +380,37 @@ jobs:
             || { echo "::error::check_deko3d_build.py selhal"; exit 1; }
           echo "::notice::finalni bundle: $(ls -la NetherSX2.nro)"
 
+      - name: Diagnosticky bundle (VK log)
+        run: |
+          # Stejna jadra, stejny launcher, jen emulator postaveny s
+          # NETHERSX2_VK_DIAGNOSTIC=1. Ten pise do /switch/nethersx2/:
+          #   nethersx2-vulkan.log    zivotopis od main() po present, s casem
+          #   nethersx2-mesa.log      MESA_LOG_FILE + NVK_DEBUG=wsi,vm
+          #   nethersx2-exception.log pc/far/esr/sp/fp/lr pri CPU vyjimce
+          # Vsechno line-buffered a fsync, takze log prezije i spad procesu.
+          # TARGET je jiny, aby se neprepsal produkci nro, ktery uz overila
+          # Kontrola bundle a ktery jde do artefaktu.
+          log=/tmp/diag.log
+          set +e
+          make -j"$(nproc)" RENDERER=VK BUILD=build-vk-diag TARGET=NetherSX2_nx_vk_diag \
+            NETHERSX2_VK_DIAGNOSTIC=1 > "$log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" != 0 ]; then
+            echo "::error::diag build selhal (rc=$rc)"
+            grep -nE "error:|undefined reference|No rule to make" "$log" \
+              | head -8 | sed 's/%/%25/g; s/^/::error::DIAG | /'
+            exit "$rc"
+          fi
+          echo "::notice::diag nro: $(ls -la NetherSX2_nx_vk_diag.nro)"
+          cp NetherSX2_nx_vk_diag.nro launcher/romfs/emu/NetherSX2_nx_vk.nro
+          make -C launcher -j"$(nproc)" || { echo "::error::diag launcher selhal"; exit 1; }
+          mv -f launcher/NetherSX2.nro NetherSX2-diag.nro
+          # romfs vrat na produkci emulator, aby dalsi kroky (ani dalsi beh)
+          # nemohly omylem zabalit diagnostickou verzi.
+          cp NetherSX2_nx_vk.nro launcher/romfs/emu/NetherSX2_nx_vk.nro
+          echo "::notice::diag bundle: $(ls -la NetherSX2-diag.nro)"
+
       - name: Artefakty
         uses: actions/upload-artifact@v4
         with:
@@ -387,5 +418,7 @@ jobs:
           if-no-files-found: warn
           path: |
             NetherSX2.nro
+            NetherSX2-diag.nro
             NetherSX2_nx_vk.nro
+            NetherSX2_nx_vk_diag.nro
             nxvk-BUILDINFO.txt
