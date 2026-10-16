@@ -116,7 +116,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq || echo "::warning::apt-get update selhal"
           apt-get install -y --no-install-recommends \
-            git curl ca-certificates bison flex cmake ninja-build make \
+            git curl ca-certificates bison flex cmake ninja-build make g++ \
             pkg-config python3 python3-pip liblz4-dev zlib1g-dev \
             || echo "::warning::nektere apt balicky nejdou nainstalovat"
           python3 -m pip install --break-system-packages --no-cache-dir mako 2>/dev/null \
@@ -145,11 +145,11 @@ jobs:
           [ -f "$DEVKITPRO/devkitA64/base_rules" ] && say "base_rules OK" \
             || echo "::error::chybi devkitA64/base_rules"
           say "portlibs lib: $(ls "$PORTLIBS/lib" 2>/dev/null | grep -c '\.a$') archivu"
-          say "portlibs .pc : $(ls "$PORTLIBS/lib/pkgconfig" 2>/dev/null | tr '\n' ' ')"
+          say "portlibs .pc: $(ls "$PORTLIBS/lib/pkgconfig" 2>/dev/null | wc -l) souboru"
           for l in SDL2 SDL2_ttf SDL2_image curl z zstd png turbojpeg EGL GLESv2 \
                    glapi drm_nouveau ntfs-3g deko3d nx; do
             found=$(find "$DEVKITPRO" -name "lib$l.a" 2>/dev/null | head -1)
-            [ -n "$found" ] && say "lib$l.a -> $found" || say "lib$l.a CHYBI"
+            [ -n "$found" ] && say "lib$l.a -> $found" || echo "::error::lib$l.a CHYBI"
           done
 
       - name: Doplnit chybejici portlibs
@@ -158,9 +158,10 @@ jobs:
           # zkusí doinstalovat. Rozhodujici je inventar vyse a build kroky nize.
           PM=$(command -v pacman || command -v dkp-pacman || true)
           if [ -z "$PM" ]; then echo "::warning::pacman neni, preskakuji doinstalaci"; exit 0; fi
+          # switch-zstd neexistuje jako balicek; zstd je v obraze uz od zacatku.
           need="switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl switch-libpng \
                 switch-ntfs-3g switch-mesa switch-libdrm_nouveau deko3d switch-zlib \
-                switch-zstd switch-libjpeg-turbo"
+                switch-libjpeg-turbo"
           for p in $need; do
             if "$PM" -S --needed --noconfirm --disable-download-timeout "$p" >/tmp/pm.log 2>&1; then
               echo "::notice::portlib OK: $p"
@@ -169,6 +170,39 @@ jobs:
             fi
           done
           exit 0
+
+      - name: Vstupy z release (volitelne)
+        env:
+          INPUTS_URL: ${{ secrets.NETHERSX2_INPUTS_URL }}
+          INPUTS_TOKEN: ${{ secrets.NETHERSX2_INPUTS_TOKEN }}
+        run: |
+          # Cores a Mesa NVK nelze distribuovat z repa. Kdyz je das na release
+          # (i privatni) jako archiv .tar.gz s vnitrnim usporadanim
+          #   NetherSX2-v2.2n-4248/{lib/arm64-v8a/libemucore.so,assets/...}
+          #   NetherSX2-v2.2n-3668/...
+          #   vulkan/{include/vulkan/vulkan_core.h,lib/libnvk.a,...}
+          # staci nastavit secrets NETHERSX2_INPUTS_URL (+ TOKEN pro privatni)
+          # a pustit run znovu. Bez nich se postavi DK + GL + launcher.
+          if [ -z "$INPUTS_URL" ]; then
+            echo "::notice::NETHERSX2_INPUTS_URL nenastaven -> stavim bez cores a NVK"
+            exit 0
+          fi
+          auth=()
+          [ -n "$INPUTS_TOKEN" ] && auth=(-H "Authorization: Bearer $INPUTS_TOKEN")
+          curl -sSL --retry 3 "${auth[@]}" -o /tmp/inputs.tar.gz "$INPUTS_URL" \
+            || { echo "::error::stazeni vstupu z release selhalo"; exit 1; }
+          echo "::notice::archiv vstupu: $(stat -c%s /tmp/inputs.tar.gz) B"
+          mkdir -p /tmp/inputs && tar xzf /tmp/inputs.tar.gz -C /tmp/inputs \
+            || { echo "::error::archiv vstupu nejde rozbalit"; exit 1; }
+          # cores patri vedle repa (build_all.sh: CORES_DIR="$(dirname "$APP")")
+          for v in 4248 3668; do
+            if [ -d "/tmp/inputs/NetherSX2-v2.2n-$v" ]; then
+              cp -r "/tmp/inputs/NetherSX2-v2.2n-$v" "$(dirname "$PWD")/"
+            fi
+          done
+          # vulkan/ patri do korene repa (Makefile: LIBDIRS := $(TOPDIR)/vulkan)
+          [ -d /tmp/inputs/vulkan ] && cp -r /tmp/inputs/vulkan "$PWD/"
+          echo "::notice::rozbaleno: $(ls /tmp/inputs | tr '\n' ' ')"
 
       - name: Vulkan (Mesa NVK) -- volitelne
         id: nvk
@@ -221,6 +255,23 @@ jobs:
             || { echo "::error::make RENDERER=DK selhal"; exit 1; }
           echo "::notice::DK nro: $(ls -la NetherSX2_nx_dk.nro 2>/dev/null)"
 
+      - name: Osmy test -- validace shaderu (jen s cores)
+        if: steps.cores.outputs.present == '1'
+        run: |
+          # shader_validation potrebuje bison+flex (UAM) A zaroven rozbalene APK
+          # assets: cte <assets>/shaders/opengl/*.glsl a kompiluje z nich DKSH.
+          # Uam.cmake ho zapne jen pri DEKO3D_SHADER_TESTS=ON a NATIVNIM buildu,
+          # proto se tady konfiguruje podruhe, bez Switch.cmake.
+          cmake -S source/deko3d/compiler -B out/shader-tests -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DDEKO3D_SHADER_TESTS=ON \
+            || { echo "::error::native configure pro shader_validation selhal"; exit 1; }
+          cmake --build out/shader-tests --parallel "$(nproc)" \
+            || { echo "::error::build shader_validation selhal"; exit 1; }
+          ./out/shader-tests/deko3d_shader_validation \
+            "$CORES_DIR/NetherSX2-v2.2n-4248/assets" \
+            "$CORES_DIR/NetherSX2-v2.2n-3668/assets" \
+            || { echo "::error::shader_validation selhal za behu"; exit 1; }
+
       - name: Emulator -- OpenGL
         run: |
           make -j"$(nproc)" RENDERER=GL BUILD=build-gl TARGET=NetherSX2_nx_gl \
@@ -250,9 +301,13 @@ jobs:
       - name: Kontrola bundle (jen s cores + NVK)
         if: steps.cores.outputs.present == '1' && steps.nvk.outputs.present == '1'
         run: |
+          # build_all.sh presouva finalni bundle do korene repa a pak ho overuje
+          mv -f launcher/NetherSX2.nro NetherSX2.nro
           python3 tools/check_deko3d_build.py --cores-dir "$CORES_DIR" \
             --map build-dk/NetherSX2_nx_dk.map --native-nro NetherSX2_nx_dk.nro \
-            --bundle launcher/NetherSX2.nro
+            --bundle NetherSX2.nro \
+            || { echo "::error::check_deko3d_build.py selhal"; exit 1; }
+          echo "::notice::finalni bundle: $(ls -la NetherSX2.nro)"
 
       - name: Artefakty
         uses: actions/upload-artifact@v4
@@ -260,6 +315,7 @@ jobs:
           name: nethersx2-switch
           if-no-files-found: warn
           path: |
+            NetherSX2.nro
             NetherSX2_nx_dk.nro
             NetherSX2_nx_gl.nro
             NetherSX2_nx_vk.nro
