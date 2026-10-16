@@ -41,10 +41,12 @@ if [[ -n "${MESA_SDK_ROOT:-}" ]]; then
 else
   # Mesa NVK, same two layouts the Makefile detects: the nxvk portlib package
   # (preferred) or the older vendored tree under $APP/vulkan.
-  NXVK_PKG_CONFIG="$DEVKITA64/bin/aarch64-none-elf-pkg-config"
-  if PKG_CONFIG_PATH= "$NXVK_PKG_CONFIG" --exists nxvk 2>/dev/null; then
-    NXVK_PREFIX=$(PKG_CONFIG_PATH= "$NXVK_PKG_CONFIG" --variable=prefix nxvk)
-    echo "NVK: portlib package $NXVK_PREFIX ($(PKG_CONFIG_PATH= "$NXVK_PKG_CONFIG" --modversion nxvk))"
+  # NXVK_PKG_CONFIG muze byt i vice slov (PKG_CONFIG_LIBDIR=... /cesta/pkg-config),
+  # proto se expanduje bez uvozovek -- presne tak ho pouziva Makefile.
+  NXVK_PKG_CONFIG="${NXVK_PKG_CONFIG:-$DEVKITA64/bin/aarch64-none-elf-pkg-config}"
+  if $NXVK_PKG_CONFIG --exists nxvk 2>/dev/null; then
+    NXVK_PREFIX=$($NXVK_PKG_CONFIG --variable=prefix nxvk)
+    echo "NVK: portlib balicek $NXVK_PREFIX ($($NXVK_PKG_CONFIG --modversion nxvk))"
     required+=(
       "$NXVK_PREFIX/lib/libnvk.a"
       "$NXVK_PREFIX/lib/libnvk_support.a"

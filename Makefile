@@ -37,6 +37,10 @@ endif
 
 RENDERER ?= GL
 MESA_SDK_ROOT ?=
+# pkg-config for the nxvk portlib package. Defaults to the devkitA64 cross
+# wrapper -- the same one launcher/Makefile already uses for SDL2 -- but CI can
+# override it when the package is only reachable another way.
+NXVK_PKG_CONFIG ?= $(PREFIX)pkg-config
 ifneq ($(strip $(MESA_SDK_ROOT)),)
 ifneq ($(RENDERER),DK)
 DEFINES += -DUSE_UNIFIED_MESA
@@ -65,7 +69,7 @@ INCLUDES	+=	source/lsfg \
 # Detect the nxvk portlib package here, not down by LIBS: CFLAGS below is
 # assigned with := and expands $(DEFINES) immediately, so the shim macro has to
 # be in DEFINES before that line.
-NXVK_PKG	:=	$(shell PKG_CONFIG_PATH= $(PREFIX)pkg-config --exists nxvk 2>/dev/null && echo 1)
+NXVK_PKG	:=	$(shell $(NXVK_PKG_CONFIG) --exists nxvk 2>/dev/null && echo 1)
 ifeq ($(NXVK_PKG),1)
 # libnvk.a defines only vk_icdGetInstanceProcAddr -- see source/hooks/vk.c.
 DEFINES		+=	-DNETHERSX2_NVK_ICD_ONLY
@@ -127,7 +131,7 @@ else
 # -ldrm_nouveau. -lstdc++/libgcc unwinder are needed by NAK's bundled Rust.
 ifeq ($(NXVK_PKG),1)
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
-LIBS	:= $(STORAGE_LIBS) `$(PREFIX)pkg-config --libs nxvk` \
+LIBS	:= $(STORAGE_LIBS) `$(NXVK_PKG_CONFIG) --libs nxvk` \
 		-lcurl -lz -lzstd -lnx -lstdc++ -lm
 else
 LIBDIRS	:= $(TOPDIR)/vulkan $(PORTLIBS) $(LIBNX)

@@ -215,30 +215,66 @@ jobs:
       - name: Vulkan (Mesa NVK) -- volitelne
         id: nvk
         run: |
-          pc="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-pkg-config"
+          # Balicek je rozbaleny v $DEVKITPRO/portlibs/switch, ale cross
+          # pkg-config muze byt na nekolika mistech a jeho vychozi search path
+          # nemusi portlibs obsahovat. Vsechny kombinace se vyzkousi a kazdy
+          # pokus se zaloguje, aby detekce a Makefile nemohly nesouhlasit
+          # potichu (presne to se stalo v runu 38968866220).
           lib="$DEVKITPRO/portlibs/switch/lib"
-          if [ -f "$lib/libnvk.a" ] && PKG_CONFIG_PATH= "$pc" --exists nxvk; then
-            echo "present=1" >> "$GITHUB_OUTPUT"
-            echo "::notice::nxvk $(PKG_CONFIG_PATH= "$pc" --modversion nxvk): libnvk.a $(stat -c%s "$lib/libnvk.a") B, libnvk_support.a $(stat -c%s "$lib/libnvk_support.a") B"
-            # Makefile zapne -DNETHERSX2_NVK_ICD_ONLY prave proto, ze libnvk.a
-            # exportuje JEN vk_icdGetInstanceProcAddr (na Horizonu neni loader).
-            nm="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm"
-            defined=$("$nm" --defined-only "$lib/libnvk.a" 2>/dev/null || true)
-            icd=$(printf '%s\n' "$defined" | grep -c ' T vk_icdGetInstanceProcAddr$' || true)
-            plain=$(printf '%s\n' "$defined" | grep -c ' T vkGetInstanceProcAddr$' || true)
-            echo "::notice::libnvk.a: vk_icdGetInstanceProcAddr=${icd}x, vkGetInstanceProcAddr=${plain}x"
-            if [ "$plain" != "0" ]; then
-              echo "::warning::libnvk.a exportuje i vkGetInstanceProcAddr -> shim v source/hooks/vk.c by kolidoval"
-            fi
-            if [ "$icd" = "0" ]; then
-              echo "::error::libnvk.a nedefinuje vk_icdGetInstanceProcAddr"
-              exit 1
-            fi
-            PKG_CONFIG_PATH= "$pc" --libs nxvk | sed 's/^/::notice::nxvk.pc Libs: /'
-          else
+          pcdir="$lib/pkgconfig"
+          nm="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm"
+          echo "::notice::libnvk.a: $([ -f "$lib/libnvk.a" ] && stat -c%s "$lib/libnvk.a" || echo CHYBI) B"
+          echo "::notice::libnvk_support.a: $([ -f "$lib/libnvk_support.a" ] && stat -c%s "$lib/libnvk_support.a" || echo CHYBI) B"
+          echo "::notice::nxvk.pc: $([ -f "$pcdir/nxvk.pc" ] && echo nalezeno || echo CHYBI)"
+          if [ ! -f "$lib/libnvk.a" ] || [ ! -f "$pcdir/nxvk.pc" ]; then
             echo "present=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::portlib balicek nxvk chybi -> RENDERER=VK se preskoci"
+            echo "::warning::portlib balicek nxvk je nekompletni -> RENDERER=VK se preskoci"
+            exit 0
           fi
+          win_pc=""; win_ld=""
+          for cand in "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-pkg-config" \
+                      "$DEVKITPRO/portlibs/switch/bin/aarch64-none-elf-pkg-config" \
+                      "$(command -v aarch64-none-elf-pkg-config 2>/dev/null)" \
+                      "$(command -v pkg-config 2>/dev/null)"; do
+            [ -n "$cand" ] && [ -x "$cand" ] || continue
+            for ld in "" "$pcdir"; do
+              if [ -n "$ld" ]; then
+                out=$(PKG_CONFIG_LIBDIR="$ld" "$cand" --modversion nxvk 2>&1) && rc=0 || rc=1
+              else
+                out=$("$cand" --modversion nxvk 2>&1) && rc=0 || rc=1
+              fi
+              echo "::notice::probe: $cand [LIBDIR=${ld:-vychozi}] rc=$rc ${out}"
+              if [ "$rc" = 0 ]; then win_pc="$cand"; win_ld="$ld"; break 2; fi
+            done
+          done
+          if [ -z "$win_pc" ]; then
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::zadny pkg-config nenasel nxvk -> RENDERER=VK se preskoci"
+            exit 0
+          fi
+          echo "present=1" >> "$GITHUB_OUTPUT"
+          # PKG_CONFIG_LIBDIR se NEexportuje globalne -- vyradil by launcheru
+          # hledani sdl2.pc. Putuje primo do promenne, kterou Makefile expanduje
+          # do shellu, takze plati jen pro nxvk.
+          if [ -n "$win_ld" ]; then
+            echo "NXVK_PKG_CONFIG=PKG_CONFIG_LIBDIR=$win_ld $win_pc" >> "$GITHUB_ENV"
+          else
+            echo "NXVK_PKG_CONFIG=$win_pc" >> "$GITHUB_ENV"
+          fi
+          echo "::notice::nxvk $(PKG_CONFIG_LIBDIR="${win_ld:-$pcdir}" "$win_pc" --modversion nxvk) nalezen pres $win_pc [LIBDIR=${win_ld:-vychozi}]"
+          # Makefile zapne -DNETHERSX2_NVK_ICD_ONLY prave proto, ze libnvk.a
+          # exportuje JEN vk_icdGetInstanceProcAddr (na Horizonu neni loader).
+          defined=$("$nm" --defined-only "$lib/libnvk.a" 2>/dev/null || true)
+          icd=$(printf '%s\n' "$defined" | grep -c ' T vk_icdGetInstanceProcAddr$' || true)
+          plain=$(printf '%s\n' "$defined" | grep -c ' T vkGetInstanceProcAddr$' || true)
+          echo "::notice::libnvk.a: vk_icdGetInstanceProcAddr=${icd}x, vkGetInstanceProcAddr=${plain}x"
+          if [ "$icd" = "0" ]; then
+            echo "::error::libnvk.a nedefinuje vk_icdGetInstanceProcAddr"; exit 1
+          fi
+          if [ "$plain" != "0" ]; then
+            echo "::warning::libnvk.a exportuje i vkGetInstanceProcAddr -> shim v source/hooks/vk.c by kolidoval"
+          fi
+          PKG_CONFIG_LIBDIR="${win_ld:-$pcdir}" "$win_pc" --libs nxvk | sed 's/^/::notice::nxvk.pc Libs: /'
 
       - name: Cores (NetherSX2 v2.2n-4248 / -3668) -- volitelne
         id: cores
@@ -306,8 +342,10 @@ jobs:
       - name: Emulator -- Vulkan (NVK)
         if: steps.nvk.outputs.present == '1'
         run: |
+          echo "::notice::make pouzije NXVK_PKG_CONFIG=${NXVK_PKG_CONFIG:-<default>}"
           make -j"$(nproc)" RENDERER=VK BUILD=build-vk TARGET=NetherSX2_nx_vk \
             || { echo "::error::make RENDERER=VK selhal"; exit 1; }
+          echo "::notice::VK nro: $(ls -la NetherSX2_nx_vk.nro 2>/dev/null)"
 
       - name: Launcher (SDL2)
         run: |
