@@ -192,8 +192,10 @@ jobs:
               || { echo "::error::NXVK tarball nejde rozbalit"; exit 1; }
             # BUILDINFO.txt = atributovatelnost (commit, ref, build run, Mesa,
             # toolchain). Zaloguje se po radcich a jde i do artefaktu.
-            sed 's/%/%25/g; s/^/::notice::NXVK BUILDINFO | /' \
-              "$DEVKITPRO/portlibs/switch/BUILDINFO.txt" || true
+            # paste, ne tr: tr mapuje po znacich, takze by oddelovac zahodil.
+            grep -E "^(Source|Commit|Ref|Build run|Mesa version|Toolchain image):" \
+              "$DEVKITPRO/portlibs/switch/BUILDINFO.txt" | paste -sd '|' - \
+              | sed 's/%/%25/g; s/^/::notice::NXVK BUILDINFO /' || true
             cp "$DEVKITPRO/portlibs/switch/BUILDINFO.txt" nxvk-BUILDINFO.txt
           else
             echo "::warning::TEST3 neobsahuje nxvk-vulkan-tegra-x1.tar.gz -> RENDERER=VK se preskoci"
@@ -209,7 +211,6 @@ jobs:
             mkdir -p "$root/NetherSX2-v2.2n-$v/lib/arm64-v8a"
             cp "$so" "$root/NetherSX2-v2.2n-$v/lib/arm64-v8a/libemucore.so"
             cp -r "/tmp/TEST3/assets_$v" "$root/NetherSX2-v2.2n-$v/assets"
-            echo "::notice::core $v sha256 $(sha256sum "$so" | cut -d' ' -f1)"
           done
 
       - name: Vulkan (Mesa NVK) -- povinne
@@ -282,6 +283,26 @@ jobs:
              [ -f "$root/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" ]; then
             echo "present=1" >> "$GITHUB_OUTPUT"; echo "CORES_DIR=$root" >> "$GITHUB_ENV"
             echo "::notice::cores nalezeny v $root"
+            # Hash kazdeho jadra a krizova kontrola proti hodnote pripnute v
+            # source/deko3d/dk_profiles.h: kdyz se blob v TEST3 zmeni, spadne to
+            # tady s jasnou zpravou, ne az v check_deko3d_build.py o tri minuty
+            # pozdeji. Overuje se premapovany soubor, tedy presne to, co jde do
+            # bundle.
+            for v in 4248 3668; do
+              so="$root/NetherSX2-v2.2n-$v/lib/arm64-v8a/libemucore.so"
+              got=$(sha256sum "$so" | cut -d' ' -f1)
+              want=$(sed -n "s/.*\"$v\", \"\([0-9a-f]\{64\}\)\".*/\1/p" source/deko3d/dk_profiles.h)
+              echo "::notice::core $v $(stat -c%s "$so") B sha256 $got"
+              if [ -z "$want" ]; then
+                echo "::error::v dk_profiles.h se nepodarilo najit pripnuty hash pro $v"; exit 1
+              fi
+              if [ "$got" != "$want" ]; then
+                echo "::error::core $v: sha256 neodpovida hodnote v dk_profiles.h"
+                echo "::error::  TEST3 ma $got"
+                echo "::error::  repo ceka $want"
+                exit 1
+              fi
+            done
           else
             echo "::error::cores v $root chybi -> bez nich nejde postavit bundle"
             exit 1
