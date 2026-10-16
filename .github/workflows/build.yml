@@ -403,6 +403,23 @@ jobs:
             exit "$rc"
           fi
           echo "::notice::diag nro: $(ls -la NetherSX2_nx_vk_diag.nro)"
+          # Overit, ze se prepinac skutecne uplatnil. Retezec cesty k logu a
+          # format "host main entered" existuji JEN pod NETHERSX2_VK_DIAGNOSTIC,
+          # takze jejich pritomnost v binarce je dukaz. Bez tehle kontroly by
+          # diag bundle mohl byt potichu stejny jako produkce (rozdil 4096 B sam
+          # o sobe nic nedokazuje -- muze to byt i jen delsi nacp nazev targetu).
+          xstrings="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-strings"
+          hits=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "nethersx2-vulkan.log" || true)
+          hits2=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "host main entered" || true)
+          prod=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "nethersx2-vulkan.log" || true)
+          echo "::notice::diag kontrola: nethersx2-vulkan.log ${hits}x, host main entered ${hits2}x (diag); ${prod}x (produkce, ma byt 0)"
+          if [ "$hits" = "0" ] || [ "$hits2" = "0" ]; then
+            echo "::error::NETHERSX2_VK_DIAGNOSTIC se v diag buildu neprojevilo -- binarka by nelogovala"
+            exit 1
+          fi
+          if [ "$prod" != "0" ]; then
+            echo "::warning::produkci nro obsahuje diagnostiku, melo by byt bez ni"
+          fi
           cp NetherSX2_nx_vk_diag.nro launcher/romfs/emu/NetherSX2_nx_vk.nro
           make -C launcher -j"$(nproc)" || { echo "::error::diag launcher selhal"; exit 1; }
           mv -f launcher/NetherSX2.nro NetherSX2-diag.nro
