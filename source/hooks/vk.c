@@ -38,6 +38,23 @@
 #include "../prefs.h"
 #include "../lsfg/lsfg_bridge.h"
 
+// The Mesa NVK portlib package (nxvk.pc, built from berlint-hub/nxvk) ships only
+// libnvk.a + libnvk_support.a, and libnvk.a defines exactly one entry point:
+// vk_icdGetInstanceProcAddr. There is no Vulkan loader on Horizon, so nothing
+// supplies the plain vkGetInstanceProcAddr that vk_gipa_hook() below resolves
+// every instance function through. Without this shim the VK link fails with an
+// undefined symbol.
+//
+// Guarded because the older 23-archive layout in vulkan/lib does export
+// vkGetInstanceProcAddr, and a second strong definition would collide with it.
+// NETHERSX2_NVK_ICD_ONLY is set by the Makefile only for the portlib link path.
+#ifdef NETHERSX2_NVK_ICD_ONLY
+#include <vulkan/vk_icd.h> // vk_icdGetInstanceProcAddr
+PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char *name) {
+  return vk_icdGetInstanceProcAddr(instance, name);
+}
+#endif
+
 volatile int vk_present_count = 0;
 
 #ifdef NETHERSX2_VK_DIAGNOSTIC

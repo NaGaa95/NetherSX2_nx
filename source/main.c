@@ -67,6 +67,15 @@ static void *FAKE_SURFACE = NULL; // android.view.Surface
 u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
 #endif
 
+// Full-memory application, never an applet. Mesa sizes itself from the core mask
+// Horizon grants the process (0x7, three cores) and NVK needs the memory it gets
+// only in this applet type; an applet is silently short of both. libnx declares
+// this weak, so a strong definition here pins it.
+// __nx_heap_size is deliberately NOT defined: __libnx_initheap() below replaces
+// libnx's heap sizing outright and already claims all available memory minus the
+// GPU and .so reserves, so the libnx knob would be dead.
+u32 __nx_applet_type = AppletType_Application;
+
 // separate the newlib heap from the .so load region (see config.h SO_REGION_MB)
 void __libnx_initheap(void) {
   void *addr;
@@ -1877,6 +1886,13 @@ int main(void) {
   setenv("MESA_LOG_FILE", DATA_ROOT "/nethersx2-mesa.log", 1);
   vk_diag_reset();
   vk_diag_note("host main entered renderer=%d", GS_RENDERER);
+#endif
+#if defined(USE_VULKAN)
+  // Not optional, and it must precede vkCreateInstance: on a device NVK is not
+  // conformant for, nvk_physical_device_create() returns
+  // VK_ERROR_INCOMPATIBLE_DRIVER unless this is set. In a release build that is
+  // the entire symptom -- no message, and no physical device to enumerate.
+  setenv("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1);
 #endif
   cpu_boost(1);
 
