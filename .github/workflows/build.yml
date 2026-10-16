@@ -343,8 +343,21 @@ jobs:
         if: steps.nvk.outputs.present == '1'
         run: |
           echo "::notice::make pouzije NXVK_PKG_CONFIG=${NXVK_PKG_CONFIG:-<default>}"
-          make -j"$(nproc)" RENDERER=VK BUILD=build-vk TARGET=NetherSX2_nx_vk \
-            || { echo "::error::make RENDERER=VK selhal"; exit 1; }
+          # Logy jobu se odsud nedaji stahnout (blob storage mimo allowlist),
+          # proto se pri selhani vypise do anotaci -- GitHub jich na krok pusti
+          # max 10 na uroven, tak 8 chybovych radku + 1 slouceny tail.
+          log=/tmp/vk.log
+          set +e
+          make -j"$(nproc)" RENDERER=VK BUILD=build-vk TARGET=NetherSX2_nx_vk > "$log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" != 0 ]; then
+            echo "::error::make RENDERER=VK selhal (rc=$rc), $(wc -l < "$log") radku logu"
+            grep -nE "error:|Error [0-9]|undefined reference|No such file|cannot find|fatal error|collect2|No rule to make" "$log" \
+              | head -8 | sed 's/%/%25/g; s/^/::error::VK | /'
+            tail -14 "$log" | tr '\n' '|' | sed 's/%/%25/g; s/^/::error::VK-tail | /'
+            exit "$rc"
+          fi
           echo "::notice::VK nro: $(ls -la NetherSX2_nx_vk.nro 2>/dev/null)"
 
       - name: Launcher (SDL2)
