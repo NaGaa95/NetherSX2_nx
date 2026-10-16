@@ -212,7 +212,7 @@ jobs:
             echo "::notice::core $v sha256 $(sha256sum "$so" | cut -d' ' -f1)"
           done
 
-      - name: Vulkan (Mesa NVK) -- volitelne
+      - name: Vulkan (Mesa NVK) -- povinne
         id: nvk
         run: |
           # Balicek je rozbaleny v $DEVKITPRO/portlibs/switch, ale cross
@@ -227,9 +227,8 @@ jobs:
           echo "::notice::libnvk_support.a: $([ -f "$lib/libnvk_support.a" ] && stat -c%s "$lib/libnvk_support.a" || echo CHYBI) B"
           echo "::notice::nxvk.pc: $([ -f "$pcdir/nxvk.pc" ] && echo nalezeno || echo CHYBI)"
           if [ ! -f "$lib/libnvk.a" ] || [ ! -f "$pcdir/nxvk.pc" ]; then
-            echo "present=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::portlib balicek nxvk je nekompletni -> RENDERER=VK se preskoci"
-            exit 0
+            echo "::error::portlib balicek nxvk je nekompletni: libnvk.a nebo nxvk.pc chybi"
+            exit 1
           fi
           win_pc=""; win_ld=""
           for cand in "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-pkg-config" \
@@ -248,9 +247,8 @@ jobs:
             done
           done
           if [ -z "$win_pc" ]; then
-            echo "present=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::zadny pkg-config nenasel nxvk -> RENDERER=VK se preskoci"
-            exit 0
+            echo "::error::zadny pkg-config nenasel nxvk"
+            exit 1
           fi
           echo "present=1" >> "$GITHUB_OUTPUT"
           # PKG_CONFIG_LIBDIR se NEexportuje globalne -- vyradil by launcheru
@@ -276,7 +274,7 @@ jobs:
           fi
           PKG_CONFIG_LIBDIR="${win_ld:-$pcdir}" "$win_pc" --libs nxvk | sed 's/^/::notice::nxvk.pc Libs: /'
 
-      - name: Cores (NetherSX2 v2.2n-4248 / -3668) -- volitelne
+      - name: Cores (NetherSX2 v2.2n-4248 / -3668) -- povinne
         id: cores
         run: |
           root="$(dirname "$PWD")"
@@ -285,20 +283,9 @@ jobs:
             echo "present=1" >> "$GITHUB_OUTPUT"; echo "CORES_DIR=$root" >> "$GITHUB_ENV"
             echo "::notice::cores nalezeny v $root"
           else
-            echo "present=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::APK cores chybi -> bundling do NetherSX2.nro se preskoci"
+            echo "::error::cores v $root chybi -> bez nich nejde postavit bundle"
+            exit 1
           fi
-
-      - name: Deko3D deps (UAM + SPIRV-Cross + LSFG)
-        run: |
-          cmake -S source/deko3d/compiler -B out/deko3d-deps -G Ninja \
-                -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
-                -DCMAKE_BUILD_TYPE=Release -DDEKO3D_SHADER_TESTS=OFF \
-            || { echo "::error::configure deko3d-deps selhal"; exit 1; }
-          cmake --build out/deko3d-deps --parallel "$(nproc)" \
-            || { echo "::error::build deko3d-deps selhal"; exit 1; }
-          ls out/deko3d-deps/lsfg/*.a out/deko3d-deps/uam-generated/*.o 2>/dev/null \
-            || echo "::warning::lsfg/uam archivy nenalezeny"
 
       - name: Storage deps (libsmb2 + libusbhsfs)
         run: |
@@ -309,15 +296,7 @@ jobs:
           cmake --build launcher/dependencies/build --parallel "$(nproc)" \
             || { echo "::error::build storage deps selhal"; exit 1; }
 
-      - name: Emulator -- native Deko3D
-        run: |
-          make -j"$(nproc)" RENDERER=DK BUILD=build-dk TARGET=NetherSX2_nx_dk \
-               DEKO3D_DEPS_ROOT="$PWD/out/deko3d-deps" \
-            || { echo "::error::make RENDERER=DK selhal"; exit 1; }
-          echo "::notice::DK nro: $(ls -la NetherSX2_nx_dk.nro 2>/dev/null)"
-
-      - name: Osmy test -- validace shaderu (jen s cores)
-        if: steps.cores.outputs.present == '1'
+      - name: Osmy test -- validace shaderu proti assets jader
         run: |
           # shader_validation potrebuje bison+flex (UAM) A zaroven rozbalene APK
           # assets: cte <assets>/shaders/opengl/*.glsl a kompiluje z nich DKSH.
@@ -333,14 +312,7 @@ jobs:
             "$CORES_DIR/NetherSX2-v2.2n-3668/assets" \
             || { echo "::error::shader_validation selhal za behu"; exit 1; }
 
-      - name: Emulator -- OpenGL
-        run: |
-          make -j"$(nproc)" RENDERER=GL BUILD=build-gl TARGET=NetherSX2_nx_gl \
-            || { echo "::error::make RENDERER=GL selhal"; exit 1; }
-          echo "::notice::GL nro: $(ls -la NetherSX2_nx_gl.nro 2>/dev/null)"
-
       - name: Emulator -- Vulkan (NVK)
-        if: steps.nvk.outputs.present == '1'
         run: |
           echo "::notice::make pouzije NXVK_PKG_CONFIG=${NXVK_PKG_CONFIG:-<default>}"
           # Logy jobu se odsud nedaji stahnout (blob storage mimo allowlist),
@@ -368,24 +340,21 @@ jobs:
       - name: Launcher (SDL2)
         run: |
           mkdir -p launcher/romfs/cores launcher/romfs/emu launcher/romfs/res
-          if [ "${{ steps.cores.outputs.present }}" = "1" ]; then
-            cp "$CORES_DIR/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_4248.so
-            cp "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_3668.so
-            cp NetherSX2_nx_dk.nro launcher/romfs/emu/
-            cp NetherSX2_nx_gl.nro launcher/romfs/emu/
-            [ -f NetherSX2_nx_vk.nro ] && cp NetherSX2_nx_vk.nro launcher/romfs/emu/
-            python3 tools/bundle_resources.py --cores-dir "$CORES_DIR"
-          fi
+          cp "$CORES_DIR/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_4248.so
+          cp "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_3668.so
+          cp NetherSX2_nx_vk.nro launcher/romfs/emu/
+          rm -f launcher/romfs/emu/NetherSX2_nx_dk.nro launcher/romfs/emu/NetherSX2_nx_gl.nro
+          python3 tools/bundle_resources.py --cores-dir "$CORES_DIR"
           make -C launcher/fwd -j"$(nproc)" || { echo "::error::launcher/fwd selhal"; exit 1; }
           make -C launcher -j"$(nproc)"     || { echo "::error::launcher selhal"; exit 1; }
 
-      - name: Kontrola bundle (jen s cores + NVK)
-        if: steps.cores.outputs.present == '1' && steps.nvk.outputs.present == '1'
+      - name: Kontrola bundle
         run: |
           # build_all.sh presouva finalni bundle do korene repa a pak ho overuje
           mv -f launcher/NetherSX2.nro NetherSX2.nro
+          # Bez --map: Deko3D target se nestavi. verify_profiles (hashe jader +
+          # vtabulky) a verify_bundle (VK nro + cores + resources) bezi dal.
           python3 tools/check_deko3d_build.py --cores-dir "$CORES_DIR" \
-            --map build-dk/NetherSX2_nx_dk.map --native-nro NetherSX2_nx_dk.nro \
             --bundle NetherSX2.nro \
             || { echo "::error::check_deko3d_build.py selhal"; exit 1; }
           echo "::notice::finalni bundle: $(ls -la NetherSX2.nro)"
@@ -397,9 +366,5 @@ jobs:
           if-no-files-found: warn
           path: |
             NetherSX2.nro
-            NetherSX2_nx_dk.nro
-            NetherSX2_nx_gl.nro
             NetherSX2_nx_vk.nro
             nxvk-BUILDINFO.txt
-            launcher/NetherSX2.nro
-            build-dk/NetherSX2_nx_dk.map

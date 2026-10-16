@@ -92,44 +92,22 @@ fi
 cmake "${deps_args[@]}"
 cmake --build "$DEPS_BUILD" --parallel "$JOBS"
 
-echo "==== native Deko3D shader compiler + LSFG dependencies ===="
-DEKO3D_DEPS_ROOT="${DEKO3D_DEPS_ROOT:-$APP/out/deko3d-deps}"
-dk_args=(
-  -S "$APP/source/deko3d/compiler"
-  -B "$DEKO3D_DEPS_ROOT"
-  -G Ninja
-  -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake"
-  -DCMAKE_BUILD_TYPE=Release
-  -DDEKO3D_SHADER_TESTS=OFF
-)
-if [[ -n "${UAM_SOURCE:-}" ]]; then
-  dk_args+=( -DFETCHCONTENT_SOURCE_DIR_DOLPHIN_UAM="$UAM_SOURCE" )
-fi
-if [[ -n "${SPIRV_CROSS_SOURCE:-}" ]]; then
-  dk_args+=( -DFETCHCONTENT_SOURCE_DIR_SPIRV_CROSS="$SPIRV_CROSS_SOURCE" )
-fi
-cmake "${dk_args[@]}"
-cmake --build "$DEKO3D_DEPS_ROOT" --parallel "$JOBS"
-
-echo "==== emulator: native Deko3D ===="
-cd "$APP"
-DK_BUILD=build-dk
-DK_TARGET=NetherSX2_nx_dk
-make -j"$JOBS" RENDERER=DK BUILD="$DK_BUILD" TARGET="$DK_TARGET" DEKO3D_DEPS_ROOT="$DEKO3D_DEPS_ROOT"
-
 echo "==== emulator: Vulkan (NVK) ===="
+# Vulkan-only: this is the shipped backend. The native Deko3D and OpenGL targets
+# still build (make RENDERER=DK / RENDERER=GL) but are not part of the bundle,
+# so their dependency step (out/deko3d-deps: UAM + SPIRV-Cross + LSFG-deko3d) is
+# not configured here either.
+cd "$APP"
 make -j"$JOBS" RENDERER=VK BUILD=build-vk TARGET=NetherSX2_nx_vk
 
-echo "==== emulator: OpenGL ===="
-make -j"$JOBS" RENDERER=GL BUILD=build-gl TARGET=NetherSX2_nx_gl
-
-echo "==== bundle cores + emulator binaries into the launcher romfs ===="
+echo "==== bundle cores + the Vulkan emulator into the launcher romfs ===="
 mkdir -p "$APP/launcher/romfs/cores" "$APP/launcher/romfs/emu"
 cp -f "$CORES_DIR/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" "$APP/launcher/romfs/cores/emucore_4248.so"
 cp -f "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" "$APP/launcher/romfs/cores/emucore_3668.so"
 cp -f "$APP/NetherSX2_nx_vk.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_vk.nro"
-cp -f "$APP/NetherSX2_nx_gl.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_gl.nro"
-cp -f "$APP/$DK_TARGET.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_dk.nro"
+# Remove stale binaries an older multi-renderer bundle left in the romfs, so a
+# rebuilt bundle cannot ship an emulator the launcher no longer offers.
+rm -f "$APP/launcher/romfs/emu/NetherSX2_nx_dk.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_gl.nro"
 
 echo "==== bundle per-build resources into the launcher romfs ===="
 python3 "$APP/tools/bundle_resources.py" --cores-dir "$CORES_DIR"
@@ -142,8 +120,9 @@ cd "$APP/launcher"
 make -j"$JOBS"
 
 mv -f "$APP/launcher/NetherSX2.nro" "$APP/NetherSX2.nro"
-python3 "$APP/tools/check_deko3d_build.py" --cores-dir "$CORES_DIR" \
-  --map "$APP/$DK_BUILD/$DK_TARGET.map" --native-nro "$APP/$DK_TARGET.nro" --bundle "$APP/NetherSX2.nro"
+# No --map: the Deko3D target is not built, so there is no link map to verify.
+# verify_profiles (core hashes + vtables) and verify_bundle still run.
+python3 "$APP/tools/check_deko3d_build.py" --cores-dir "$CORES_DIR" --bundle "$APP/NetherSX2.nro"
 
 echo
 echo "Done. The only file to copy:"

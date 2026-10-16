@@ -91,32 +91,37 @@ def romfs_files(nro):
     visit(0, "")
     return result
 
-def verify_bundle(nro, workspace, cores, native_nro=None):
+def verify_bundle(nro, workspace, cores):
     files = romfs_files(nro)
-    expected = {f"emu/NetherSX2_nx_{backend}.nro": workspace / f"NetherSX2_nx_{backend}.nro"
-                for backend in ("dk", "gl", "vk")}
-    if native_nro:
-        expected["emu/NetherSX2_nx_dk.nro"] = native_nro
+    # Vulkan-only: the bundle ships just the NVK emulator. The dk and gl targets
+    # are still buildable from the Makefile, but they are no longer bundled, so
+    # requiring them here would fail every bundle built after the switch.
+    expected = {"emu/NetherSX2_nx_vk.nro": workspace / "NetherSX2_nx_vk.nro"}
     for version in ("4248", "3668"):
         expected[f"cores/emucore_{version}.so"] = cores / f"NetherSX2-v2.2n-{version}/lib/arm64-v8a/libemucore.so"
         expected[f"res/{version}/shaders/opengl/tfx_fs.glsl"] = cores / f"NetherSX2-v2.2n-{version}/assets/shaders/opengl/tfx_fs.glsl"
     for name, source in expected.items():
         if name not in files or hashlib.sha256(files[name]).digest() != hashlib.sha256(source.read_bytes()).digest():
             raise ValueError(f"Missing or outdated bundled artifact: {name}")
-    print(f"{nro.name}: both cores, all three renderer NROs and per-core GS shader resources verified")
+    print(f"{nro.name}: both cores, the Vulkan (NVK) NRO and per-core GS shader resources verified")
 
 def main():
     workspace = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cores-dir", type=Path, default=workspace / "out/cores")
-    parser.add_argument("--map", type=Path, default=workspace / "build-dk/NetherSX2_nx_dk.map")
+    parser.add_argument("--map", type=Path, default=workspace / "build-dk/NetherSX2_nx_dk.map",
+                        help="link map of the native Deko3D target; checked only when it exists")
     parser.add_argument("--bundle", type=Path)
-    parser.add_argument("--native-nro", type=Path)
     args = parser.parse_args()
     verify_profiles(workspace, args.cores_dir)
-    verify_link(args.map)
+    # The Deko3D target is no longer part of the shipped bundle, so its map is
+    # optional: verify it when a build produced one, skip quietly otherwise.
+    if args.map.is_file():
+        verify_link(args.map)
+    else:
+        print(f"{args.map}: not built, skipping the Deko3D link check")
     if args.bundle:
-        verify_bundle(args.bundle, workspace, args.cores_dir, args.native_nro)
+        verify_bundle(args.bundle, workspace, args.cores_dir)
 
 if __name__ == "__main__":
     main()

@@ -35,7 +35,8 @@ ifneq ($(strip $(NETHERSX2_VK_DIAGNOSTIC)),)
 DEFINES += -DNETHERSX2_VK_DIAGNOSTIC
 endif
 
-RENDERER ?= GL
+# Vulkan-only product: NVK is the shipped backend, so it is also the default.
+RENDERER ?= VK
 MESA_SDK_ROOT ?=
 # pkg-config for the nxvk portlib package. Defaults to the devkitA64 cross
 # wrapper -- the same one launcher/Makefile already uses for SDL2 -- but CI can
