@@ -10,6 +10,8 @@
 
 #include "util.h"
 
+u32 __nx_applet_PerformanceConfiguration[2] = {0x92220007, 0};
+
 void cpu_boost(int on) {
   appletSetCpuBoostMode(on ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
 }
