@@ -1,19 +1,23 @@
-# Build NetherSX2_nx on GitHub Actions.
+# Build NetherSX2_nx na GitHub Actions.
 #
-# Proč CI a ne lokálně: devkitA64, libnx.a, switch portlibs a Mesa NVK se
-# nedají nainstalovat v omezeném sandboxu (pkg.devkitpro.org, apt.devkitpro.org,
+# Proc CI a ne lokalne: devkitA64, libnx.a, switch portlibs a Mesa NVK se nedaji
+# nainstalovat v omezenem sandboxu (pkg.devkitpro.org, apt.devkitpro.org,
 # downloads.devkitpro.org, deb.debian.org, release-assets.githubusercontent.com,
-# registry-1.docker.io a ghcr.io jsou mimo allowlist). Runner má plný internet.
+# results-receiver.actions.githubusercontent.com, registry-1.docker.io a ghcr.io
+# jsou mimo allowlist). Runner ma plny internet.
 #
-# Co build potřebuje a kde se to bere:
 #   devkitA64 + libnx + switch-tools + portlibs -> obraz devkitpro/devkita64
 #   bison, flex, cmake, ninja, lz4              -> apt-get v tom obraze
 #   libsmb2, libusbhsfs, UAM, SPIRV-Cross       -> FetchContent z GitHubu
-#   vulkan/lib/*.a (23 archivu Mesa NVK)        -> MUSI se dodat, viz krok "Vulkan"
-#   NetherSX2-v2.2n-4248 / -3668 (APK cores)    -> MUSI se dodat, viz krok "Cores"
+#   vulkan/lib/*.a (23 archivu Mesa NVK)        -> MUSI se dodat
+#   NetherSX2-v2.2n-4248 / -3668 (APK cores)    -> MUSI se dodat
 #
-# Bez cores a NVK se postaví DK a GL emulator + launcher (compile-level).
-# S nimi projde celý build_all.sh a vznikne finální NetherSX2.nro.
+# Bez cores a NVK se postavi DK a GL emulator + launcher (compile-level).
+# S nimi projde cely build_all.sh a vznikne finalni NetherSX2.nro.
+#
+# Diagnostika: logy runu jsou ze sandboxu nedostupne, proto klicove kroky pisou
+# `::notice::` / `::error::`, ktere jde precist pres
+#   gh api repos/<owner>/<repo>/check-runs/<job_id>/annotations
 name: build
 
 on:
@@ -21,11 +25,6 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
-    inputs:
-      full_bundle:
-        description: 'Spustit kompletni build_all.sh (vyžaduje cores + NVK jako artifacts)'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -40,51 +39,70 @@ env:
 
 jobs:
   # ---------------------------------------------------------------- host tests
-  # Nepotřebuje devkitA64. Rychlá zpětná vazba na logiku, která jde ověřit na
-  # hostiteli: patche jádra, síťový shim a kontrakt nativního Deko3D backendu.
+  # Nepotrebuje devkitA64. Rychla zpetna vazba na logiku overitelnou na hostiteli.
   host-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Host dependencies
+      - name: Host zavislosti
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ libegl-dev libgles-dev
+          # tests/patches hleda EGL/egl.h; HINTS ukazuji na $DEVKITPRO, ale
+          # find_path prohleda i systemove cesty -> systemove EGL staci.
+          test -e /usr/include/EGL/egl.h || echo "::error::EGL/egl.h chybi i po libegl-dev"
 
-      - name: Stáhnout hlavičky libnx a deko3d
+      - name: Hlavicky libnx a deko3d
         run: |
-          mkdir -p /tmp/dkp/libnx /tmp/dkp/portlibs/switch/include
-          curl -sSL https://codeload.github.com/switchbrew/libnx/tar.gz/refs/heads/master \
-            | tar xz -C /tmp/dkp/libnx --strip-components=4 '*/nx/include'
-          curl -sSL https://codeload.github.com/devkitPro/deko3d/tar.gz/refs/heads/master \
-            | tar xz -C /tmp/dkp/libnx --strip-components=2 '*/include/deko3d.h' \
-                                       '*/include/deko3d.hpp'
-          echo "DEVKITPRO=/tmp/dkp" >> "$GITHUB_ENV"
+          set -e
+          root=/tmp/dkp
+          rm -rf "$root"; mkdir -p "$root/libnx" "$root/portlibs/switch/include"
+          curl -sSL --retry 3 -o /tmp/libnx.tgz \
+            https://codeload.github.com/switchbrew/libnx/tar.gz/refs/heads/master
+          curl -sSL --retry 3 -o /tmp/deko3d.tgz \
+            https://codeload.github.com/devkitPro/deko3d/tar.gz/refs/heads/master
+          mkdir -p /tmp/libnx /tmp/deko3d
+          tar xzf /tmp/libnx.tgz   -C /tmp/libnx   --strip-components=1
+          tar xzf /tmp/deko3d.tgz -C /tmp/deko3d --strip-components=1
+          cp -r /tmp/libnx/nx/include/. "$root/libnx/include/"
+          cp /tmp/libnx/nx/switch_rules /tmp/libnx/nx/switch.specs \
+             /tmp/libnx/nx/switch.ld "$root/libnx/"
+          cp /tmp/deko3d/include/deko3d.h /tmp/deko3d/include/deko3d.hpp \
+             "$root/libnx/include/"
+          echo "DEVKITPRO=$root" >> "$GITHUB_ENV"
+          n=$(find "$root/libnx/include" -name '*.h' | wc -l)
+          echo "::notice::libnx hlavicek: $n"
+          test "$n" -gt 100 || echo "::error::libnx hlavicky se nerozbalily ($n)"
 
-      - name: Validace patchů a sítě (CMake + ctest)
+      - name: Validace patchu a site (CMake + ctest)
         run: |
           for suite in patches network; do
-            cmake -S tests/$suite -B /tmp/$suite -G Ninja -DCMAKE_BUILD_TYPE=Release
-            cmake --build /tmp/$suite
-            ctest --test-dir /tmp/$suite --output-on-failure
+            cmake -S tests/$suite -B /tmp/$suite -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              || { echo "::error::cmake configure selhal: tests/$suite"; exit 1; }
+            cmake --build /tmp/$suite || { echo "::error::build selhal: tests/$suite"; exit 1; }
+            ctest --test-dir /tmp/$suite --output-on-failure \
+              || echo "::error::ctest selhal: tests/$suite"
           done
-        # tests/patches potřebuje EGL/egl.h; na runneru vezmeme systémový.
-        env:
-          CMAKE_PREFIX_PATH: /usr/include
 
-      - name: Validace nativního Deko3D backendu
+      - name: Validace nativniho Deko3D backendu
         run: |
+          # shader_validation preskoceno: linkuje `uam`, jehoz CMake vyzaduje
+          # bison+flex. V kontejnerovem jobu se UAM stavi jako soucast DK buildu.
+          fail=0
           for t in transfer render_target vertex_format render_state presentation; do
-            src="tests/deko3d/${t}_validation.cpp"
-            extra=""
+            src="tests/deko3d/${t}_validation.cpp"; extra=""
             [ "$t" = presentation ] && extra="source/deko3d/dk_presentation.cpp"
-            g++ -std=c++20 -O1 -Isource/deko3d -I"$DEVKITPRO/libnx/include" \
-                $src $extra -o "/tmp/dk_$t"
-            "/tmp/dk_$t"
+            if g++ -std=c++20 -O1 -Isource/deko3d -I"$DEVKITPRO/libnx/include" \
+                   $src $extra -o "/tmp/dk_$t"; then
+              out=$("/tmp/dk_$t") && echo "::notice::deko3d/$t: $out" \
+                || { echo "::error::deko3d/$t selhal za behu"; fail=1; }
+            else
+              echo "::error::deko3d/$t neslo zkompilovat"; fail=1
+            fi
           done
-        # shader_validation se přeskočí: linkuje `uam`, jehož CMake vyžaduje
-        # bison+flex. V kontejnerovém jobu níže se staví jako součást DK buildu.
+          exit $fail
 
   # ------------------------------------------------------------- switch build
   switch:
@@ -93,100 +111,143 @@ jobs:
       image: docker.io/devkitpro/devkita64:latest
       options: --user root
     steps:
-      - name: Nástroje, které v obraze chybí
+      - name: Nastroje, ktere v obraze chybi
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update
+          apt-get update -qq || echo "::warning::apt-get update selhal"
           apt-get install -y --no-install-recommends \
             git curl ca-certificates bison flex cmake ninja-build make \
-            pkg-config python3 python3-pip liblz4-dev zlib1g-dev
-          python3 -m pip install --break-system-packages --no-cache-dir mako || \
-            python3 -m pip install --no-cache-dir mako
-          bison --version | head -1; flex --version; cmake --version | head -1
-          ninja --version; python3 -c 'import mako; print("mako", mako.__version__)'
-          # switch_rules volá elf2nro/nacptool/npdmtool/build_pfs0/elf2nso/elf2kip
-          for t in elf2nro nacptool npdmtool build_pfs0 elf2nso elf2kip; do
-            command -v "$t" >/dev/null || { echo "chybí switch-tool: $t"; exit 1; }
+            pkg-config python3 python3-pip liblz4-dev zlib1g-dev \
+            || echo "::warning::nektere apt balicky nejdou nainstalovat"
+          python3 -m pip install --break-system-packages --no-cache-dir mako 2>/dev/null \
+            || python3 -m pip install --no-cache-dir mako 2>/dev/null \
+            || echo "::warning::mako se nepodarilo nainstalovat"
+          echo "::notice::bison=$(bison --version 2>/dev/null | head -1) flex=$(flex --version 2>/dev/null) cmake=$(cmake --version 2>/dev/null | head -1)"
+          # switch_rules vola elf2nro/elf2nso/elf2kip/nacptool/npdmtool/build_pfs0
+          for t in elf2nro elf2nso elf2kip nacptool npdmtool build_pfs0; do
+            command -v "$t" >/dev/null || echo "::error::chybi switch-tool: $t"
           done
 
       - uses: actions/checkout@v4
 
-      - name: Doplnit portlibs, které obraz nemusí mít
+      - name: Inventar sysrootu
         run: |
-          need=(switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl \
-                switch-libpng switch-ntfs-3g switch-mesa switch-libdrm_nouveau \
-                deko3d switch-zlib)
-          pacman -Syu --noconfirm "${need[@]}" || \
-            pacman -S --needed --noconfirm "${need[@]}" || \
-            echo "::warning::některé portlibs se nepodařilo doinstalovat"
-          ls "$PORTLIBS/lib" | head -40
+          # Diagnostika misto logu, ktere ze sandboxu nejde stahnout.
+          say() { echo "::notice::$1"; }
+          say "DEVKITPRO=$DEVKITPRO existuje=$([ -d "$DEVKITPRO" ] && echo ano || echo ne)"
+          command -v pacman >/dev/null && say "pacman=$(pacman --version 2>/dev/null | head -1)" \
+            || say "pacman NENI v PATH"
+          command -v dkp-pacman >/dev/null && say "dkp-pacman dostupny" || true
+          [ -f "$DEVKITPRO/cmake/Switch.cmake" ] && say "cmake/Switch.cmake OK" \
+            || echo "::error::chybi $DEVKITPRO/cmake/Switch.cmake"
+          [ -f "$DEVKITPRO/libnx/lib/libnx.a" ] && say "libnx.a OK" \
+            || echo "::error::chybi libnx.a"
+          [ -f "$DEVKITPRO/devkitA64/base_rules" ] && say "base_rules OK" \
+            || echo "::error::chybi devkitA64/base_rules"
+          say "portlibs lib: $(ls "$PORTLIBS/lib" 2>/dev/null | grep -c '\.a$') archivu"
+          say "portlibs .pc : $(ls "$PORTLIBS/lib/pkgconfig" 2>/dev/null | tr '\n' ' ')"
+          for l in SDL2 SDL2_ttf SDL2_image curl z zstd png turbojpeg EGL GLESv2 \
+                   glapi drm_nouveau ntfs-3g deko3d nx; do
+            found=$(find "$DEVKITPRO" -name "lib$l.a" 2>/dev/null | head -1)
+            [ -n "$found" ] && say "lib$l.a -> $found" || say "lib$l.a CHYBI"
+          done
 
-      # ---- vstupy, které nejsou v repu a musí se dodat ----
-      - name: Vulkan (Mesa NVK) — volitelné
+      - name: Doplnit chybejici portlibs
+        run: |
+          # Nikdy nesmi shodit job: obraz uz cast portlibs ma a zbytek se jen
+          # zkusí doinstalovat. Rozhodujici je inventar vyse a build kroky nize.
+          PM=$(command -v pacman || command -v dkp-pacman || true)
+          if [ -z "$PM" ]; then echo "::warning::pacman neni, preskakuji doinstalaci"; exit 0; fi
+          need="switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl switch-libpng \
+                switch-ntfs-3g switch-mesa switch-libdrm_nouveau deko3d switch-zlib \
+                switch-zstd switch-libjpeg-turbo"
+          for p in $need; do
+            if "$PM" -S --needed --noconfirm --disable-download-timeout "$p" >/tmp/pm.log 2>&1; then
+              echo "::notice::portlib OK: $p"
+            else
+              echo "::warning::portlib SELHAL: $p -- $(tail -2 /tmp/pm.log | tr '\n' ' ' | cut -c1-180)"
+            fi
+          done
+          exit 0
+
+      - name: Vulkan (Mesa NVK) -- volitelne
         id: nvk
         run: |
           if [ -f vulkan/lib/libnvk.a ] && [ -f vulkan/include/vulkan/vulkan_core.h ]; then
             echo "present=1" >> "$GITHUB_OUTPUT"
-            echo "NVK archivy nalezeny: $(ls vulkan/lib/*.a | wc -l)"
+            echo "::notice::NVK archivu: $(ls vulkan/lib/*.a | wc -l)"
           else
             echo "present=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::vulkan/lib/libnvk.a chybí — RENDERER=VK se přeskočí"
+            echo "::warning::vulkan/lib/libnvk.a chybi -> RENDERER=VK se preskoci"
           fi
 
-      - name: Cores (NetherSX2 v2.2n-4248 / -3668) — volitelné
+      - name: Cores (NetherSX2 v2.2n-4248 / -3668) -- volitelne
         id: cores
         run: |
           root="$(dirname "$PWD")"
           if [ -f "$root/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" ] && \
              [ -f "$root/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" ]; then
             echo "present=1" >> "$GITHUB_OUTPUT"; echo "CORES_DIR=$root" >> "$GITHUB_ENV"
+            echo "::notice::cores nalezeny v $root"
           else
             echo "present=0" >> "$GITHUB_OUTPUT"
-            echo "::warning::APK cores chybí — bundling do NetherSX2.nro se přeskočí"
+            echo "::warning::APK cores chybi -> bundling do NetherSX2.nro se preskoci"
           fi
 
       - name: Deko3D deps (UAM + SPIRV-Cross + LSFG)
         run: |
           cmake -S source/deko3d/compiler -B out/deko3d-deps -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
-                -DCMAKE_BUILD_TYPE=Release -DDEKO3D_SHADER_TESTS=OFF
-          cmake --build out/deko3d-deps --parallel "$(nproc)"
+                -DCMAKE_BUILD_TYPE=Release -DDEKO3D_SHADER_TESTS=OFF \
+            || { echo "::error::configure deko3d-deps selhal"; exit 1; }
+          cmake --build out/deko3d-deps --parallel "$(nproc)" \
+            || { echo "::error::build deko3d-deps selhal"; exit 1; }
+          ls out/deko3d-deps/lsfg/*.a out/deko3d-deps/uam-generated/*.o 2>/dev/null \
+            || echo "::warning::lsfg/uam archivy nenalezeny"
 
       - name: Storage deps (libsmb2 + libusbhsfs)
         run: |
           cmake -S launcher/dependencies -B launcher/dependencies/build -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
-                -DCMAKE_BUILD_TYPE=Release
-          cmake --build launcher/dependencies/build --parallel "$(nproc)"
+                -DCMAKE_BUILD_TYPE=Release \
+            || { echo "::error::configure storage deps selhal (chybi switch-ntfs-3g?)"; exit 1; }
+          cmake --build launcher/dependencies/build --parallel "$(nproc)" \
+            || { echo "::error::build storage deps selhal"; exit 1; }
 
-      - name: Emulátor — native Deko3D
-        run: make -j"$(nproc)" RENDERER=DK BUILD=build-dk TARGET=NetherSX2_nx_dk \
-                DEKO3D_DEPS_ROOT="$PWD/out/deko3d-deps"
+      - name: Emulator -- native Deko3D
+        run: |
+          make -j"$(nproc)" RENDERER=DK BUILD=build-dk TARGET=NetherSX2_nx_dk \
+               DEKO3D_DEPS_ROOT="$PWD/out/deko3d-deps" \
+            || { echo "::error::make RENDERER=DK selhal"; exit 1; }
+          echo "::notice::DK nro: $(ls -la NetherSX2_nx_dk.nro 2>/dev/null)"
 
-      - name: Emulátor — OpenGL
-        run: make -j"$(nproc)" RENDERER=GL BUILD=build-gl TARGET=NetherSX2_nx_gl
+      - name: Emulator -- OpenGL
+        run: |
+          make -j"$(nproc)" RENDERER=GL BUILD=build-gl TARGET=NetherSX2_nx_gl \
+            || { echo "::error::make RENDERER=GL selhal"; exit 1; }
+          echo "::notice::GL nro: $(ls -la NetherSX2_nx_gl.nro 2>/dev/null)"
 
-      - name: Emulátor — Vulkan (NVK)
+      - name: Emulator -- Vulkan (NVK)
         if: steps.nvk.outputs.present == '1'
-        run: make -j"$(nproc)" RENDERER=VK BUILD=build-vk TARGET=NetherSX2_nx_vk
+        run: |
+          make -j"$(nproc)" RENDERER=VK BUILD=build-vk TARGET=NetherSX2_nx_vk \
+            || { echo "::error::make RENDERER=VK selhal"; exit 1; }
 
       - name: Launcher (SDL2)
         run: |
+          mkdir -p launcher/romfs/cores launcher/romfs/emu launcher/romfs/res
           if [ "${{ steps.cores.outputs.present }}" = "1" ]; then
-            mkdir -p launcher/romfs/cores launcher/romfs/emu
             cp "$CORES_DIR/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_4248.so
             cp "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_3668.so
             cp NetherSX2_nx_dk.nro launcher/romfs/emu/
             cp NetherSX2_nx_gl.nro launcher/romfs/emu/
             [ -f NetherSX2_nx_vk.nro ] && cp NetherSX2_nx_vk.nro launcher/romfs/emu/
             python3 tools/bundle_resources.py --cores-dir "$CORES_DIR"
-          else
-            mkdir -p launcher/romfs/cores launcher/romfs/emu launcher/romfs/res
           fi
-          make -C launcher/fwd -j"$(nproc)"
-          make -C launcher -j"$(nproc)"
+          make -C launcher/fwd -j"$(nproc)" || { echo "::error::launcher/fwd selhal"; exit 1; }
+          make -C launcher -j"$(nproc)"     || { echo "::error::launcher selhal"; exit 1; }
 
-      - name: Kompletní bundle (jen s cores + NVK)
+      - name: Kontrola bundle (jen s cores + NVK)
         if: steps.cores.outputs.present == '1' && steps.nvk.outputs.present == '1'
         run: |
           python3 tools/check_deko3d_build.py --cores-dir "$CORES_DIR" \
@@ -197,7 +258,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nethersx2-switch
-          if-no-files-found: error
+          if-no-files-found: warn
           path: |
             NetherSX2_nx_dk.nro
             NetherSX2_nx_gl.nro
