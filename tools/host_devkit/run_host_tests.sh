@@ -13,6 +13,11 @@ set -uo pipefail
 
 REPO="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 DK="${DEVKITPRO:-/home/user/devkitpro}"
+# Export it back out: tests/patches/CMakeLists.txt does its own
+# find_path(HINTS "$ENV{DEVKITPRO}/portlibs/switch/include"), so deriving the
+# default only into $DK leaves that suite failing to configure unless the caller
+# happened to set DEVKITPRO.
+export DEVKITPRO="$DK"
 WORK="${HOST_TEST_BUILD:-/tmp/nethersx2-host-tests}"
 PASS=0; FAIL=0
 report() { if [[ "$2" -eq 0 ]]; then printf '  \033[32mPASS\033[0m  %-32s %s\n' "$1" "${3:-}"; PASS=$((PASS+1));
