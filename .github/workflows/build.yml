@@ -352,9 +352,14 @@ jobs:
           rc=$?
           set -e
           if [ "$rc" != 0 ]; then
-            echo "::error::make RENDERER=VK selhal (rc=$rc), $(wc -l < "$log") radku logu"
-            grep -nE "error:|Error [0-9]|undefined reference|No such file|cannot find|fatal error|collect2|No rule to make" "$log" \
-              | head -8 | sed 's/%/%25/g; s/^/::error::VK | /'
+            echo "::error::make RENDERER=VK selhal (rc=$rc), $(wc -l < "$log") radku logu, $(grep -c 'error:' "$log" || true)x 'error:'"
+            # Kompletni deduplikovany seznam nedefinovanych symbolu do JEDNE
+            # anotace: head -8 v minule verzi usekl seznam prave tam, kde
+            # zacinala ta zajimava cast (run 38970571750).
+            grep -oE "undefined reference to .[A-Za-z0-9_.]+" "$log" | sed "s/.*to .//" \
+              | sort -u | tr '\n' ' ' | sed 's/%/%25/g; s/^/::error::VK nedefinovane symboly | /'
+            grep -E "error:|fatal error|No rule to make|cannot find" "$log" | grep -v "undefined reference" \
+              | head -6 | sed 's/%/%25/g; s/^/::error::VK | /'
             tail -14 "$log" | tr '\n' '|' | sed 's/%/%25/g; s/^/::error::VK-tail | /'
             exit "$rc"
           fi
