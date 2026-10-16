@@ -5,8 +5,10 @@
 #   (transfer, render_target, vertex_format, render_state, presentation) primo
 #   g++, protoze source/deko3d/compiler/CMakeLists.txt includuje Uam.cmake
 #   bezpodminene a to bez bison+flex spadne na FATAL_ERROR.
-# 1 z 8 preskocen: tests/deko3d/shader_validation -- linkuje `uam`, vyzaduje
-#   bison + flex. build_all.sh ho stejne vypina (-DDEKO3D_SHADER_TESTS=OFF).
+# 1 z 8 preskocen: tests/deko3d/shader_validation -- linkuje `uam`, jehoz CMake
+#   vyzaduje bison+flex, a navic jeho main() bere rozbalene APK assets diry.
+#   build_all.sh ho stejne vypina (-DDEKO3D_SHADER_TESTS=OFF). Podrobnosti v
+#   README.md; v CI je jako gated krok "Osmy test -- validace shaderu".
 set -uo pipefail
 
 REPO="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -43,7 +45,7 @@ for t in transfer render_target vertex_format render_state presentation; do
 done
 
 echo "== Preskoceno =="
-printf '  \033[33mSKIP\033[0m  %-32s %s\n' "deko3d/shader_validation" "vyzaduje bison+flex pro UAM"
+printf '  \033[33mSKIP\033[0m  %-32s %s\n' "deko3d/shader_validation" "vyzaduje bison+flex a rozbalene APK assets"
 echo
 echo "proslo=$PASS selhalo=$FAIL   logy: $WORK"
 [[ "$FAIL" -eq 0 ]]

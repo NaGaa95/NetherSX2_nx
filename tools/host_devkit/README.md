@@ -115,10 +115,27 @@ položkách; cesty parsuje z `Makefile`/`CMakeLists`, takže nezastará.
 | `tests/deko3d/vertex_format_validation` | idem | PASS, 16 atributů |
 | `tests/deko3d/render_state_validation` | idem | PASS, 59 regresí |
 | `tests/deko3d/presentation_validation` | idem + `dk_presentation.cpp` | PASS, 255 kontrol |
-| `tests/deko3d/shader_validation` | — | SKIP: linkuje `uam`, vyžaduje bison + flex |
+| `tests/deko3d/shader_validation` | — | SKIP: viz níže, chybí bison + flex **i** APK assets |
 
 Deko3D testy se kompilují přímo, protože
 `source/deko3d/compiler/CMakeLists.txt` includuje `Uam.cmake` bezpodmínečně a to
 bez bison/flex spadne na `FATAL_ERROR`. `build_all.sh` je stejně vypíná
-(`-DDEKO3D_SHADER_TESTS=OFF`). V CI běží obojí: `host-tests` bez devkitA64 a
-`shader_validation` nepřímo jako součást DK buildu.
+(`-DDEKO3D_SHADER_TESTS=OFF`).
+
+### Proč `shader_validation` neběží ani v CI bez cores
+
+Chybí mu dvě nezávislé věci:
+
+1. **bison + flex** — `Uam.cmake` je vyžaduje na generování Mesa GLSL parseru a
+   lexeru. V obraze `devkitpro/devkita64` nejsou, workflow je doplní přes apt.
+2. **rozbalené APK assets** — `main()` bere adresáře assets jako argumenty
+   (`Provide one or more extracted APK assets directories`) a čte z nich
+   `shaders/opengl/{common_header,tfx_vgs,convert,tfx_fs,cas,…}.glsl` a
+   `shaders/common/fxaa.fx`. Z nich skládá a kompiluje reálné DKSH varianty.
+   Bez cores tedy není co validovat.
+
+Navíc `Uam.cmake` zapíná shader testy jen při `DEKO3D_SHADER_TESTS=ON` **a**
+`NOT CMAKE_CROSSCOMPILING`, takže je potřeba druhá, nativní konfigurace
+`source/deko3d/compiler` (bez `Switch.cmake`). Workflow ji má jako krok
+`Osmy test -- validace shaderu`, gated na přítomnost cores — dnes se přeskočí,
+s cores dá plné 8/8.
