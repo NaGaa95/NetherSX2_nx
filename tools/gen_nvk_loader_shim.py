@@ -276,7 +276,12 @@ def main() -> int:
 
     out = args.out or root / "source/vk_loader_shim.c"
     body = "".join(emit(n, *protos[n]) + "\n" for n in wanted)
-    out.write_text(HEADER + body + FOOTER)
+    text = HEADER + body + FOOTER
+    # A "*/" inside prose (e.g. "egl*/gl*") would end the header comment early
+    # and turn the rest of it into code -- that broke every build once already.
+    if text.count("/*") != text.count("*/"):
+        raise SystemExit("comment markers unbalanced in generated output")
+    out.write_text(text)
     print(f"wrote {out}: {len(wanted)} forwarders")
     return 0
 

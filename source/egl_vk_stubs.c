@@ -8,7 +8,7 @@
  * them has to exist for the link to resolve.
  *
  * The nxvk portlib package (berlint-hub/nxvk, libnvk.a + libnvk_support.a)
- * exports no egl*/gl* symbol at all -- nm --defined-only over both archives
+ * exports no egl or gl symbol at all -- nm --defined-only over both archives
  * finds 14155 globals, none of them egl* -- whereas the older 23-archive
  * vulkan/lib layout used to carry NVK's rust_switch_stubs, which supplied most
  * of them. This file therefore covers the whole set now, not just a handful.
@@ -25,6 +25,7 @@
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <stddef.h> /* NULL -- egl.h ho na Switch zarucene nedodava */
 
 /* Already queried by the core before any context exists. */
 EGLBoolean eglQuerySurface(EGLDisplay d, EGLSurface s, EGLint a, EGLint *v) {
