@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,6 +33,11 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <signal.h> /* sigset_t */
+#include <switch.h> /* svcGetInfo, InfoType_*, CUR_PROCESS_HANDLE, R_FAILED */
+
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+#include "hooks/vk.h" /* vk_diag_note; this whole file is the VK link path */
+#endif
 
 /* NVK_STUBS_NO_SYS_HEADERS forces the fallback declarations even on a host that
  * has these headers, which is the only way to compile-check the branch a
@@ -82,14 +88,64 @@ int getpwuid_r(unsigned int uid, void *pwd, char *buf, unsigned long buflen,
 }
 #endif
 
-/* Only the page size is meaningful here -- Mesa uses it to align disk-cache
- * entries. Switch MMU pages are 4 KiB. Everything else reports "unknown". */
+/* NOT "unknown". Mesa's os_get_total_physical_memory() is
+ * sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE), and nvk_physical_device_create()
+ * feeds that through os_get_gpu_heap_size() to size NVK's only memory heap. When
+ * it comes back 0 the driver fails with
+ *
+ *   vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+ *             "Failed to query total system memory")
+ *
+ * nvk_enumerate_physical_device() propagates that, vk_common_EnumeratePhysicalDevices()
+ * returns it verbatim, and the core sees vkEnumeratePhysicalDevices() == -3 with
+ * zero adapters -- so GS init dies before vkCreateDevice is ever called. Returning
+ * -1 here looked harmless ("Mesa will take its graceful fallback") and instead
+ * removed the GPU entirely.
+ *
+ * The honest figure on Horizon is what this process still has left: main.c's
+ * __libnx_initheap() claims the newlib heap and deliberately leaves
+ * GPU_RESERVE_MB unmapped for exactly this purpose, and NVK/nvmap allocates from
+ * that remainder rather than from our heap. It also tracks reality over time --
+ * nvk_get_sysmem_heap_available() calls this on every VK_EXT_memory_budget
+ * query, so the reported budget shrinks as NVK allocates. */
+uint64_t nvk_host_physical_bytes(void) {
+  uint64_t total = 0, used = 0;
+
+  if (R_FAILED(svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0))
+      || total == 0)
+    return 0;
+  if (R_FAILED(svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0)))
+    used = 0;
+  if (total <= used)
+    return 0;
+  return total - used;
+}
+
 long sysconf(int name) {
 #ifdef _SC_PAGESIZE
   if (name == _SC_PAGESIZE) return 4096;
 #endif
 #ifdef _SC_PAGE_SIZE
   if (name == _SC_PAGE_SIZE) return 4096;
+#endif
+#ifdef _SC_PHYS_PAGES
+  if (name == _SC_PHYS_PAGES) {
+    const uint64_t bytes = nvk_host_physical_bytes();
+    const long pages = bytes >= 4096 ? (long)(bytes / 4096) : -1L;
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+    /* Once: NVK re-queries this for every memory-budget report. */
+    static int logged;
+    if (!logged) {
+      logged = 1;
+      vk_diag_note("sysconf(_SC_PHYS_PAGES): process free=%llu B -> %ld pages "
+                   "(NVK takes %d%% of that as its heap size)",
+                   (unsigned long long)bytes, pages,
+                   bytes <= 1024ull * 1024 * 1024 ? 25 :
+                   bytes <= 4096ull * 1024 * 1024 ? 50 : 75);
+    }
+#endif
+    if (pages > 0) return pages;
+  }
 #endif
   errno = EINVAL;
   return -1;

@@ -7,9 +7,9 @@
  * fails to initialise dies with no message anywhere and no way to tell which of
  * a dozen checks tripped.
  *
- * This module gives the core its voice back: one file under DATA_ROOT, fully
- * buffered so steady-state logging costs nothing, flushed and fsynced when the
- * core reports an error or is about to die. The abort path records the caller as
+ * This module gives the core its voice back: one line-buffered file under
+ * DATA_ROOT, capped so it cannot fill the card, and fsynced when the core reports
+ * an error or is about to die. The abort path records the caller as
  * core+0xOFFSET, which is enough to find the faulting instruction in
  * libemucore.so without a debugger.
  *
@@ -38,7 +38,6 @@
 extern so_module emu_mod;
 
 #define CORELOG_PATH   DATA_ROOT "/nethersx2-core.log"
-#define CORELOG_BUFFER (64 * 1024)
 #define CORELOG_LIMIT  (2 * 1024 * 1024) // stop rather than fill the card
 #define CORELOG_LINE   1024
 
@@ -49,7 +48,6 @@ static const char *const corelog_priority[] = {
 // Zero-initialised libnx Mutex is unlocked; hooks/vk.c relies on the same.
 static Mutex corelog_mutex;
 static FILE *corelog_file;
-static char  corelog_buffer[CORELOG_BUFFER];
 static char  corelog_abort_text[512];
 static long  corelog_written;
 
@@ -114,7 +112,12 @@ corelog_open(void) {
   mkdir(DATA_ROOT, 0777);
   corelog_file = fopen(CORELOG_PATH, "w");
   if (corelog_file) {
-    setvbuf(corelog_file, corelog_buffer, _IOFBF, sizeof(corelog_buffer));
+    /* Line-buffered, NOT fully buffered. main() ends in __libnx_exit(0), which
+     * bypasses atexit, so a flush registered there never runs -- and the tail of
+     * this log is exactly the part that explains the failure. The core writes
+     * logcat at ANDROID_LOG_INFO (4), so waiting for an ERROR before flushing
+     * loses everything. ERROR and FATAL are still fsynced below. */
+    setvbuf(corelog_file, NULL, _IOLBF, 0);
     fprintf(corelog_file, "NetherSX2 core console\n");
     corelog_written = 24;
     fflush(corelog_file);

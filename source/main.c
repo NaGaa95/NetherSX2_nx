@@ -1880,12 +1880,14 @@ static void update_touch(void) {
 }
 
 #if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
-/* atexit does not run when crash.c calls svcExitProcess(), so the presence of
- * this line in the log is what separates "the VM loop returned and the emulator
- * exited cleanly" from "the process died". Without it the log just stops and the
- * last preceding note is ambiguous. */
+/* The line that separates "the VM loop returned and the emulator exited cleanly"
+ * from "the process died". It is called EXPLICITLY at the end of main(), not
+ * only through atexit: main() finishes with __libnx_exit(0), and like
+ * crash.c's svcExitProcess() that bypasses atexit entirely -- so relying on the
+ * handler alone meant the note never appeared, on a clean exit or any other.
+ * The atexit registration stays for the paths that do go through exit(). */
 static void vk_diag_exit_note(void) {
-  vk_diag_note("host exiting normally (atexit)");
+  vk_diag_note("host exiting normally");
 }
 #endif
 
@@ -1893,8 +1895,9 @@ int main(void) {
   extern int crash_in_progress(void);
   // The core's console: Bionic logcat -> DATA_ROOT/nethersx2-core.log. Opened
   // before anything that can fail so a failure always has somewhere to say what
-  // happened. A clean exit flushes through atexit; abort(), __stack_chk_fail and
-  // the CPU exception handler each make their own line durable first.
+  // happened. It is line-buffered, because main() ends in __libnx_exit(0) and
+  // that bypasses atexit; abort(), __stack_chk_fail and the CPU exception handler
+  // each make their own line durable first.
   corelog_open();
   atexit(corelog_flush);
 #if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
@@ -2163,6 +2166,12 @@ int main(void) {
   if (g_net_ready && !storage_socket)
     socketExit();
   g_net_ready = 0;
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_exit_note();
+#endif
+  // __libnx_exit() bypasses atexit, so flush the core console here instead of
+  // trusting the handler registered at the top of main().
+  corelog_flush();
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
   return 0;

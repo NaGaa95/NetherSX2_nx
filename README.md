@@ -117,7 +117,7 @@ nethersx2-exception.log  pc/far/esr/sp/fp/lr, only if a CPU exception fires
 
 The Vulkan log traces every `vkGetInstanceProcAddr` lookup the core makes and
 whether it resolved, and reports how many physical devices NVK returned and what
-they are called. A run whose log ends without `host exiting normally (atexit)`
+they are called. A run whose log ends without `host exiting normally`
 did not exit cleanly — the last line before the gap names the stage that died.
 
 ### How to build
