@@ -439,7 +439,13 @@ jobs:
           # vypnuty), takze jeho pritomnost dokazuje, ze #ifndef zabral.
           cutp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "INFO and below dropped" || true)
           cutd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "INFO and below dropped" || true)
-          echo "::notice::corelog/libc_shim v obou: region ${regd}x (diag) / ${regp}x (produkce), cutoff-INFO ${cutp}x (produkce) / ${cutd}x (diag, ma byt 0)"
+          # Synteticke /sys a /proc soubory pro cpuinfo nejsou za zadnym
+          # #ifdef, takze musi byt v obou binarkach. "CPU implementer" je kus
+          # formatovaciho retezce /proc/cpuinfo; strings ho ukaze jako vlastni
+          # radek, protoze \n v tom retezci jsou opravdove konce radku.
+          cpud=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "CPU implementer" || true)
+          cpup=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "CPU implementer" || true)
+          echo "::notice::corelog/libc_shim v obou: region ${regd}x (diag) / ${regp}x (produkce), cutoff-INFO ${cutp}x (produkce) / ${cutd}x (diag, ma byt 0), cpuinfo-sysfs ${cpud}x (diag) / ${cpup}x (produkce)"
           echo "::notice::diag kontrola: vulkan.log ${hits}x + host main entered ${hits2}x (diag), ${prod}x (produkce, ma byt 0); core.log ${cored}x (diag) / ${corep}x (produkce), oboji ma byt aspon 1; sysconf-total ${scd}x (diag) / ${scp}x (produkce); logging-jadra ${logd}x (diag) / ${logp}x (produkce)"
           if [ "$hits" = "0" ] || [ "$hits2" = "0" ]; then
             echo "::error::NETHERSX2_VK_DIAGNOSTIC se v diag buildu neprojevilo -- binarka by nelogovala"
@@ -459,6 +465,10 @@ jobs:
           fi
           if [ "$cutp" = "0" ] || [ "$cutd" != "0" ]; then
             echo "::error::dvoustupnovy limit corelogu se neprojevil spravne: cutoff-INFO ma byt 1x v produkci a 0x v diag, je ${cutp}x/${cutd}x"
+            exit 1
+          fi
+          if [ "$cpud" = "0" ] || [ "$cpup" = "0" ]; then
+            echo "::error::synteticke soubory pro cpuinfo chybi v binarce (diag ${cpud}x / produkce ${cpup}x) -- /sys a /proc cesty by opet selhaly"
             exit 1
           fi
           if [ "$scp" != "0" ] || [ "$logp" != "0" ]; then

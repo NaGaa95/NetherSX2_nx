@@ -150,6 +150,12 @@ int munmap_fake(void *addr, size_t length);
  * may be on the abort path with other threads wedged. */
 int shim_describe_address(uintptr_t addr, char *out, size_t outsz);
 
+/* Synthetic read-only files (/sys/devices/system/cpu/*, /proc/cpuinfo) that
+ * cpuinfo probes but Horizon does not have. open_fake() hands out descriptors
+ * from SYNFILE_FD_BASE for them, so read/lseek/fstat/close must recognise those
+ * fds instead of forwarding to newlib -- hence these wrappers. */
+off_t lseek_fake(int fd, off_t offset, int whence);
+
 void libc_memory_shutdown(void);
 
 // pthread extras

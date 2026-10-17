@@ -85,6 +85,28 @@ forwarding through it, and `source/nvk_libc_stubs.c` supplies the POSIX calls
 Mesa expects that newlib does not have. The SDL launcher uses its own graphics
 runtime and exits before the emulator starts.
 
+Three things about the Horizon environment need papering over for the core to
+work at all, all of them in the POSIX shim rather than in the emulator:
+
+- **Memory.** NVK sizes its one `VkMemoryHeap` from `sysconf(_SC_PHYS_PAGES)`,
+  which newlib does not implement. `source/nvk_libc_stubs.c` answers it with
+  `InfoType_TotalMemorySize` — the *total* figure, as `_SC_PHYS_PAGES` means on
+  every POSIX system. Reporting the free remainder instead gives NVK a heap of
+  about 1 MiB (the process has almost nothing left once the newlib heap, the
+  core image and its `svcMapProcessCodeMemory` mappings are in place), and the
+  allocator then refuses everything.
+- **CPU topology.** The core links Facebook's `cpuinfo`, which reads
+  `/sys/devices/system/cpu/*` and `/proc/cpuinfo`. Horizon has neither, so
+  `source/libc_shim.c` serves both from a small synthetic-file table, sized
+  from the core mask Horizon actually granted. It is reachable from `open()`
+  *and* `fopen()`, because `cpuinfo` uses `open`/`__read_chk`/`close` while
+  other consumers use stdio.
+- **File I/O latency.** Every `write()` is an IPC round trip to the SD card,
+  costing around 0.8 ms. newlib's default 1 KiB stream buffer turned creating
+  an 8 MB memory card into thousands of them — 6.7 s per card. `fopen_fake()`
+  installs a 256 KiB buffer for reads and a 64 KiB one for writes; the smaller
+  write buffer bounds how much unflushed data a hard kill can lose.
+
 LSFG 2x Frame Generation is available in **Settings > Frame Generation**.
 You must provide your own `Lossless.dll` at `/switch/nethersx2/lsfg/Lossless.dll`.
 LSFG must be enabled before launching a game so its shader session can be
