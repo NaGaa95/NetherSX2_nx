@@ -42,6 +42,15 @@ MESA_SDK_ROOT ?=
 # wrapper -- the same one launcher/Makefile already uses for SDL2 -- but CI can
 # override it when the package is only reachable another way.
 NXVK_PKG_CONFIG ?= $(PREFIX)pkg-config
+# sha256 of the nxvk-vulkan-tegra-x1.tar.gz this tree was validated against.
+# TEST3 holds the blob and CI clones its main branch at build time, so without a
+# pin the driver can be swapped under a build silently -- which is exactly what
+# happened once: the tarball changed branch (arena/92b2b9eb-nxvk ->
+# arena/068e6f2f-nxvk), commit and build run between two runs of the same repo
+# commit. The cores are pinned the same way against source/deko3d/dk_profiles.h,
+# and CI fails loudly on both. Update this together with a hardware-validated
+# build, not before. Override with NXVK_EXPECTED_SHA256= to test a new driver.
+NXVK_EXPECTED_SHA256 ?= 938bdecbb3ee12a81768aa9d52dae7ba9a610445a3f9830d754b9a2df1d8d22f
 ifneq ($(strip $(MESA_SDK_ROOT)),)
 ifneq ($(RENDERER),DK)
 DEFINES += -DUSE_UNIFIED_MESA

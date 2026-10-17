@@ -181,6 +181,14 @@ else. An older vendored tree under `vulkan/include` and `vulkan/lib` is still
 accepted as a fallback; it exports the public entry points itself, so the
 `NETHERSX2_NVK_ICD_ONLY` shim and loader stay off for it.
 
+`NXVK_EXPECTED_SHA256` in the Makefile pins the tarball this tree was validated
+against, and CI fails if `berlint-hub/TEST3` serves anything else — the same
+protection the cores get from `source/deko3d/dk_profiles.h`. TEST3 is cloned at
+its branch head at build time, so without a pin the driver can change between
+two builds of one repo commit; it did once, silently switching branch, commit
+and build run. Test a new driver with `make NXVK_EXPECTED_SHA256=<sha>`, and
+move the pin in the Makefile only after it has been verified on hardware.
+
 Extract the 4248 and 3668 APKs into sibling folders named
 `NetherSX2-v2.2n-4248` and `NetherSX2-v2.2n-3668`, or set `CORES_DIR` to the
 folder containing them. Alternatively, extract the supplied inputs without

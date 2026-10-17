@@ -187,7 +187,27 @@ jobs:
           #    tam a pkg-config ho pak najde bez nastavovani PKG_CONFIG_PATH.
           tb=/tmp/TEST3/nxvk-vulkan-tegra-x1.tar.gz
           if [ -f "$tb" ]; then
-            echo "::notice::NXVK tarball $(stat -c%s "$tb") B, sha256 $(sha256sum "$tb" | cut -d' ' -f1)"
+            got=$(sha256sum "$tb" | cut -d' ' -f1)
+            # Pinovano v Makefile, stejne jako jsou jadra pinovana v dk_profiles.h.
+            # TEST3 drzi blob a klonuje se jeho main, takze bez tohle driver muze
+            # mezi dvema behy stejneho commitu repu potichu vymenit -- a jednou se
+            # to stalo: zmenila se vetev, commit i build run nxvk.
+            want=$(sed -n 's/^NXVK_EXPECTED_SHA256 ?= \([0-9a-f]\{64\}\).*/\1/p' Makefile)
+            echo "::notice::NXVK tarball $(stat -c%s "$tb") B, sha256 $got"
+            if [ -z "$want" ]; then
+              echo "::error::v Makefile se nepodarilo najit NXVK_EXPECTED_SHA256"; exit 1
+            fi
+            if [ "$got" != "$want" ]; then
+              echo "::error::NXVK tarball: sha256 neodpovida hodnote pripnute v Makefile"
+              echo "::error::  TEST3 ma  $got"
+              echo "::error::  repo ceka $want"
+              # Kdo to je zac: BUILDINFO primo z tarballu, bez rozbalovani.
+              tar -xzOf "$tb" --wildcards '*BUILDINFO.txt' 2>/dev/null \
+                | grep -E "^(Commit|Ref|Build run|Mesa version):" \
+                | sed 's/%/%25/g; s/^/::error::  BUILDINFO /' || true
+              echo "::error::  over novy driver na zarizeni, potom pin v Makefile aktualizuj"
+              exit 1
+            fi
             tar -xzf "$tb" -C "$DEVKITPRO/portlibs/switch" \
               || { echo "::error::NXVK tarball nejde rozbalit"; exit 1; }
             # BUILDINFO.txt = atributovatelnost (commit, ref, build run, Mesa,
