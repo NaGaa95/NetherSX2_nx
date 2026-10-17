@@ -428,6 +428,18 @@ jobs:
           scp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "sysconf(_SC_PHYS_PAGES): total=" || true)
           logd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "core logging forced on" || true)
           logp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "core logging forced on" || true)
+          # shim_describe_address() a novy text corelog_format_address() jsou v
+          # OBOU buildech (nejsou za #ifdef), takze musi byt v obou binarkach.
+          # Produkcni nro totiz po teto zmene ma naprosto stejnou velikost jako
+          # pred ni, coz je sice vysvetlitelne zarovnavanim segmentu NRO na
+          # stranku, ale velikost nic nedokazuje -- ani rozdil, ani jeho absence.
+          regd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "mmap RX (recompiler/JIT)" || true)
+          regp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "mmap RX (recompiler/JIT)" || true)
+          # Tenhle format je naopak JEN v produkci (cutoff INFO je v diag buildu
+          # vypnuty), takze jeho pritomnost dokazuje, ze #ifndef zabral.
+          cutp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "INFO and below dropped" || true)
+          cutd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "INFO and below dropped" || true)
+          echo "::notice::corelog/libc_shim v obou: region ${regd}x (diag) / ${regp}x (produkce), cutoff-INFO ${cutp}x (produkce) / ${cutd}x (diag, ma byt 0)"
           echo "::notice::diag kontrola: vulkan.log ${hits}x + host main entered ${hits2}x (diag), ${prod}x (produkce, ma byt 0); core.log ${cored}x (diag) / ${corep}x (produkce), oboji ma byt aspon 1; sysconf-total ${scd}x (diag) / ${scp}x (produkce); logging-jadra ${logd}x (diag) / ${logp}x (produkce)"
           if [ "$hits" = "0" ] || [ "$hits2" = "0" ]; then
             echo "::error::NETHERSX2_VK_DIAGNOSTIC se v diag buildu neprojevilo -- binarka by nelogovala"
@@ -439,6 +451,14 @@ jobs:
           fi
           if [ "$scd" = "0" ] || [ "$logd" = "0" ]; then
             echo "::error::diag build neobsahuje opravu sysconf (${scd}x) nebo vynucene logovani jadra (${logd}x) -- NVK by dostal ~1 MiB heap a core by opet mlcel"
+            exit 1
+          fi
+          if [ "$regd" = "0" ] || [ "$regp" = "0" ]; then
+            echo "::error::shim_describe_address() chybi v binarce (diag ${regd}x / produkce ${regp}x) -- adresa abortu by zustala nececitelna"
+            exit 1
+          fi
+          if [ "$cutp" = "0" ] || [ "$cutd" != "0" ]; then
+            echo "::error::dvoustupnovy limit corelogu se neprojevil spravne: cutoff-INFO ma byt 1x v produkci a 0x v diag, je ${cutp}x/${cutd}x"
             exit 1
           fi
           if [ "$scp" != "0" ] || [ "$logp" != "0" ]; then
