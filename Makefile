@@ -35,8 +35,22 @@ ifneq ($(strip $(NETHERSX2_VK_DIAGNOSTIC)),)
 DEFINES += -DNETHERSX2_VK_DIAGNOSTIC
 endif
 
-RENDERER ?= GL
+# Vulkan-only product: NVK is the shipped backend, so it is also the default.
+RENDERER ?= VK
 MESA_SDK_ROOT ?=
+# pkg-config for the nxvk portlib package. Defaults to the devkitA64 cross
+# wrapper -- the same one launcher/Makefile already uses for SDL2 -- but CI can
+# override it when the package is only reachable another way.
+NXVK_PKG_CONFIG ?= $(PREFIX)pkg-config
+# sha256 of the nxvk-vulkan-tegra-x1.tar.gz this tree was validated against.
+# TEST3 holds the blob and CI clones its main branch at build time, so without a
+# pin the driver can be swapped under a build silently -- which is exactly what
+# happened once: the tarball changed branch (arena/92b2b9eb-nxvk ->
+# arena/068e6f2f-nxvk), commit and build run between two runs of the same repo
+# commit. The cores are pinned the same way against source/deko3d/dk_profiles.h,
+# and CI fails loudly on both. Update this together with a hardware-validated
+# build, not before. Override with NXVK_EXPECTED_SHA256= to test a new driver.
+NXVK_EXPECTED_SHA256 ?= 938bdecbb3ee12a81768aa9d52dae7ba9a610445a3f9830d754b9a2df1d8d22f
 ifneq ($(strip $(MESA_SDK_ROOT)),)
 ifneq ($(RENDERER),DK)
 DEFINES += -DUSE_UNIFIED_MESA
@@ -62,12 +76,22 @@ INCLUDES	+=	source/lsfg \
 			third_party/lsfg-vk/lsfg-vk-common/include \
 			third_party/lsfg-vk/lsfg-vk-backend/include \
 			third_party/lsfg-vk/lsfg-vk-backend/src
+# Detect the nxvk portlib package here, not down by LIBS: CFLAGS below is
+# assigned with := and expands $(DEFINES) immediately, so the shim macro has to
+# be in DEFINES before that line.
+NXVK_PKG	:=	$(shell $(NXVK_PKG_CONFIG) --exists nxvk 2>/dev/null && echo 1)
+ifeq ($(NXVK_PKG),1)
+# libnvk.a defines only vk_icdGetInstanceProcAddr -- see source/hooks/vk.c.
+DEFINES		+=	-DNETHERSX2_NVK_ICD_ONLY
+endif
 else
 DEFINES	+=	-DGS_RENDERER=12
 endif
 endif
 
-CFLAGS	:=	-g -Wall -O3 -ffunction-sections -fno-omit-frame-pointer $(LTOFLAGS) \
+# -fdata-sections pairs with the --gc-sections that nxvk.pc puts on the VK link
+# line; it is harmless for DK/GL, which do not enable gc-sections themselves.
+CFLAGS	:=	-g -Wall -O3 -ffunction-sections -fdata-sections -fno-omit-frame-pointer $(LTOFLAGS) \
 			$(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
 CXXFLAGS	:= $(CFLAGS) -std=gnu++20
@@ -99,11 +123,27 @@ LIBS	:= -Wl,--start-group -lvulkan -lEGL -lGLESv2 -lglapi \
 		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lelf -lexpat -lz -lzstd \
 		-lnx -lstdc++ -lm
 else
-# Mesa NVK: 23 vendored static archives (vulkan/lib) linked in one --start-group
-# (circular NVK<->runtime<->nir<->compiler deps). -l:libX.a links by exact file
-# name (avoids the -lvulkan GROUP-script + the double-prefixed liblibnil...a).
+# Mesa NVK, two supported layouts (detected into $(NXVK_PKG) above):
+#
+# portlib package, preferred -- the artifact built by berlint-hub/nxvk's
+# switch-vulkan.yml: libnvk.a + libnvk_support.a + pkgconfig/nxvk.pc, extracted
+# into $(PORTLIBS). nxvk.pc carries the entire link line, including
+# --whole-archive, -u,vk_icdGetInstanceProcAddr and --gc-sections, so none of it
+# is spelled out here. vulkan/ and vk_video/ headers arrive through
+# -I$(PORTLIBS)/include, which LIBDIRS below generates.
+#
+# vendored tree, fallback -- 23 static archives (vulkan/lib) linked in one
+# --start-group (circular NVK<->runtime<->nir<->compiler deps). -l:libX.a links
+# by exact file name (avoids the -lvulkan GROUP-script + the double-prefixed
+# liblibnil...a). That libvulkan_lite_* does export the plain
+# vkGetInstanceProcAddr, which is why the ICD-only shim stays off for it.
 # -lz/-lzstd resolve crc32/ZSTD_*; the DRM/nouveau_ws path is dead-stripped so no
 # -ldrm_nouveau. -lstdc++/libgcc unwinder are needed by NAK's bundled Rust.
+ifeq ($(NXVK_PKG),1)
+LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+LIBS	:= $(STORAGE_LIBS) `$(NXVK_PKG_CONFIG) --libs nxvk` \
+		-lcurl -lz -lzstd -lnx -lstdc++ -lm
+else
 LIBDIRS	:= $(TOPDIR)/vulkan $(PORTLIBS) $(LIBNX)
 LIBS	:= -Wl,--start-group \
 		-l:libnvk.a -l:libvulkan_lite_runtime.a -l:libvulkan_runtime.a \
@@ -115,6 +155,7 @@ LIBS	:= -Wl,--start-group \
 		-l:libnir.a -l:libcompiler.a -l:libcompiler_c_helpers.a \
 		-l:libmesa_util.a -l:libmesa_util_simd.a -l:libblake3.a -l:libmesa_util_c11.a \
 		-Wl,--end-group $(STORAGE_LIBS) -lcurl -lz -lzstd -lnx -lstdc++ -lm
+endif
 endif
 else
 ifneq ($(strip $(MESA_SDK_ROOT)),)

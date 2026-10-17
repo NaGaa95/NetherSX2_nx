@@ -1,0 +1,518 @@
+# Build NetherSX2_nx na GitHub Actions.
+#
+# Proc CI a ne lokalne: devkitA64, libnx.a, switch portlibs a Mesa NVK se nedaji
+# nainstalovat v omezenem sandboxu (pkg.devkitpro.org, apt.devkitpro.org,
+# downloads.devkitpro.org, deb.debian.org, release-assets.githubusercontent.com,
+# results-receiver.actions.githubusercontent.com, registry-1.docker.io a ghcr.io
+# jsou mimo allowlist). Runner ma plny internet.
+#
+#   devkitA64 + libnx + switch-tools + portlibs -> obraz devkitpro/devkita64
+#   bison, flex, cmake, ninja, lz4              -> apt-get v tom obraze
+#   libsmb2, libusbhsfs, UAM, SPIRV-Cross       -> FetchContent z GitHubu
+#   vulkan/lib/*.a (23 archivu Mesa NVK)        -> MUSI se dodat
+#   NetherSX2-v2.2n-4248 / -3668 (APK cores)    -> MUSI se dodat
+#
+# Bez cores a NVK se postavi DK a GL emulator + launcher (compile-level).
+# S nimi projde cely build_all.sh a vznikne finalni NetherSX2.nro.
+#
+# Diagnostika: logy runu jsou ze sandboxu nedostupne, proto klicove kroky pisou
+# `::notice::` / `::error::`, ktere jde precist pres
+#   gh api repos/<owner>/<repo>/check-runs/<job_id>/annotations
+name: build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVKITPRO: /opt/devkitpro
+  PORTLIBS: /opt/devkitpro/portlibs/switch
+
+jobs:
+  # ---------------------------------------------------------------- host tests
+  # Nepotrebuje devkitA64. Rychla zpetna vazba na logiku overitelnou na hostiteli.
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host zavislosti
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ libegl-dev libgles-dev
+          # tests/patches hleda EGL/egl.h; HINTS ukazuji na $DEVKITPRO, ale
+          # find_path prohleda i systemove cesty -> systemove EGL staci.
+          test -e /usr/include/EGL/egl.h || echo "::error::EGL/egl.h chybi i po libegl-dev"
+
+      - name: Hlavicky libnx a deko3d
+        run: |
+          set -e
+          root=/tmp/dkp
+          rm -rf "$root"; mkdir -p "$root/libnx" "$root/portlibs/switch/include"
+          curl -sSL --retry 3 -o /tmp/libnx.tgz \
+            https://codeload.github.com/switchbrew/libnx/tar.gz/refs/heads/master
+          curl -sSL --retry 3 -o /tmp/deko3d.tgz \
+            https://codeload.github.com/devkitPro/deko3d/tar.gz/refs/heads/master
+          mkdir -p /tmp/libnx /tmp/deko3d
+          tar xzf /tmp/libnx.tgz   -C /tmp/libnx   --strip-components=1
+          tar xzf /tmp/deko3d.tgz -C /tmp/deko3d --strip-components=1
+          cp -r /tmp/libnx/nx/include/. "$root/libnx/include/"
+          cp /tmp/libnx/nx/switch_rules /tmp/libnx/nx/switch.specs \
+             /tmp/libnx/nx/switch.ld "$root/libnx/"
+          cp /tmp/deko3d/include/deko3d.h /tmp/deko3d/include/deko3d.hpp \
+             "$root/libnx/include/"
+          echo "DEVKITPRO=$root" >> "$GITHUB_ENV"
+          n=$(find "$root/libnx/include" -name '*.h' | wc -l)
+          echo "::notice::libnx hlavicek: $n"
+          test "$n" -gt 100 || echo "::error::libnx hlavicky se nerozbalily ($n)"
+
+      - name: Validace patchu a site (CMake + ctest)
+        run: |
+          for suite in patches network; do
+            cmake -S tests/$suite -B /tmp/$suite -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              || { echo "::error::cmake configure selhal: tests/$suite"; exit 1; }
+            cmake --build /tmp/$suite || { echo "::error::build selhal: tests/$suite"; exit 1; }
+            ctest --test-dir /tmp/$suite --output-on-failure \
+              || echo "::error::ctest selhal: tests/$suite"
+          done
+
+      - name: Validace nativniho Deko3D backendu
+        run: |
+          # shader_validation preskoceno: linkuje `uam`, jehoz CMake vyzaduje
+          # bison+flex. V kontejnerovem jobu se UAM stavi jako soucast DK buildu.
+          fail=0
+          for t in transfer render_target vertex_format render_state presentation; do
+            src="tests/deko3d/${t}_validation.cpp"; extra=""
+            [ "$t" = presentation ] && extra="source/deko3d/dk_presentation.cpp"
+            if g++ -std=c++20 -O1 -Isource/deko3d -I"$DEVKITPRO/libnx/include" \
+                   $src $extra -o "/tmp/dk_$t"; then
+              out=$("/tmp/dk_$t") && echo "::notice::deko3d/$t: $out" \
+                || { echo "::error::deko3d/$t selhal za behu"; fail=1; }
+            else
+              echo "::error::deko3d/$t neslo zkompilovat"; fail=1
+            fi
+          done
+          exit $fail
+
+  # ------------------------------------------------------------- switch build
+  switch:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/devkitpro/devkita64:latest
+      options: --user root
+    steps:
+      - name: Nastroje, ktere v obraze chybi
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq || echo "::warning::apt-get update selhal"
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates bison flex cmake ninja-build make g++ \
+            pkg-config python3 python3-pip liblz4-dev zlib1g-dev \
+            || echo "::warning::nektere apt balicky nejdou nainstalovat"
+          python3 -m pip install --break-system-packages --no-cache-dir mako 2>/dev/null \
+            || python3 -m pip install --no-cache-dir mako 2>/dev/null \
+            || echo "::warning::mako se nepodarilo nainstalovat"
+          echo "::notice::bison=$(bison --version 2>/dev/null | head -1) flex=$(flex --version 2>/dev/null) cmake=$(cmake --version 2>/dev/null | head -1)"
+          # switch_rules vola elf2nro/elf2nso/elf2kip/nacptool/npdmtool/build_pfs0
+          for t in elf2nro elf2nso elf2kip nacptool npdmtool build_pfs0; do
+            command -v "$t" >/dev/null || echo "::error::chybi switch-tool: $t"
+          done
+
+      - uses: actions/checkout@v4
+
+      - name: Inventar sysrootu
+        run: |
+          # Diagnostika misto logu, ktere ze sandboxu nejde stahnout.
+          say() { echo "::notice::$1"; }
+          say "DEVKITPRO=$DEVKITPRO existuje=$([ -d "$DEVKITPRO" ] && echo ano || echo ne)"
+          command -v pacman >/dev/null && say "pacman=$(pacman --version 2>/dev/null | head -1)" \
+            || say "pacman NENI v PATH"
+          command -v dkp-pacman >/dev/null && say "dkp-pacman dostupny" || true
+          [ -f "$DEVKITPRO/cmake/Switch.cmake" ] && say "cmake/Switch.cmake OK" \
+            || echo "::error::chybi $DEVKITPRO/cmake/Switch.cmake"
+          [ -f "$DEVKITPRO/libnx/lib/libnx.a" ] && say "libnx.a OK" \
+            || echo "::error::chybi libnx.a"
+          [ -f "$DEVKITPRO/devkitA64/base_rules" ] && say "base_rules OK" \
+            || echo "::error::chybi devkitA64/base_rules"
+          say "portlibs lib: $(ls "$PORTLIBS/lib" 2>/dev/null | grep -c '\.a$') archivu"
+          say "portlibs .pc: $(ls "$PORTLIBS/lib/pkgconfig" 2>/dev/null | wc -l) souboru"
+          for l in SDL2 SDL2_ttf SDL2_image curl z zstd png turbojpeg EGL GLESv2 \
+                   glapi drm_nouveau ntfs-3g deko3d nx; do
+            found=$(find "$DEVKITPRO" -name "lib$l.a" 2>/dev/null | head -1)
+            [ -n "$found" ] && say "lib$l.a -> $found" || echo "::error::lib$l.a CHYBI"
+          done
+
+      - name: Doplnit chybejici portlibs
+        run: |
+          # Nikdy nesmi shodit job: obraz uz cast portlibs ma a zbytek se jen
+          # zkusí doinstalovat. Rozhodujici je inventar vyse a build kroky nize.
+          PM=$(command -v pacman || command -v dkp-pacman || true)
+          if [ -z "$PM" ]; then echo "::warning::pacman neni, preskakuji doinstalaci"; exit 0; fi
+          # switch-zstd neexistuje jako balicek; zstd je v obraze uz od zacatku.
+          need="switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl switch-libpng \
+                switch-ntfs-3g switch-mesa switch-libdrm_nouveau deko3d switch-zlib \
+                switch-libjpeg-turbo"
+          for p in $need; do
+            if "$PM" -S --needed --noconfirm --disable-download-timeout "$p" >/tmp/pm.log 2>&1; then
+              echo "::notice::portlib OK: $p"
+            else
+              echo "::warning::portlib SELHAL: $p -- $(tail -2 /tmp/pm.log | tr '\n' ' ' | cut -c1-180)"
+            fi
+          done
+          exit 0
+
+      - name: Vstupy z TEST3 (cores + NXVK)
+        run: |
+          # Cores ani Mesa NVK nemohou zit v tomhle repu. berlint-hub/TEST3 je
+          # drzi jako binarni bloby a git clone pres github.com funguje; raw
+          # contents API a Actions artefakty nejsou potřeba.
+          rm -rf /tmp/TEST3
+          git clone --depth 1 https://github.com/berlint-hub/TEST3.git /tmp/TEST3 \
+            || { echo "::error::clone TEST3 selhal"; exit 1; }
+          echo "::notice::TEST3 commit $(git -C /tmp/TEST3 rev-parse --short HEAD)"
+
+          # 1) NXVK jako portlib balicek. switch/docs/bringing-an-application.md:
+          #    tar -xzf ... -C "$DEVKITPRO/portlibs/switch". prefix v nxvk.pc je
+          #    napevno /opt/devkitpro/portlibs/switch, proto se rozbaluje primo
+          #    tam a pkg-config ho pak najde bez nastavovani PKG_CONFIG_PATH.
+          tb=/tmp/TEST3/nxvk-vulkan-tegra-x1.tar.gz
+          if [ -f "$tb" ]; then
+            got=$(sha256sum "$tb" | cut -d' ' -f1)
+            # Pinovano v Makefile, stejne jako jsou jadra pinovana v dk_profiles.h.
+            # TEST3 drzi blob a klonuje se jeho main, takze bez tohle driver muze
+            # mezi dvema behy stejneho commitu repu potichu vymenit -- a jednou se
+            # to stalo: zmenila se vetev, commit i build run nxvk.
+            want=$(sed -n 's/^NXVK_EXPECTED_SHA256 ?= \([0-9a-f]\{64\}\).*/\1/p' Makefile)
+            echo "::notice::NXVK tarball $(stat -c%s "$tb") B, sha256 $got"
+            if [ -z "$want" ]; then
+              echo "::error::v Makefile se nepodarilo najit NXVK_EXPECTED_SHA256"; exit 1
+            fi
+            if [ "$got" != "$want" ]; then
+              echo "::error::NXVK tarball: sha256 neodpovida hodnote pripnute v Makefile"
+              echo "::error::  TEST3 ma  $got"
+              echo "::error::  repo ceka $want"
+              # Kdo to je zac: BUILDINFO primo z tarballu, bez rozbalovani.
+              tar -xzOf "$tb" --wildcards '*BUILDINFO.txt' 2>/dev/null \
+                | grep -E "^(Commit|Ref|Build run|Mesa version):" \
+                | sed 's/%/%25/g; s/^/::error::  BUILDINFO /' || true
+              echo "::error::  over novy driver na zarizeni, potom pin v Makefile aktualizuj"
+              exit 1
+            fi
+            tar -xzf "$tb" -C "$DEVKITPRO/portlibs/switch" \
+              || { echo "::error::NXVK tarball nejde rozbalit"; exit 1; }
+            # BUILDINFO.txt = atributovatelnost (commit, ref, build run, Mesa,
+            # toolchain). Zaloguje se po radcich a jde i do artefaktu.
+            # paste, ne tr: tr mapuje po znacich, takze by oddelovac zahodil.
+            grep -E "^(Source|Commit|Ref|Build run|Mesa version|Toolchain image):" \
+              "$DEVKITPRO/portlibs/switch/BUILDINFO.txt" | paste -sd '|' - \
+              | sed 's/%/%25/g; s/^/::notice::NXVK BUILDINFO /' || true
+            cp "$DEVKITPRO/portlibs/switch/BUILDINFO.txt" nxvk-BUILDINFO.txt
+          else
+            echo "::warning::TEST3 neobsahuje nxvk-vulkan-tegra-x1.tar.gz -> RENDERER=VK se preskoci"
+          fi
+
+          # 2) cores: TEST3 je drzi ploche (libemucore_<V>_baked.so + assets_<V>),
+          #    build_all.sh a check_deko3d_build.py cekaji rozbalene APK
+          #    usporadani. Premapuji se vedle repa (CORES_DIR="$(dirname $APP)").
+          root="$(dirname "$PWD")"
+          for v in 4248 3668; do
+            so="/tmp/TEST3/libemucore_${v}_baked.so"
+            [ -f "$so" ] || { echo "::warning::TEST3 neobsahuje libemucore_${v}_baked.so"; continue; }
+            mkdir -p "$root/NetherSX2-v2.2n-$v/lib/arm64-v8a"
+            cp "$so" "$root/NetherSX2-v2.2n-$v/lib/arm64-v8a/libemucore.so"
+            cp -r "/tmp/TEST3/assets_$v" "$root/NetherSX2-v2.2n-$v/assets"
+          done
+
+      - name: Vulkan (Mesa NVK) -- povinne
+        id: nvk
+        run: |
+          # Balicek je rozbaleny v $DEVKITPRO/portlibs/switch, ale cross
+          # pkg-config muze byt na nekolika mistech a jeho vychozi search path
+          # nemusi portlibs obsahovat. Vsechny kombinace se vyzkousi a kazdy
+          # pokus se zaloguje, aby detekce a Makefile nemohly nesouhlasit
+          # potichu (presne to se stalo v runu 38968866220).
+          lib="$DEVKITPRO/portlibs/switch/lib"
+          pcdir="$lib/pkgconfig"
+          nm="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm"
+          echo "::notice::libnvk.a: $([ -f "$lib/libnvk.a" ] && stat -c%s "$lib/libnvk.a" || echo CHYBI) B"
+          echo "::notice::libnvk_support.a: $([ -f "$lib/libnvk_support.a" ] && stat -c%s "$lib/libnvk_support.a" || echo CHYBI) B"
+          echo "::notice::nxvk.pc: $([ -f "$pcdir/nxvk.pc" ] && echo nalezeno || echo CHYBI)"
+          if [ ! -f "$lib/libnvk.a" ] || [ ! -f "$pcdir/nxvk.pc" ]; then
+            echo "::error::portlib balicek nxvk je nekompletni: libnvk.a nebo nxvk.pc chybi"
+            exit 1
+          fi
+          win_pc=""; win_ld=""
+          for cand in "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-pkg-config" \
+                      "$DEVKITPRO/portlibs/switch/bin/aarch64-none-elf-pkg-config" \
+                      "$(command -v aarch64-none-elf-pkg-config 2>/dev/null)" \
+                      "$(command -v pkg-config 2>/dev/null)"; do
+            [ -n "$cand" ] && [ -x "$cand" ] || continue
+            for ld in "" "$pcdir"; do
+              if [ -n "$ld" ]; then
+                out=$(PKG_CONFIG_LIBDIR="$ld" "$cand" --modversion nxvk 2>&1) && rc=0 || rc=1
+              else
+                out=$("$cand" --modversion nxvk 2>&1) && rc=0 || rc=1
+              fi
+              echo "::notice::probe: $cand [LIBDIR=${ld:-vychozi}] rc=$rc ${out}"
+              if [ "$rc" = 0 ]; then win_pc="$cand"; win_ld="$ld"; break 2; fi
+            done
+          done
+          if [ -z "$win_pc" ]; then
+            echo "::error::zadny pkg-config nenasel nxvk"
+            exit 1
+          fi
+          echo "present=1" >> "$GITHUB_OUTPUT"
+          # PKG_CONFIG_LIBDIR se NEexportuje globalne -- vyradil by launcheru
+          # hledani sdl2.pc. Putuje primo do promenne, kterou Makefile expanduje
+          # do shellu, takze plati jen pro nxvk.
+          if [ -n "$win_ld" ]; then
+            echo "NXVK_PKG_CONFIG=PKG_CONFIG_LIBDIR=$win_ld $win_pc" >> "$GITHUB_ENV"
+          else
+            echo "NXVK_PKG_CONFIG=$win_pc" >> "$GITHUB_ENV"
+          fi
+          echo "::notice::nxvk $(PKG_CONFIG_LIBDIR="${win_ld:-$pcdir}" "$win_pc" --modversion nxvk) nalezen pres $win_pc [LIBDIR=${win_ld:-vychozi}]"
+          # Makefile zapne -DNETHERSX2_NVK_ICD_ONLY prave proto, ze libnvk.a
+          # exportuje JEN vk_icdGetInstanceProcAddr (na Horizonu neni loader).
+          defined=$("$nm" --defined-only "$lib/libnvk.a" 2>/dev/null || true)
+          icd=$(printf '%s\n' "$defined" | grep -c ' T vk_icdGetInstanceProcAddr$' || true)
+          plain=$(printf '%s\n' "$defined" | grep -c ' T vkGetInstanceProcAddr$' || true)
+          echo "::notice::libnvk.a: vk_icdGetInstanceProcAddr=${icd}x, vkGetInstanceProcAddr=${plain}x"
+          if [ "$icd" = "0" ]; then
+            echo "::error::libnvk.a nedefinuje vk_icdGetInstanceProcAddr"; exit 1
+          fi
+          if [ "$plain" != "0" ]; then
+            echo "::warning::libnvk.a exportuje i vkGetInstanceProcAddr -> shim v source/hooks/vk.c by kolidoval"
+          fi
+          PKG_CONFIG_LIBDIR="${win_ld:-$pcdir}" "$win_pc" --libs nxvk | sed 's/^/::notice::nxvk.pc Libs: /'
+
+      - name: Cores (NetherSX2 v2.2n-4248 / -3668) -- povinne
+        id: cores
+        run: |
+          root="$(dirname "$PWD")"
+          if [ -f "$root/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" ] && \
+             [ -f "$root/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"; echo "CORES_DIR=$root" >> "$GITHUB_ENV"
+            echo "::notice::cores nalezeny v $root"
+            # Hash kazdeho jadra a krizova kontrola proti hodnote pripnute v
+            # source/deko3d/dk_profiles.h: kdyz se blob v TEST3 zmeni, spadne to
+            # tady s jasnou zpravou, ne az v check_deko3d_build.py o tri minuty
+            # pozdeji. Overuje se premapovany soubor, tedy presne to, co jde do
+            # bundle.
+            for v in 4248 3668; do
+              so="$root/NetherSX2-v2.2n-$v/lib/arm64-v8a/libemucore.so"
+              got=$(sha256sum "$so" | cut -d' ' -f1)
+              want=$(sed -n "s/.*\"$v\", \"\([0-9a-f]\{64\}\)\".*/\1/p" source/deko3d/dk_profiles.h)
+              echo "::notice::core $v $(stat -c%s "$so") B sha256 $got"
+              if [ -z "$want" ]; then
+                echo "::error::v dk_profiles.h se nepodarilo najit pripnuty hash pro $v"; exit 1
+              fi
+              if [ "$got" != "$want" ]; then
+                echo "::error::core $v: sha256 neodpovida hodnote v dk_profiles.h"
+                echo "::error::  TEST3 ma $got"
+                echo "::error::  repo ceka $want"
+                exit 1
+              fi
+            done
+          else
+            echo "::error::cores v $root chybi -> bez nich nejde postavit bundle"
+            exit 1
+          fi
+
+      - name: Storage deps (libsmb2 + libusbhsfs)
+        run: |
+          cmake -S launcher/dependencies -B launcher/dependencies/build -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
+                -DCMAKE_BUILD_TYPE=Release \
+            || { echo "::error::configure storage deps selhal (chybi switch-ntfs-3g?)"; exit 1; }
+          cmake --build launcher/dependencies/build --parallel "$(nproc)" \
+            || { echo "::error::build storage deps selhal"; exit 1; }
+
+      - name: Osmy test -- validace shaderu proti assets jader
+        run: |
+          # shader_validation potrebuje bison+flex (UAM) A zaroven rozbalene APK
+          # assets: cte <assets>/shaders/opengl/*.glsl a kompiluje z nich DKSH.
+          # Uam.cmake ho zapne jen pri DEKO3D_SHADER_TESTS=ON a NATIVNIM buildu,
+          # proto se tady konfiguruje podruhe, bez Switch.cmake.
+          cmake -S source/deko3d/compiler -B out/shader-tests -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DDEKO3D_SHADER_TESTS=ON \
+            || { echo "::error::native configure pro shader_validation selhal"; exit 1; }
+          cmake --build out/shader-tests --parallel "$(nproc)" \
+            || { echo "::error::build shader_validation selhal"; exit 1; }
+          ./out/shader-tests/deko3d_shader_validation \
+            "$CORES_DIR/NetherSX2-v2.2n-4248/assets" \
+            "$CORES_DIR/NetherSX2-v2.2n-3668/assets" \
+            || { echo "::error::shader_validation selhal za behu"; exit 1; }
+
+      - name: Emulator -- Vulkan (NVK)
+        run: |
+          echo "::notice::make pouzije NXVK_PKG_CONFIG=${NXVK_PKG_CONFIG:-<default>}"
+          # Logy jobu se odsud nedaji stahnout (blob storage mimo allowlist),
+          # proto se pri selhani vypise do anotaci -- GitHub jich na krok pusti
+          # max 10 na uroven, tak 8 chybovych radku + 1 slouceny tail.
+          log=/tmp/vk.log
+          set +e
+          make -j"$(nproc)" RENDERER=VK BUILD=build-vk TARGET=NetherSX2_nx_vk > "$log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" != 0 ]; then
+            echo "::error::make RENDERER=VK selhal (rc=$rc), $(wc -l < "$log") radku logu, $(grep -c 'error:' "$log" || true)x 'error:'"
+            # Kompletni deduplikovany seznam nedefinovanych symbolu do JEDNE
+            # anotace: head -8 v minule verzi usekl seznam prave tam, kde
+            # zacinala ta zajimava cast (run 38970571750).
+            grep -oE "undefined reference to .[A-Za-z0-9_.]+" "$log" | sed "s/.*to .//" \
+              | sort -u | tr '\n' ' ' | sed 's/%/%25/g; s/^/::error::VK nedefinovane symboly | /'
+            grep -E "error:|fatal error|No rule to make|cannot find" "$log" | grep -v "undefined reference" \
+              | head -6 | sed 's/%/%25/g; s/^/::error::VK | /'
+            tail -14 "$log" | tr '\n' '|' | sed 's/%/%25/g; s/^/::error::VK-tail | /'
+            exit "$rc"
+          fi
+          echo "::notice::VK nro: $(ls -la NetherSX2_nx_vk.nro 2>/dev/null)"
+
+      - name: Launcher (SDL2)
+        run: |
+          mkdir -p launcher/romfs/cores launcher/romfs/emu launcher/romfs/res
+          cp "$CORES_DIR/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_4248.so
+          cp "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" launcher/romfs/cores/emucore_3668.so
+          cp NetherSX2_nx_vk.nro launcher/romfs/emu/
+          rm -f launcher/romfs/emu/NetherSX2_nx_dk.nro launcher/romfs/emu/NetherSX2_nx_gl.nro
+          python3 tools/bundle_resources.py --cores-dir "$CORES_DIR"
+          make -C launcher/fwd -j"$(nproc)" || { echo "::error::launcher/fwd selhal"; exit 1; }
+          make -C launcher -j"$(nproc)"     || { echo "::error::launcher selhal"; exit 1; }
+
+      - name: Kontrola bundle
+        run: |
+          # build_all.sh presouva finalni bundle do korene repa a pak ho overuje
+          mv -f launcher/NetherSX2.nro NetherSX2.nro
+          # Bez --map: Deko3D target se nestavi. verify_profiles (hashe jader +
+          # vtabulky) a verify_bundle (VK nro + cores + resources) bezi dal.
+          python3 tools/check_deko3d_build.py --cores-dir "$CORES_DIR" \
+            --bundle NetherSX2.nro \
+            || { echo "::error::check_deko3d_build.py selhal"; exit 1; }
+          echo "::notice::finalni bundle: $(ls -la NetherSX2.nro)"
+
+      - name: Diagnosticky bundle (VK log)
+        run: |
+          # Stejna jadra, stejny launcher, jen emulator postaveny s
+          # NETHERSX2_VK_DIAGNOSTIC=1. Ten pise do /switch/nethersx2/:
+          #   nethersx2-vulkan.log    zivotopis od main() po present, s casem
+          #   nethersx2-mesa.log      MESA_LOG_FILE + NVK_DEBUG=wsi,vm
+          #   nethersx2-exception.log pc/far/esr/sp/fp/lr pri CPU vyjimce
+          #   nethersx2-core.log      konzole jadra (Bionic logcat) + duvod
+          #                           abortu; pise se VZDY, i v produkci
+          # Vsechno line-buffered a fsync, takze log prezije i spad procesu.
+          # TARGET je jiny, aby se neprepsal produkci nro, ktery uz overila
+          # Kontrola bundle a ktery jde do artefaktu.
+          log=/tmp/diag.log
+          set +e
+          make -j"$(nproc)" RENDERER=VK BUILD=build-vk-diag TARGET=NetherSX2_nx_vk_diag \
+            NETHERSX2_VK_DIAGNOSTIC=1 > "$log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" != 0 ]; then
+            echo "::error::diag build selhal (rc=$rc)"
+            grep -nE "error:|undefined reference|No rule to make" "$log" \
+              | head -8 | sed 's/%/%25/g; s/^/::error::DIAG | /'
+            exit "$rc"
+          fi
+          echo "::notice::diag nro: $(ls -la NetherSX2_nx_vk_diag.nro)"
+          # Overit, ze se prepinac skutecne uplatnil. Retezec cesty k logu a
+          # format "host main entered" existuji JEN pod NETHERSX2_VK_DIAGNOSTIC,
+          # takze jejich pritomnost v binarce je dukaz. Bez tehle kontroly by
+          # diag bundle mohl byt potichu stejny jako produkce (rozdil 4096 B sam
+          # o sobe nic nedokazuje -- muze to byt i jen delsi nacp nazev targetu).
+          xstrings="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-strings"
+          hits=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "nethersx2-vulkan.log" || true)
+          hits2=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "host main entered" || true)
+          prod=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "nethersx2-vulkan.log" || true)
+          # corelog (konzole jadra) je zapnuty VZDY, nezavisle na prepinaci, takze
+          # nethersx2-core.log musi byt v OBOU binarkach. Kdyby chybel, znamena to
+          # ze se source/corelog.c neskompiloval a core by opet mlcel.
+          cored=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "nethersx2-core.log" || true)
+          corep=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "nethersx2-core.log" || true)
+          # Dve dalsi diag-only vetve: sysconf(_SC_PHYS_PAGES) vraci
+          # TotalMemorySize misto volneho zbytku (jinak NVK vypocita heap
+          # ~1 MiB a VMA odmitne kazdou alokaci) a diagnosticky build nasilim
+          # zapina logging jadra. Hodnoty pref jsou v obou vetvich tyz literal
+          # "1"/"0", takze je rozlisi jen tyhle formaty.
+          scd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "sysconf(_SC_PHYS_PAGES): total=" || true)
+          scp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "sysconf(_SC_PHYS_PAGES): total=" || true)
+          logd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "core logging forced on" || true)
+          logp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "core logging forced on" || true)
+          # shim_describe_address() a novy text corelog_format_address() jsou v
+          # OBOU buildech (nejsou za #ifdef), takze musi byt v obou binarkach.
+          # Produkcni nro totiz po teto zmene ma naprosto stejnou velikost jako
+          # pred ni, coz je sice vysvetlitelne zarovnavanim segmentu NRO na
+          # stranku, ale velikost nic nedokazuje -- ani rozdil, ani jeho absence.
+          regd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "mmap RX (recompiler/JIT)" || true)
+          regp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "mmap RX (recompiler/JIT)" || true)
+          # Tenhle format je naopak JEN v produkci (cutoff INFO je v diag buildu
+          # vypnuty), takze jeho pritomnost dokazuje, ze #ifndef zabral.
+          cutp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "INFO and below dropped" || true)
+          cutd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "INFO and below dropped" || true)
+          # Synteticke /sys a /proc soubory pro cpuinfo nejsou za zadnym
+          # #ifdef, takze musi byt v obou binarkach. "CPU implementer" je kus
+          # formatovaciho retezce /proc/cpuinfo; strings ho ukaze jako vlastni
+          # radek, protoze \n v tom retezci jsou opravdove konce radku.
+          cpud=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "CPU implementer" || true)
+          cpup=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "CPU implementer" || true)
+          echo "::notice::corelog/libc_shim v obou: region ${regd}x (diag) / ${regp}x (produkce), cutoff-INFO ${cutp}x (produkce) / ${cutd}x (diag, ma byt 0), cpuinfo-sysfs ${cpud}x (diag) / ${cpup}x (produkce)"
+          echo "::notice::diag kontrola: vulkan.log ${hits}x + host main entered ${hits2}x (diag), ${prod}x (produkce, ma byt 0); core.log ${cored}x (diag) / ${corep}x (produkce), oboji ma byt aspon 1; sysconf-total ${scd}x (diag) / ${scp}x (produkce); logging-jadra ${logd}x (diag) / ${logp}x (produkce)"
+          if [ "$hits" = "0" ] || [ "$hits2" = "0" ]; then
+            echo "::error::NETHERSX2_VK_DIAGNOSTIC se v diag buildu neprojevilo -- binarka by nelogovala"
+            exit 1
+          fi
+          if [ "$cored" = "0" ] || [ "$corep" = "0" ]; then
+            echo "::error::source/corelog.c se nedostal do binarky -- konzole jadra by se zahazovala"
+            exit 1
+          fi
+          if [ "$scd" = "0" ] || [ "$logd" = "0" ]; then
+            echo "::error::diag build neobsahuje opravu sysconf (${scd}x) nebo vynucene logovani jadra (${logd}x) -- NVK by dostal ~1 MiB heap a core by opet mlcel"
+            exit 1
+          fi
+          if [ "$regd" = "0" ] || [ "$regp" = "0" ]; then
+            echo "::error::shim_describe_address() chybi v binarce (diag ${regd}x / produkce ${regp}x) -- adresa abortu by zustala nececitelna"
+            exit 1
+          fi
+          if [ "$cutp" = "0" ] || [ "$cutd" != "0" ]; then
+            echo "::error::dvoustupnovy limit corelogu se neprojevil spravne: cutoff-INFO ma byt 1x v produkci a 0x v diag, je ${cutp}x/${cutd}x"
+            exit 1
+          fi
+          if [ "$cpud" = "0" ] || [ "$cpup" = "0" ]; then
+            echo "::error::synteticke soubory pro cpuinfo chybi v binarce (diag ${cpud}x / produkce ${cpup}x) -- /sys a /proc cesty by opet selhaly"
+            exit 1
+          fi
+          if [ "$scp" != "0" ] || [ "$logp" != "0" ]; then
+            echo "::warning::produkce obsahuje diag-only sysconf/logging retezce (${scp}x/${logp}x), melo by byt 0"
+          fi
+          if [ "$prod" != "0" ]; then
+            echo "::warning::produkci nro obsahuje diagnostiku, melo by byt bez ni"
+          fi
+          cp NetherSX2_nx_vk_diag.nro launcher/romfs/emu/NetherSX2_nx_vk.nro
+          make -C launcher -j"$(nproc)" || { echo "::error::diag launcher selhal"; exit 1; }
+          mv -f launcher/NetherSX2.nro NetherSX2-diag.nro
+          # romfs vrat na produkci emulator, aby dalsi kroky (ani dalsi beh)
+          # nemohly omylem zabalit diagnostickou verzi.
+          cp NetherSX2_nx_vk.nro launcher/romfs/emu/NetherSX2_nx_vk.nro
+          echo "::notice::diag bundle: $(ls -la NetherSX2-diag.nro)"
+
+      - name: Artefakty
+        uses: actions/upload-artifact@v4
+        with:
+          name: nethersx2-switch
+          if-no-files-found: warn
+          path: |
+            NetherSX2.nro
+            NetherSX2-diag.nro
+            NetherSX2_nx_vk.nro
+            NetherSX2_nx_vk_diag.nro
+            nxvk-BUILDINFO.txt

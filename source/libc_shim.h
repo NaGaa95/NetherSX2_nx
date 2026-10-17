@@ -143,6 +143,19 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t of
 int mprotect_fake(void *addr, size_t length, int prot);
 int munmap_fake(void *addr, size_t length);
 
+/* Name an address outside libemucore.so: which of the regions this file mapped
+ * on the core's behalf (recompiler RX, fastmem mirror, ashmem PS2 RAM) contains
+ * it. Returns 1 and fills `out` on a match, 0 otherwise. Used by corelog.c to
+ * make abort()'s return address interpretable. Lock-free by design -- callers
+ * may be on the abort path with other threads wedged. */
+int shim_describe_address(uintptr_t addr, char *out, size_t outsz);
+
+/* Synthetic read-only files (/sys/devices/system/cpu/*, /proc/cpuinfo) that
+ * cpuinfo probes but Horizon does not have. open_fake() hands out descriptors
+ * from SYNFILE_FD_BASE for them, so read/lseek/fstat/close must recognise those
+ * fds instead of forwarding to newlib -- hence these wrappers. */
+off_t lseek_fake(int fd, off_t offset, int whence);
+
 void libc_memory_shutdown(void);
 
 // pthread extras

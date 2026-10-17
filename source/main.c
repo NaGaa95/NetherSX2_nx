@@ -27,6 +27,7 @@
 #include "jni_fake.h"
 #include "prefs.h"
 #include "libc_shim.h"
+#include "corelog.h"
 #include "pthr.h"
 #include "keycodes.h"
 #include "syslang.h"
@@ -66,6 +67,15 @@ static void *FAKE_SURFACE = NULL; // android.view.Surface
 // device if nvMap/instance creation fails.
 u32 __nx_nv_transfermem_size = 16 * 1024 * 1024;
 #endif
+
+// Full-memory application, never an applet. Mesa sizes itself from the core mask
+// Horizon grants the process (0x7, three cores) and NVK needs the memory it gets
+// only in this applet type; an applet is silently short of both. libnx declares
+// this weak, so a strong definition here pins it.
+// __nx_heap_size is deliberately NOT defined: __libnx_initheap() below replaces
+// libnx's heap sizing outright and already claims all available memory minus the
+// GPU and .so reserves, so the libnx knob would be dead.
+u32 __nx_applet_type = AppletType_Application;
 
 // separate the newlib heap from the .so load region (see config.h SO_REGION_MB)
 void __libnx_initheap(void) {
@@ -427,11 +437,40 @@ static void run_startup_sequence(void) {
   prefs_set_int("EmuCore/GS/CropBottom", 0);
   prefs_set_int("EmuCore/GS/StretchY", 100);
   apply_network_settings();
+  /* PCSX2's Log:: system is gated behind these five keys, and until this build
+   * every one of them was forced to "0" -- so the core's own console was muted
+   * by us, not by the emulator. That is why the GS could abort() with not one
+   * word in nethersx2-core.log: the four [I] lines that did appear come from
+   * NativeLibrary's folder setup calling __android_log_print() directly, which
+   * bypasses Log:: entirely.
+   *
+   * The diagnostic build turns the console and verbose levels on, because the
+   * core's message is the only thing that can name the fault. EnableFileLogging
+   * stays off -- corelog already captures the same stream, and PCSX2's own file
+   * sink would write a second copy under a path we do not control.
+   *
+   * Production keeps everything off: verbose PCSX2 logging is megabytes per
+   * boot and measurable time on a Tegra X1, for output nobody reads. */
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  prefs_set_string("Logging/EnableSystemConsole", "1");
+  prefs_set_string("Logging/EnableFileLogging",   "0");
+  prefs_set_string("Logging/EnableVerbose",       "1");
+  prefs_set_string("Logging/EnableEEConsole",     "1");
+  prefs_set_string("Logging/EnableIOPConsole",    "1");
+#ifdef USE_VULKAN
+  /* Proves at runtime that this run really did have the core's logging forced
+   * on -- the pref values are the same string literals in both branches, so
+   * nothing in the binary distinguishes them. run_startup_sequence() is called
+   * well after the diagnostic log is opened. */
+  vk_diag_note("core logging forced on: SystemConsole+Verbose+EEConsole+IOPConsole");
+#endif
+#else
   prefs_set_string("Logging/EnableSystemConsole", "0");
   prefs_set_string("Logging/EnableFileLogging", "0");
   prefs_set_string("Logging/EnableVerbose", "0");
   prefs_set_string("Logging/EnableEEConsole", "0");
   prefs_set_string("Logging/EnableIOPConsole", "0");
+#endif
   prefs_save();
 
   if (!nl.isBIOSAvailable(fake_env, NATIVE_CLASS))
@@ -1869,14 +1908,50 @@ static void update_touch(void) {
   }
 }
 
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+/* The line that separates "the VM loop returned and the emulator exited cleanly"
+ * from "the process died". It is called EXPLICITLY at the end of main(), not
+ * only through atexit: main() finishes with __libnx_exit(0), and like
+ * crash.c's svcExitProcess() that bypasses atexit entirely -- so relying on the
+ * handler alone meant the note never appeared, on a clean exit or any other.
+ * The atexit registration stays for the paths that do go through exit(). */
+static void vk_diag_exit_note(void) {
+  vk_diag_note("host exiting normally");
+}
+#endif
+
 int main(void) {
   extern int crash_in_progress(void);
+  // The core's console: Bionic logcat -> DATA_ROOT/nethersx2-core.log. Opened
+  // before anything that can fail so a failure always has somewhere to say what
+  // happened. It is line-buffered, because main() ends in __libnx_exit(0) and
+  // that bypasses atexit; abort(), __stack_chk_fail and the CPU exception handler
+  // each make their own line durable first.
+  corelog_open();
+  atexit(corelog_flush);
 #if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
   unlink(DATA_ROOT "/nethersx2-exception.log");
   unlink(DATA_ROOT "/nethersx2-mesa.log");
   setenv("MESA_LOG_FILE", DATA_ROOT "/nethersx2-mesa.log", 1);
+  // NVK's own tracing, into that same file, and it has to be set before the
+  // driver is first touched. wsi prints the presentation path and per-frame
+  // totals -- exactly the stage that fails when the screen flashes once and the
+  // process exits; vm prints memory mapping, which is how an OOM or a failed
+  // import shows up. Both are the flags nxvk's bringing-an-application.md names
+  // for an attributable report.
+  setenv("NVK_DEBUG", "wsi,vm", 1);
+  setenv("MESA_SHADER_CACHE_SHOW_STATS", "1", 1);
   vk_diag_reset();
-  vk_diag_note("host main entered renderer=%d", GS_RENDERER);
+  atexit(vk_diag_exit_note);
+  vk_diag_note("host main entered renderer=%d applet=%u", GS_RENDERER,
+               (unsigned)__nx_applet_type);
+#endif
+#if defined(USE_VULKAN)
+  // Not optional, and it must precede vkCreateInstance: on a device NVK is not
+  // conformant for, nvk_physical_device_create() returns
+  // VK_ERROR_INCOMPATIBLE_DRIVER unless this is set. In a release build that is
+  // the entire symptom -- no message, and no physical device to enumerate.
+  setenv("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1);
 #endif
   cpu_boost(1);
 
@@ -2120,6 +2195,12 @@ int main(void) {
   if (g_net_ready && !storage_socket)
     socketExit();
   g_net_ready = 0;
+#if defined(USE_VULKAN) && defined(NETHERSX2_VK_DIAGNOSTIC)
+  vk_diag_exit_note();
+#endif
+  // __libnx_exit() bypasses atexit, so flush the core console here instead of
+  // trusting the handler registered at the top of main().
+  corelog_flush();
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
   return 0;
