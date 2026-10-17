@@ -513,7 +513,11 @@ vkCreateDevice_shim(VkPhysicalDevice physical_device,
     }
   }
 #ifdef NETHERSX2_VK_DIAGNOSTIC
-  vk_diag_note("vkCreateDevice end result=%d device=%p lsfg_capable=%d family=%u",
+  /* lsfg_family is LSFG's queue family, not the graphics/present one: it stays
+   * VK_QUEUE_FAMILY_IGNORED (prints as 4294967295) whenever lsfg_capable is 0,
+   * which is normal here. Read it together with lsfg_capable, not on its own. */
+  vk_diag_note("vkCreateDevice end result=%d device=%p lsfg_capable=%d "
+               "lsfg_family=%u",
                result, out && result == VK_SUCCESS ? (void *)*out : NULL,
                lsfg_device_capable, lsfg_main_queue_family);
 #endif

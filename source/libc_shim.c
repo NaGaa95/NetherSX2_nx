@@ -2024,6 +2024,80 @@ int munmap_fake(void *addr, size_t length) {
   return 0;
 }
 
+/* Name an address that is not inside libemucore.so.
+ *
+ * corelog_death() records abort()'s caller so the faulting instruction can be
+ * located without a debugger, but __builtin_return_address(0) often lands
+ * outside the core image: the recompiler's RX cache, the ashmem-backed PS2 RAM
+ * mirrors and the 4 GiB fastmem reservation are all handed out by this file at
+ * ASLR addresses the core never reports. On device the death note read
+ * "called from 0x41b1667c68" and there was no way to tell JIT'd code from a RAM
+ * mirror from a value that was never a code address at all -- which matters,
+ * because the first two point at the recompiler and the last one points at a
+ * corrupted stack. This says which of the regions we mapped it fell in.
+ *
+ * Returns 1 and fills `out` on a match, 0 otherwise. Deliberately lock-free: the
+ * caller may be on the abort path with other threads wedged inside
+ * mmap_fake()/munmap_fake(), and a stale or torn answer beats a deadlock. */
+int shim_describe_address(uintptr_t addr, char *out, size_t outsz) {
+  if (!out || outsz == 0)
+    return 0;
+  out[0] = '\0';
+  if (!addr)
+    return 0;
+
+  for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+    const MmapRegion *r = &g_mmaps[i];
+    if (!r->dst || !r->size)
+      continue;
+    const uintptr_t base = (uintptr_t)r->dst;
+    if (addr < base || addr >= base + r->size)
+      continue;
+    /* is_code: 1 = executable RX mapping (the recompiler), 2 = PROT_NONE
+     * address-space reservation, 0 = plain data mapping. */
+    const char *what = r->is_code == 1 ? "mmap RX (recompiler/JIT)"
+                     : r->is_code == 2 ? "mmap PROT_NONE reservation"
+                                       : "mmap data region";
+    snprintf(out, outsz, "%s #%d base=0x%llx size=0x%llx addr=base+0x%llx",
+             what, i, (unsigned long long)base, (unsigned long long)r->size,
+             (unsigned long long)(addr - base));
+    return 1;
+  }
+
+  const uintptr_t fastmem_base = __atomic_load_n(&g_fastmem_base, __ATOMIC_ACQUIRE);
+  if (fastmem_base && addr >= fastmem_base &&
+      addr < fastmem_base + FASTMEM_AREA_SIZE) {
+    snprintf(out, outsz,
+             "fastmem mirror base=0x%llx (4 GiB PS2 address space) "
+             "addr=base+0x%llx",
+             (unsigned long long)fastmem_base,
+             (unsigned long long)(addr - fastmem_base));
+    return 1;
+  }
+
+  for (int i = 0; i < MAX_ASHMEM; i++) {
+    const AshmemRegion *a = &g_ashmem[i];
+    if (a->used != 1 || !a->size)
+      continue;
+    uintptr_t hit = 0;
+    if (a->raw && addr >= (uintptr_t)a->raw &&
+        addr < (uintptr_t)a->raw + a->size)
+      hit = (uintptr_t)a->raw;
+    else if (a->ptr && addr >= (uintptr_t)a->ptr &&
+             addr < (uintptr_t)a->ptr + a->size)
+      hit = (uintptr_t)a->ptr;
+    if (!hit)
+      continue;
+    snprintf(out, outsz, "ashmem region #%d size=0x%llx addr=base+0x%llx%s",
+             i, (unsigned long long)a->size,
+             (unsigned long long)(addr - hit),
+             a->alias_backed ? " (alias-backed)" : "");
+    return 1;
+  }
+
+  return 0;
+}
+
 void libc_memory_shutdown(void) {
   mutexLock(&g_signal_lock);
   memset(g_signal_actions, 0, sizeof(g_signal_actions));

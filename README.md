@@ -102,8 +102,14 @@ console: PCSX2 reports every initialisation failure through Bionic's logcat, and
 Horizon has nowhere to print it, so without this the emulator dies without ever
 saying why. It also records the reason and the calling address whenever the core
 calls `abort()` or trips the stack protector, rendering an address inside
-`libemucore.so` as `core+0xOFFSET`. The file is buffered and capped at 2 MiB;
-errors are flushed and `fsync`ed as they are written, so they survive a crash.
+`libemucore.so` as `core+0xOFFSET`, and an address in memory this port mapped on
+the core's behalf — the recompiler's RX cache, the fastmem mirror, the ashmem
+PS2 RAM regions — by naming that region instead of printing a bare pointer.
+
+The file is line-buffered and capped (2 MiB in the shipping build, 8 MiB in the
+diagnostic one). Hitting the cap stops `INFO` and below but leaves the file open,
+so errors and the death note are always recorded; they are flushed and `fsync`ed
+as they are written, so they survive a crash.
 
 CI additionally publishes `NetherSX2-diag.nro` — the same launcher and the same
 cores, with the emulator built with `NETHERSX2_VK_DIAGNOSTIC=1`. Install it as
@@ -115,9 +121,18 @@ nethersx2-mesa.log       NVK's own log (MESA_LOG_FILE, NVK_DEBUG=wsi,vm)
 nethersx2-exception.log  pc/far/esr/sp/fp/lr, only if a CPU exception fires
 ```
 
+The diagnostic build also turns PCSX2's own logging back on
+(`Logging/EnableSystemConsole`, `EnableVerbose`, `EnableEEConsole`,
+`EnableIOPConsole`), which the shipping build forces off — verbose emulator
+output is megabytes per boot and real time on a Tegra X1. Expect
+`nethersx2-core.log` to be far larger and the boot to be slower as a result;
+that is the point, since the core's own message is usually the only thing that
+names a fault.
+
 The Vulkan log traces every `vkGetInstanceProcAddr` lookup the core makes and
-whether it resolved, and reports how many physical devices NVK returned and what
-they are called. A run whose log ends without `host exiting normally`
+whether it resolved, reports how many physical devices NVK returned and what
+they are called, and prints the physical-memory figure NVK sizes its heap from.
+A run whose log ends without `host exiting normally`
 did not exit cleanly — the last line before the gap names the stage that died.
 
 ### How to build

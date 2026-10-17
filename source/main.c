@@ -437,11 +437,40 @@ static void run_startup_sequence(void) {
   prefs_set_int("EmuCore/GS/CropBottom", 0);
   prefs_set_int("EmuCore/GS/StretchY", 100);
   apply_network_settings();
+  /* PCSX2's Log:: system is gated behind these five keys, and until this build
+   * every one of them was forced to "0" -- so the core's own console was muted
+   * by us, not by the emulator. That is why the GS could abort() with not one
+   * word in nethersx2-core.log: the four [I] lines that did appear come from
+   * NativeLibrary's folder setup calling __android_log_print() directly, which
+   * bypasses Log:: entirely.
+   *
+   * The diagnostic build turns the console and verbose levels on, because the
+   * core's message is the only thing that can name the fault. EnableFileLogging
+   * stays off -- corelog already captures the same stream, and PCSX2's own file
+   * sink would write a second copy under a path we do not control.
+   *
+   * Production keeps everything off: verbose PCSX2 logging is megabytes per
+   * boot and measurable time on a Tegra X1, for output nobody reads. */
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+  prefs_set_string("Logging/EnableSystemConsole", "1");
+  prefs_set_string("Logging/EnableFileLogging",   "0");
+  prefs_set_string("Logging/EnableVerbose",       "1");
+  prefs_set_string("Logging/EnableEEConsole",     "1");
+  prefs_set_string("Logging/EnableIOPConsole",    "1");
+#ifdef USE_VULKAN
+  /* Proves at runtime that this run really did have the core's logging forced
+   * on -- the pref values are the same string literals in both branches, so
+   * nothing in the binary distinguishes them. run_startup_sequence() is called
+   * well after the diagnostic log is opened. */
+  vk_diag_note("core logging forced on: SystemConsole+Verbose+EEConsole+IOPConsole");
+#endif
+#else
   prefs_set_string("Logging/EnableSystemConsole", "0");
   prefs_set_string("Logging/EnableFileLogging", "0");
   prefs_set_string("Logging/EnableVerbose", "0");
   prefs_set_string("Logging/EnableEEConsole", "0");
   prefs_set_string("Logging/EnableIOPConsole", "0");
+#endif
   prefs_save();
 
   if (!nl.isBIOSAvailable(fake_env, NATIVE_CLASS))

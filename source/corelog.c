@@ -31,14 +31,36 @@
 #include <sys/stat.h>
 #include <switch.h>
 
-#include "config.h"   // DATA_ROOT
-#include "so_util.h"  // so_module
+#include "config.h"    // DATA_ROOT
+#include "so_util.h"   // so_module
+#include "libc_shim.h" // shim_describe_address()
 
 // libemucore.so, loaded by main.c (same pattern as dl_emu.c).
 extern so_module emu_mod;
 
 #define CORELOG_PATH   DATA_ROOT "/nethersx2-core.log"
-#define CORELOG_LIMIT  (2 * 1024 * 1024) // stop rather than fill the card
+/* Two caps, because the tail of this file is the part that matters.
+ *
+ * CORELOG_LIMIT stops the chatter: with Logging/EnableVerbose on (the
+ * diagnostic build) PCSX2 emits far more than the old flat 2 MiB allowance, and
+ * the previous code fclose()d the stream the moment it was reached -- which
+ * discarded every later ERROR, the abort() reason and the death note, i.e.
+ * exactly the lines the file exists to preserve.
+ *
+ * So chatter now stops at CORELOG_LIMIT but the file stays open, and anything at
+ * CORELOG_ERROR or above keeps recording up to CORELOG_HARD.
+ *
+ * The diagnostic build has no chatter cutoff at all and a larger cap: PCSX2's
+ * console sink flattens every Log:: level to ANDROID_LOG_INFO, so an ERROR is
+ * indistinguishable from chatter by priority alone, and cutting INFO off would
+ * cut off the very message being hunted for. Everything up to CORELOG_HARD is
+ * written and the line-buffered stream carries it to the card. */
+#ifdef NETHERSX2_VK_DIAGNOSTIC
+#define CORELOG_LIMIT  (8 * 1024 * 1024)
+#else
+#define CORELOG_LIMIT  (2 * 1024 * 1024)
+#endif
+#define CORELOG_HARD   (CORELOG_LIMIT + 256 * 1024)
 #define CORELOG_LINE   1024
 
 static const char *const corelog_priority[] = {
@@ -50,12 +72,21 @@ static Mutex corelog_mutex;
 static FILE *corelog_file;
 static char  corelog_abort_text[512];
 static long  corelog_written;
+#ifndef NETHERSX2_VK_DIAGNOSTIC
+static int   corelog_chatter_stopped; // soft cap hit; only >= ERROR still writes
+#endif
 
 // Caller holds corelog_mutex.
 static void
 corelog_emit_locked(int priority, const char *tag, const char *text) {
-  if (!corelog_file || corelog_written >= CORELOG_LIMIT)
+  const int important = (priority >= CORELOG_ERROR);
+
+  if (!corelog_file || corelog_written >= CORELOG_HARD)
     return;
+#ifndef NETHERSX2_VK_DIAGNOSTIC
+  if (!important && corelog_chatter_stopped)
+    return;
+#endif
 
   struct timespec time;
   clock_gettime(CLOCK_MONOTONIC, &time);
@@ -72,31 +103,42 @@ corelog_emit_locked(int priority, const char *tag, const char *text) {
     corelog_written += n;
 
   // Errors, fatals and a full buffer must survive whatever happens next.
-  if (priority >= CORELOG_ERROR) {
+  if (important) {
     fflush(corelog_file);
     fsync(fileno(corelog_file));
   }
 
-  if (corelog_written >= CORELOG_LIMIT) {
-    fprintf(corelog_file, "-- core log stopped at %ld bytes --\n",
+#ifndef NETHERSX2_VK_DIAGNOSTIC
+  if (!important && !corelog_chatter_stopped && corelog_written >= CORELOG_LIMIT) {
+    corelog_chatter_stopped = 1;
+    fprintf(corelog_file,
+            "-- core log: %ld bytes written, INFO and below dropped from here "
+            "on; errors and the death note are still recorded --\n",
             corelog_written);
     fflush(corelog_file);
-    fsync(fileno(corelog_file));
-    fclose(corelog_file);
-    corelog_file = NULL;
   }
+#endif
 }
 
-// Render an address as core+0xOFFSET when it falls inside libemucore.so.
+/* Render an address as core+0xOFFSET when it falls inside libemucore.so, and
+ * otherwise ask libc_shim.c which of the regions IT mapped the address belongs
+ * to. Without the second half the death note is frequently uninterpretable: on
+ * device abort()'s caller printed as a bare 0x41b1667c68, far outside the core
+ * image, and there was no way to tell JIT'd recompiler code from a PS2 RAM
+ * mirror from a value that was never a code address at all. */
 static void
 corelog_format_address(char *out, size_t size, const void *address) {
   const uintptr_t a = (uintptr_t)address;
   const uintptr_t base = (uintptr_t)emu_mod.load_base;
+  char region[160];
 
   if (base && a >= base && a < base + emu_mod.load_size)
     snprintf(out, size, "core+0x%llx", (unsigned long long)(a - base));
+  else if (shim_describe_address(a, region, sizeof(region)))
+    snprintf(out, size, "0x%llx [%s]", (unsigned long long)a, region);
   else
-    snprintf(out, size, "0x%llx", (unsigned long long)a);
+    snprintf(out, size, "0x%llx (not in the core image or any mapped region)",
+             (unsigned long long)a);
 }
 
 void
@@ -107,6 +149,9 @@ corelog_open(void) {
     corelog_file = NULL;
   }
   corelog_written = 0;
+#ifndef NETHERSX2_VK_DIAGNOSTIC
+  corelog_chatter_stopped = 0;
+#endif
   corelog_abort_text[0] = '\0';
 
   mkdir(DATA_ROOT, 0777);
@@ -186,7 +231,7 @@ corelog_abort_message(const char *message) {
 
 void
 corelog_death(const char *reason, const void *called_from) {
-  char where[64];
+  char where[256];  // room for a libc_shim region description
   char line[CORELOG_LINE];
   corelog_format_address(where, sizeof(where), called_from);
 

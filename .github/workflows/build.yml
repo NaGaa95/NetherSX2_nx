@@ -419,7 +419,16 @@ jobs:
           # ze se source/corelog.c neskompiloval a core by opet mlcel.
           cored=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "nethersx2-core.log" || true)
           corep=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "nethersx2-core.log" || true)
-          echo "::notice::diag kontrola: vulkan.log ${hits}x + host main entered ${hits2}x (diag), ${prod}x (produkce, ma byt 0); core.log ${cored}x (diag) / ${corep}x (produkce), oboji ma byt aspon 1"
+          # Dve dalsi diag-only vetve: sysconf(_SC_PHYS_PAGES) vraci
+          # TotalMemorySize misto volneho zbytku (jinak NVK vypocita heap
+          # ~1 MiB a VMA odmitne kazdou alokaci) a diagnosticky build nasilim
+          # zapina logging jadra. Hodnoty pref jsou v obou vetvich tyz literal
+          # "1"/"0", takze je rozlisi jen tyhle formaty.
+          scd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "sysconf(_SC_PHYS_PAGES): total=" || true)
+          scp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "sysconf(_SC_PHYS_PAGES): total=" || true)
+          logd=$("$xstrings" NetherSX2_nx_vk_diag.nro | grep -c "core logging forced on" || true)
+          logp=$("$xstrings" NetherSX2_nx_vk.nro | grep -c "core logging forced on" || true)
+          echo "::notice::diag kontrola: vulkan.log ${hits}x + host main entered ${hits2}x (diag), ${prod}x (produkce, ma byt 0); core.log ${cored}x (diag) / ${corep}x (produkce), oboji ma byt aspon 1; sysconf-total ${scd}x (diag) / ${scp}x (produkce); logging-jadra ${logd}x (diag) / ${logp}x (produkce)"
           if [ "$hits" = "0" ] || [ "$hits2" = "0" ]; then
             echo "::error::NETHERSX2_VK_DIAGNOSTIC se v diag buildu neprojevilo -- binarka by nelogovala"
             exit 1
@@ -427,6 +436,13 @@ jobs:
           if [ "$cored" = "0" ] || [ "$corep" = "0" ]; then
             echo "::error::source/corelog.c se nedostal do binarky -- konzole jadra by se zahazovala"
             exit 1
+          fi
+          if [ "$scd" = "0" ] || [ "$logd" = "0" ]; then
+            echo "::error::diag build neobsahuje opravu sysconf (${scd}x) nebo vynucene logovani jadra (${logd}x) -- NVK by dostal ~1 MiB heap a core by opet mlcel"
+            exit 1
+          fi
+          if [ "$scp" != "0" ] || [ "$logp" != "0" ]; then
+            echo "::warning::produkce obsahuje diag-only sysconf/logging retezce (${scp}x/${logp}x), melo by byt 0"
           fi
           if [ "$prod" != "0" ]; then
             echo "::warning::produkci nro obsahuje diagnostiku, melo by byt bez ni"

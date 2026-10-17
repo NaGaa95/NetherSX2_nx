@@ -143,6 +143,13 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t of
 int mprotect_fake(void *addr, size_t length, int prot);
 int munmap_fake(void *addr, size_t length);
 
+/* Name an address outside libemucore.so: which of the regions this file mapped
+ * on the core's behalf (recompiler RX, fastmem mirror, ashmem PS2 RAM) contains
+ * it. Returns 1 and fills `out` on a match, 0 otherwise. Used by corelog.c to
+ * make abort()'s return address interpretable. Lock-free by design -- callers
+ * may be on the abort path with other threads wedged. */
+int shim_describe_address(uintptr_t addr, char *out, size_t outsz);
+
 void libc_memory_shutdown(void);
 
 // pthread extras
