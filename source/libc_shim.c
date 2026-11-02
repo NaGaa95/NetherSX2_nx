@@ -33,6 +33,7 @@
 #include "util.h"
 #include "so_util.h"
 #include "libc_shim.h"
+#include "network.h"
 #include "hooks.h"
 
 // ---------------------------------------------------------------------------
@@ -604,6 +605,9 @@ int getc_fake(FILE *f) {
 // streams the multi-hundred-MB .dat packs with many small reads/seeks, and
 // fsdev round trips dominate without buffering.
 FILE *fopen_fake(const char *path, const char *mode) {
+  if (path && strchr(mode, 'r') &&
+      (!strcmp(path, "/proc/net/route") || !strcmp(path, "/etc/resolv.conf")))
+    return net_open_config(path);
   // CPU topology: the Switch has no /sys, and the core reads these to size its
   // worker-thread pool -- a failed/garbage read here can spawn a runaway number
   // of threads. Report 4 present/online CPUs (matches the 3 app cores we use).

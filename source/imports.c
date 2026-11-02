@@ -119,35 +119,19 @@ static ssize_t __write_chk_fake(int fd, const void *buf, size_t count, size_t bn
 static int tolower_l_fake(int c, locale_t l) { (void)l; return tolower(c); }
 static int toupper_l_fake(int c, locale_t l) { (void)l; return toupper(c); }
 
-// ioctl: ashmem fds get the ashmem ioctls (SET_NAME/SET_SIZE/GET_SIZE etc); the
-// VTLB memory setup bails if SET_SIZE fails. Everything else -> failure.
+// Route ashmem and Android socket ioctls to their respective bridges.
 static int ioctl_fake(int fd, unsigned long req, ...) {
   int ret;
   if (ashmem_ioctl(fd, req, &ret) == 0) return ret;
+  if (req == 0x541b || req == 0x5421 || req == 0x8927) {
+    va_list arguments;
+    va_start(arguments, req);
+    void *argument = va_arg(arguments, void *);
+    va_end(arguments);
+    return net_ioctl(fd, req, argument);
+  }
   errno = ENOTTY; return -1;
 }
-
-// --- PS2 network adapter (DEV9 "Sockets" backend) --------------------------
-// The core's SMAP/Sockets stack stays dormant unless the launcher's Network
-// toggle set DEV9/Eth/EthEnable (see main.c). g_net_ready is raised there once
-// the libnx bsd service is up; until then every entry point fails cleanly --
-// identical to the old offline stub -- so a networking-disabled boot is
-// unchanged. socket fds are small ints and never collide with the ashmem base
-// (0x40000000) used by the VTLB, so they share the fd namespace safely.
-#define NET_GUARD do { if (!g_net_ready) { errno = ENETDOWN; return -1; } } while (0)
-
-static int     net_socket(int a,int b,int c){ NET_GUARD; return socket(a,b,c); }
-static int     net_bind(int f,const struct sockaddr*a,socklen_t l){ NET_GUARD; return bind(f,a,l); }
-static int     net_connect(int f,const struct sockaddr*a,socklen_t l){ NET_GUARD; return connect(f,a,l); }
-static ssize_t net_sendto(int f,const void*b,size_t n,int fl,const struct sockaddr*a,socklen_t l){ NET_GUARD; return sendto(f,b,n,fl,a,l); }
-static ssize_t net_recvfrom(int f,void*b,size_t n,int fl,struct sockaddr*a,socklen_t*l){ NET_GUARD; return recvfrom(f,b,n,fl,a,l); }
-static ssize_t net_recvmsg(int f,struct msghdr*m,int fl){ NET_GUARD; return recvmsg(f,m,fl); }
-static int     net_select(int n,fd_set*r,fd_set*w,fd_set*e,struct timeval*t){ if(!g_net_ready){ errno=ENETDOWN; return -1; } return select(n,r,w,e,t); }
-static int     net_setsockopt(int f,int lv,int o,const void*v,socklen_t l){ NET_GUARD; return setsockopt(f,lv,o,v,l); }
-static int     net_getsockopt(int f,int lv,int o,void*v,socklen_t*l){ NET_GUARD; return getsockopt(f,lv,o,v,l); }
-static int     net_getsockname(int f,struct sockaddr*a,socklen_t*l){ NET_GUARD; return getsockname(f,a,l); }
-static int     net_shutdown(int f,int h){ NET_GUARD; return shutdown(f,h); }
-static int     net_getaddrinfo(const char*n,const char*s,const struct addrinfo*h,struct addrinfo**r){ if(!g_net_ready) return EAI_FAIL; return getaddrinfo(n,s,h,r); }
 
 // The core is FORTIFY-built, so FD_SET/FD_ISSET expand to these _chk helpers;
 // route them to a plain byte-addressed fd bitmap (matches the little-endian
@@ -334,7 +318,7 @@ DynLibFunction dynlib_functions[] = {
   { "fputs", (uintptr_t)&fputs_fake },
   { "fread", (uintptr_t)&fread_fake },
   { "free", (uintptr_t)&free },
-  { "freeaddrinfo", (uintptr_t)&freeaddrinfo },
+  { "freeaddrinfo", (uintptr_t)&net_freeaddrinfo },
   { "freeifaddrs", (uintptr_t)&net_freeifaddrs },
   { "freelocale", (uintptr_t)&freelocale_fake },
   { "fseek", (uintptr_t)&fseek_fake },
@@ -358,7 +342,7 @@ DynLibFunction dynlib_functions[] = {
   { "gettid", (uintptr_t)&gettid_fake },
   { "gmtime", (uintptr_t)&gmtime },
   { "gmtime_r", (uintptr_t)&gmtime_r },
-  { "inet_pton", (uintptr_t)&inet_pton },
+  { "inet_pton", (uintptr_t)&net_inet_pton },
   { "ioctl", (uintptr_t)&ioctl_fake },
   { "isatty", (uintptr_t)&isatty },
   { "isdigit_l", (uintptr_t)&isdigit_l },

@@ -6,3 +6,4 @@ target_compile_features(network_validation PRIVATE c_std_11)
 
 enable_testing()
 add_test(NAME network_validation COMMAND network_validation)
+set_tests_properties(network_validation PROPERTIES TIMEOUT 15)
