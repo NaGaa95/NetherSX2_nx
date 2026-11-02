@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.4.0
+APP_VERSION	:=	1.4.1
 BUILD		?=	build-$(RENDERER)
 SOURCES		:=	source source/hooks source/switch
 DATA		:=	data

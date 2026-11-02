@@ -6,7 +6,7 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    := ../romfs/fwd
 
 # cfg dir is hardcoded in main.c; don't pass it via -D (MSYS2 mangles leading-slash args).
-VERSION := 1.4.0
+VERSION := 1.4.1
 AUTHOR := naga
 LTOFLAGS := -flto=auto -fuse-linker-plugin
 
