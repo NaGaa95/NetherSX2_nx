@@ -11,6 +11,7 @@
 #include <GLES2/gl2.h>
 
 void patch_game(void);
+int core_install_resolution_hook(void);
 
 typedef enum {
   CORE_VER_UNKNOWN = 0,

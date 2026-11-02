@@ -19,6 +19,7 @@
 #include <switch.h>
 
 #include "config.h"
+#include "saltynx.h"
 #include "util.h"
 #include "error.h"
 #include "so_util.h"
@@ -1879,6 +1880,7 @@ int main(void) {
   vk_diag_note("host main entered renderer=%d", GS_RENDERER);
 #endif
   cpu_boost(1);
+  saltynx_start();
 
   // settings store: load nethersx2.ini + seed OpenGL/folder defaults
   prefs_init(PREFS_PATH);
@@ -1981,6 +1983,9 @@ int main(void) {
   if (!dk_install_native_backend(g_core_so))
     fatal_error("Deko3D: unsupported emulator core or native ABI mismatch.\n"
                 "Use the supplied v2.2n-4248 or v2.2n-3668 APK core.");
+#else
+  if (!core_install_resolution_hook())
+    fprintf(stderr, "SaltyNX: internal resolution hook unavailable.\n");
 #endif
   resolve_entry_points();
 
@@ -2116,6 +2121,7 @@ int main(void) {
   so_unload(&emu_mod);
   prefs_save();
   const bool storage_socket = switchStorageSocketReady();
+  saltynx_stop();
   switchStorageShutdown();
   if (g_net_ready && !storage_socket)
     socketExit();

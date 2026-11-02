@@ -1,4 +1,5 @@
 #include "dk_native.h"
+#include "../saltynx.h"
 #include "dk_vertex_format.h"
 #include "dk_utility_target.h"
 #include "dk_render_state.h"
@@ -796,6 +797,8 @@ void present_rect(void *, TextureAbi *source, const FloatRect *sr, TextureAbi *d
   if (shader >= std::size(names)) fatal_error("Deko3D: invalid presentation shader");
   Image *target = destination ? texture(destination)->image.get() : gpu().backbuffer();
   if (!target) return;
+  if (!destination && source->width > 0 && source->height > 0)
+    saltynx_set_resolution(source->width, source->height);
   auto pixel = utility_kernel("shaders/opengl/present.glsl", names[shader], DkStage_Fragment);
   const float src_size[]{(sr->z - sr->x) * source->width, (sr->w - sr->y) * source->height};
   const float dst_size[]{dr->z - dr->x, dr->w - dr->y};

@@ -1,4 +1,5 @@
 #include "dk_gpu.h"
+#include "../saltynx.h"
 #include <algorithm>
 
 namespace nxdk {
@@ -21,6 +22,7 @@ void Gpu::present() {
   } else {
     present_backbuffer();
   }
+  saltynx_frame(1);
 }
 
 void Gpu::present_image(const Image &image) {

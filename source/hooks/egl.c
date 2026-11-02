@@ -16,6 +16,7 @@
 #include "../config.h"
 #include "../util.h"
 #include "../hooks.h"
+#include "../saltynx.h"
 
 #ifndef EGL_OPENGL_ES3_BIT
 #define EGL_OPENGL_ES3_BIT 0x00000040
@@ -329,7 +330,10 @@ EGLBoolean eglSwapBuffersHook(EGLDisplay dpy, EGLSurface surface) {
   if (fake_pbuffer_from_surface(surface))
     return EGL_TRUE;
 
-  return eglSwapBuffers(dpy, surface);
+  const EGLBoolean result = eglSwapBuffers(dpy, surface);
+  if (result == EGL_TRUE)
+    saltynx_frame(2);
+  return result;
 }
 
 void *eglGetProcAddressHook(const char *name) {

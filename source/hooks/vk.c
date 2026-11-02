@@ -37,6 +37,7 @@
 #include "../config.h"
 #include "../prefs.h"
 #include "../lsfg/lsfg_bridge.h"
+#include "../saltynx.h"
 
 volatile int vk_present_count = 0;
 
@@ -701,10 +702,19 @@ vkDestroyDevice_shim(VkDevice device, const VkAllocationCallbacks *alloc) {
 // present counter (main.c reads vk_present_count).
 static PFN_vkQueuePresentKHR real_qpresent = NULL;
 
+static void saltynx_present_result(const VkPresentInfoKHR *info, VkResult result) {
+  if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) && info &&
+      info->swapchainCount == 1 && info->pSwapchains &&
+      info->pSwapchains[0] == tracked_swapchain) {
+    saltynx_frame(3);
+  }
+}
+
 static VkResult
 vkQueuePresentKHR_native(VkQueue queue, const VkPresentInfoKHR *present_info) {
   PFN_vkQueuePresentKHR present = real_qpresent ? real_qpresent : vkQueuePresentKHR;
   VkResult result = present(queue, present_info);
+  saltynx_present_result(present_info, result);
 #ifdef NETHERSX2_VK_DIAGNOSTIC
   if (vk_present_count <= 4 || result != VK_SUCCESS)
     vk_diag_note("vkQueuePresentKHR call=%d swaps=%u result=%d",
@@ -827,6 +837,7 @@ vkQueuePresentKHR_shim(VkQueue q, const VkPresentInfoKHR *pi) {
       return VK_ERROR_INITIALIZATION_FAILED;
     VkResult result = VK_ERROR_INITIALIZATION_FAILED;
     if (lsfg_nx_present(lsfg_runtime, q, pi, &result)) {
+      saltynx_present_result(pi, result);
 #ifdef NETHERSX2_VK_DIAGNOSTIC
       if (vk_present_count <= 4 || result != VK_SUCCESS)
         vk_diag_note("lsfg present call=%d result=%d", vk_present_count, result);
